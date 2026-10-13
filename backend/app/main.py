@@ -1,5 +1,6 @@
 from dotenv import load_dotenv
-load_dotenv()  # Injects .env into os.environ for LangSmith
+# Force load the .env variables into the OS environment FIRST for langsmith
+load_dotenv(override=True)
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware

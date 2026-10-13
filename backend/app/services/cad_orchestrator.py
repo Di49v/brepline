@@ -1,147 +1,166 @@
-import time
-import json
+import operator
 import logging
-import asyncio
-from typing import Dict, Any, List
-from app.core.config import settings
-from app.models.schemas import JobRequest, JobResponse, JobResult
+from typing import TypedDict, Annotated, List, Dict, Any, Optional
+from langgraph.graph import StateGraph, END
 from app.services.llm import LLMService
 from app.sandbox.executor import SandboxExecutor
 from app.db.repository import CadRepository
-from examples_lib import EXAMPLES
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-class CadPipeline:
+# 1. Define the System State
+class CadGraphState(TypedDict):
+    job_id: str
+    raw_prompt: str
+    expanded_prompt: Optional[str]
+    bom_json: Optional[Dict[str, Any]]
+    cad_code: Optional[str]
+    error_traceback: Optional[str]
+    repair_attempts: int
+    physics_report: Optional[Dict[str, Any]]
+    final_result: Optional[Dict[str, Any]]
+
+class CadOrchestrator:
     def __init__(self):
         self.llm = LLMService()
         self.sandbox = SandboxExecutor()
         self.repo = CadRepository()
-        self.job_state: Dict[str, JobResponse] = {}
+        self.graph = self._build_graph()
 
-    def get_job_state(self, job_id: str) -> JobResponse | None:
-        return self.job_state.get(job_id)
+    def _build_graph(self):
+        """Constructs the LangGraph state machine."""
+        workflow = StateGraph(CadGraphState)
 
-    async def run_job(self, job_id: str, request: JobRequest):
-        """Main asynchronous pipeline orchestrator."""
-        self.job_state[job_id] = JobResponse(status="running", log=["Starting job..."])
-        t0 = time.time()
+        # Add Nodes (Agents)
+        workflow.add_node("intent_analyzer", self.node_intent_analyzer)
+        workflow.add_node("specifier", self.node_specifier)
+        workflow.add_node("coder", self.node_coder)
+        workflow.add_node("compiler", self.node_compiler)
+        workflow.add_node("auditor", self.node_auditor)
+
+        # Define Edges (Routing)
+        workflow.set_entry_point("intent_analyzer")
+        workflow.add_edge("intent_analyzer", "specifier")
+        workflow.add_edge("specifier", "coder")  # Cache/Router logic injects here later
+        workflow.add_edge("coder", "compiler")
         
-        try:
-            # 1. Planning Step
-            self.job_state[job_id].log.append("Planning geometry...")
-            plan = await self._generate_plan(request.prompt)
-            
-            # 2. Few-Shot Retrieval
-            # TODO: Replace with Supabase pgvector retrieval in Milestone 4
-            examples = self._retrieve_examples_naive(request.prompt)
-            
-            # 3. Concurrent Candidate Generation
-            self.job_state[job_id].log.append(f"Generating {settings.max_concurrent_jobs} candidates concurrently...")
-            msgs = self._build_prompt(request.prompt, plan, examples)
-            
-            # Fire LLM calls in parallel
-            llm_tasks = [self.llm.generate(msgs, temperature=0.2 + (i * 0.2)) for i in range(settings.max_concurrent_jobs)]
-            llm_outputs = await asyncio.gather(*llm_tasks, return_exceptions=True)
-            
-            # 4. Concurrent Sandbox Execution
-            self.job_state[job_id].log.append("Executing CadQuery sandboxes...")
-            exec_tasks = []
-            valid_codes = []
-            
-            for out in llm_outputs:
-                if isinstance(out, Exception):
-                    continue
-                code = self.llm.extract_code(out)
-                if code:
-                    valid_codes.append(code)
-                    wd = f"{settings.out_dir}/{job_id}_{len(valid_codes)}"
-                    exec_tasks.append(self.sandbox.run_code(code, wd))
+        # Conditional Routing from Compiler (Success vs Error)
+        workflow.add_conditional_edges(
+            "compiler",
+            self.route_compiler_output,
+            {
+                "repair": "coder",
+                "success": "auditor",
+                "fatal": END
+            }
+        )
+        workflow.add_edge("auditor", END)
 
-            results = await asyncio.gather(*exec_tasks, return_exceptions=True)
-            
-            # 5. Scoring & Selection
-            best_result = None
-            best_code = None
-            best_score = -1
-            
-            for i, res in enumerate(results):
-                if isinstance(res, Exception) or not res.get("ok"):
-                    # Save failure to DB asynchronously via background task/repo
-                    self.repo.save_failure({"job": job_id, "prompt": request.prompt, "code": valid_codes[i], "stage": "execution"})
-                    continue
-                
-                # Basic scoring heuristic
-                score = 10 if res.get("valid") else 5
-                if score > best_score:
-                    best_score = score
-                    best_result = res
-                    best_code = valid_codes[i]
+        return workflow.compile()
 
-            # 6. Finalization
-            if best_result:
-                elapsed = round(time.time() - t0, 1)
-                self.job_state[job_id].log.append(f"Success in {elapsed}s.")
-                
-                job_result = JobResult(
-                    ok=True,
-                    code=best_code,
-                    volume_mm3=best_result.get("volume"),
-                    bbox=best_result.get("bbox")
-                )
-                self.job_state[job_id].status = "done"
-                self.job_state[job_id].result = job_result
-                
-                # Persist winning generation
-                db_record = {
-                    "job": job_id,
-                    "prompt": request.prompt,
-                    "material": request.material,
-                    "code": best_code,
-                    "ok": True,
-                    "score": best_score,
-                    "bbox": best_result.get("bbox"),
-                    "volume_mm3": best_result.get("volume"),
-                    "elapsed_s": elapsed
-                }
-                self.repo.save_generation(db_record)
-            else:
-                self.job_state[job_id].status = "error"
-                self.job_state[job_id].error = "All candidates failed execution."
+    # --- Node Implementations ---
 
-        except Exception as e:
-            logger.error(f"Pipeline failure for {job_id}: {e}")
-            self.job_state[job_id].status = "error"
-            self.job_state[job_id].error = str(e)
-
-    async def _generate_plan(self, prompt: str) -> Dict[str, Any]:
-        """Calls the LLM to generate a JSON structural plan."""
-        sys_prompt = "You are a mechanical design planner. Turn the request into a compact JSON object: {'object': 'short name', 'features': ['step 1', 'step 2']}"
-        try:
-            raw = await self.llm.generate([
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": prompt}
-            ], temperature=0.1, max_tokens=600, planner=True)
-            return self.llm.extract_json(raw)
-        except Exception:
-            return {}
-
-    def _retrieve_examples_naive(self, prompt: str) -> List[tuple]:
-        """Legacy retrieval to be replaced by pgvector."""
-        p = prompt.lower()
-        scored = sorted(((sum(t in p for t in tags), i) for i, (tags, _, _) in enumerate(EXAMPLES)), reverse=True)
-        idx = [i for s, i in scored if s > 0][:3] or [3, 4]
-        return [EXAMPLES[i] for i in idx]
-
-    def _build_prompt(self, prompt: str, plan: Dict[str, Any], examples: List[tuple]) -> List[Dict[str, str]]:
-        """Assembles the system instructions, few-shot examples, and user prompt."""
-        msgs = [{"role": "system", "content": "You are an expert CAD engineer. Return only a CadQuery python script."}]
-        for _, req, code in examples:
-            msgs.append({"role": "user", "content": f"Request: {req}"})
-            msgs.append({"role": "assistant", "content": f"```python\n{code}```"})
+    async def node_intent_analyzer(self, state: CadGraphState) -> Dict[str, Any]:
+        """Agent 0: Expands sparse prompts and extracts implicit mechanical requirements."""
+        sys_prompt = "You are a Requirements Engineer. Expand the user's CAD request to include reasonable default mechanical constraints if missing (e.g. wall thickness, tolerances). Output ONLY the expanded prompt."
+        expanded = await self.llm.generate([
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": state["raw_prompt"]}
+        ], temperature=0.3, max_tokens=300)
         
-        user_content = f"Request: {prompt}\n"
-        if plan:
-            user_content += f"Plan: {json.dumps(plan)}\n"
-        msgs.append({"role": "user", "content": user_content})
-        return msgs
+        return {"expanded_prompt": expanded.strip()}
+
+    async def node_specifier(self, state: CadGraphState) -> Dict[str, Any]:
+        """Agent 1: Decomposes the prompt into a structured JSON BOM and interface constraints."""
+        sys_prompt = "You are a CAD Planner. Convert the prompt into a JSON object: {'parts': [{'name': '...', 'type': '...', 'dimensions': {}}], 'shared_interfaces': {}}."
+        raw_json = await self.llm.generate([
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": state["expanded_prompt"]}
+        ], temperature=0.1, max_tokens=800, planner=True)
+        
+        return {"bom_json": self.llm.extract_json(raw_json)}
+
+    async def node_coder(self, state: CadGraphState) -> Dict[str, Any]:
+        """Agent 2: Generates CadQuery python code. Handles repair feedback if present."""
+        sys_prompt = "You are an expert CadQuery engineer. Output ONLY valid python code. Assign the final shape to `result`."
+        
+        user_content = f"BOM/Specs: {state['bom_json']}\n"
+        if state.get("error_traceback"):
+            user_content += f"\nPREVIOUS CODE FAILED with error:\n{state['error_traceback']}\nFix the code."
+
+        raw_code = await self.llm.generate([
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_content}
+        ], temperature=0.2)
+        
+        clean_code = self.llm.extract_code(raw_code)
+        return {"cad_code": clean_code}
+
+    async def node_compiler(self, state: CadGraphState) -> Dict[str, Any]:
+        """Agent 3: Executes code in isolated subprocess. Returns metrics or traceback."""
+        wd = f"{settings.out_dir}/{state['job_id']}_r{state['repair_attempts']}"
+        exec_result = await self.sandbox.run_code(state["cad_code"], wd)
+
+        if not exec_result.get("ok"):
+            return {
+                "error_traceback": exec_result.get("error", "Unknown runtime error"),
+                "repair_attempts": state["repair_attempts"] + 1
+            }
+        
+        return {
+            "error_traceback": None,
+            "final_result": exec_result
+        }
+
+    def route_compiler_output(self, state: CadGraphState) -> str:
+        """Determines if the pipeline should repair, proceed to physics, or fail."""
+        if state.get("error_traceback"):
+            if state["repair_attempts"] >= 3:
+                logger.error(f"Job {state['job_id']} failed after 3 repair attempts.")
+                return "fatal"
+            return "repair"
+        return "success"
+
+    async def node_auditor(self, state: CadGraphState) -> Dict[str, Any]:
+        """Agent 4: Heuristic Physics check (Volume, Mass, Bounding Box constraints)."""
+        res = state.get("final_result", {})
+        vol = res.get("volume", 0)
+        
+        # Basic heuristic: calculate mass assuming Aluminum 6061 (density ~ 2.7e-3 g/mm^3)
+        mass_g = vol * 0.0027 
+        report = {
+            "estimated_mass_g": round(mass_g, 2),
+            "volume_mm3": round(vol, 2),
+            "safety_warning": "Mass exceeds 5kg limit" if mass_g > 5000 else "Within heuristic safety margins."
+        }
+        
+        # Persist success to database
+        self.repo.save_generation({
+            "job": state["job_id"],
+            "prompt": state["raw_prompt"],
+            "code": state["cad_code"],
+            "ok": True,
+            "score": 10,
+            "metadata": {"physics": report}
+        })
+
+        return {"physics_report": report}
+
+    async def execute_job(self, job_id: str, prompt: str) -> Dict[str, Any]:
+        """Entry point for the FastAPI route."""
+        initial_state = {
+            "job_id": job_id,
+            "raw_prompt": prompt,
+            "expanded_prompt": None,
+            "bom_json": None,
+            "cad_code": None,
+            "error_traceback": None,
+            "repair_attempts": 0,
+            "physics_report": None,
+            "final_result": None
+        }
+        
+        # Execute LangGraph asynchronously
+        final_state = await self.graph.ainvoke(initial_state)
+        return final_state

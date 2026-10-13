@@ -13,6 +13,7 @@ dependencies = [
     "supabase>=2.4.3",
     "cadquery>=2.4",
     "numpy",
+    "langgraph>=1.2.15",
 ]
 
 [dependency-groups]

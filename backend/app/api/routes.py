@@ -1,14 +1,21 @@
 import uuid
 import hashlib
-from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks
+import asyncio
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from app.models.schemas import JobRequest, ShapeRequest, VoteRequest, JobResponse
 from app.api.deps import verify_access_and_rate_limit, get_repository
 from app.db.repository import CadRepository
-# We will build this orchestrator in the next step
-from app.services.cad_orchestrator import CadPipeline 
+
+# Explicit imports to prevent ImportError
+from app.services.profiles import build, clean, SpecError
+from app.services.cad_orchestrator import CadOrchestrator
 
 router = APIRouter()
-pipeline = CadPipeline()
+orchestrator = CadOrchestrator()
+
+# Temporary in-memory state store for the API to poll. 
+# In production, this reads directly from Supabase.
+JOB_STATES = {}
 
 @router.post("/shape/validate")
 async def validate_shape(
@@ -16,16 +23,15 @@ async def validate_shape(
     ip: str = Depends(verify_access_and_rate_limit)
 ):
     """Pure-python check of a drawn polygon / profile (no CAD, no LLM, no rate limit)."""
-    from app.services import profiles
     try:
-        _, plan, spec = profiles.build(body.spec)
+        _, plan, spec = build(body.spec)
         return {
             "ok": True, 
             "spec": spec, 
             "bbox": plan.get("overall_size_mm"),
             "volume_mm3": plan.get("expect_volume_mm3")
         }
-    except profiles.SpecError as e:
+    except SpecError as e:
         return {"ok": False, "error": str(e)}
 
 @router.post("/shape")
@@ -35,15 +41,33 @@ async def create_shape(
     ip: str = Depends(verify_access_and_rate_limit)
 ):
     """Build a solid straight from a user-drawn polygon (extrude) or half-section (revolve)."""
-    from app.services import profiles
     try:
-        spec = profiles.clean(body.spec)
-    except profiles.SpecError as e:
+        spec = clean(body.spec)
+    except SpecError as e:
         raise HTTPException(status_code=400, detail=str(e))
         
     job_id = uuid.uuid4().hex[:12]
-    # Fire the deterministic build task in the background
-    background_tasks.add_task(pipeline.run_shape_job, job_id, body.model_copy(update={"spec": spec}))
+    JOB_STATES[job_id] = {"status": "queued", "log": ["Starting deterministic shape build..."]}
+    
+    # Background execution for deterministic shapes
+    async def run_shape():
+        JOB_STATES[job_id]["status"] = "running"
+        try:
+            code, plan, _ = build(spec)
+            wd = f"{orchestrator.sandbox.base_dir}/../cad_out/{job_id}"
+            res = await orchestrator.sandbox.run_code(code, wd)
+            
+            if res.get("ok"):
+                JOB_STATES[job_id]["status"] = "done"
+                JOB_STATES[job_id]["result"] = {"ok": True, "code": code, "volume_mm3": res.get("volume"), "bbox": res.get("bbox")}
+            else:
+                JOB_STATES[job_id]["status"] = "error"
+                JOB_STATES[job_id]["error"] = res.get("error", "Sandbox failed")
+        except Exception as e:
+            JOB_STATES[job_id]["status"] = "error"
+            JOB_STATES[job_id]["error"] = str(e)
+
+    background_tasks.add_task(run_shape)
     return {"job": job_id}
 
 @router.post("/jobs")
@@ -52,16 +76,40 @@ async def create_job(
     background_tasks: BackgroundTasks,
     ip: str = Depends(verify_access_and_rate_limit)
 ):
-    """Initiates an LLM-driven CAD generation job."""
+    """Initiates an LLM-driven CAD generation job using LangGraph."""
     job_id = uuid.uuid4().hex[:12]
-    # Fire the LLM orchestrator in the background
-    background_tasks.add_task(pipeline.run_job, job_id, body)
+    JOB_STATES[job_id] = {"status": "queued", "log": ["Initializing multi-agent graph..."]}
+    
+    async def run_graph():
+        JOB_STATES[job_id]["status"] = "running"
+        try:
+            # Execute the LangGraph State Machine (Agent 0 -> Agent 4)
+            final_state = await orchestrator.execute_job(job_id, body.prompt)
+            
+            if final_state.get("error_traceback") and not final_state.get("final_result"):
+                JOB_STATES[job_id]["status"] = "error"
+                JOB_STATES[job_id]["error"] = final_state["error_traceback"]
+            else:
+                JOB_STATES[job_id]["status"] = "done"
+                res = final_state.get("final_result", {})
+                JOB_STATES[job_id]["result"] = {
+                    "ok": True, 
+                    "code": final_state.get("cad_code"), 
+                    "volume_mm3": res.get("volume"), 
+                    "bbox": res.get("bbox"),
+                    "physics": final_state.get("physics_report")
+                }
+        except Exception as e:
+            JOB_STATES[job_id]["status"] = "error"
+            JOB_STATES[job_id]["error"] = str(e)
+
+    background_tasks.add_task(run_graph)
     return {"job": job_id}
 
 @router.get("/jobs/{job_id}", response_model=JobResponse)
 async def get_job(job_id: str):
     """Polls the status of an ongoing or completed job."""
-    state = pipeline.get_job_state(job_id)
+    state = JOB_STATES.get(job_id)
     if not state:
         raise HTTPException(status_code=404, detail="Unknown job or expired")
     return state

@@ -82,17 +82,44 @@ class CadOrchestrator:
         return {"bom_json": self.llm.extract_json(raw_json)}
 
     async def node_coder(self, state: CadGraphState) -> Dict[str, Any]:
-        """Agent 2: Generates CadQuery python code. Handles repair feedback if present."""
-        sys_prompt = "You are an expert CadQuery engineer. Output ONLY valid python code. Assign the final shape to `result`."
+        """Agent 2: Generates CadQuery python code using Vector Search routing."""
         
-        user_content = f"BOM/Specs: {state['bom_json']}\n"
-        if state.get("error_traceback"):
-            user_content += f"\nPREVIOUS CODE FAILED with error:\n{state['error_traceback']}\nFix the code."
+        # 1. Generate Semantic Embedding of the Intent
+        embedding = await self.llm.get_embedding(state["expanded_prompt"] or state["raw_prompt"])
+        
+        # 2. Query Supabase pgvector
+        matches = self.repo.search_similar_cad(embedding, threshold=0.70, limit=2)
+        
+        best_match = matches[0] if matches else None
+        
+        if best_match and best_match["similarity"] >= 0.85 and not state.get("error_traceback"):
+            # AGENT 2A: PARAMETRIC MODIFIER (High Confidence Cache Hit)
+            logger.info(f"High similarity hit ({best_match['similarity']}). Invoking Modifier.")
+            sys_prompt = "You are a CAD Parametric Modifier. Take the provided working CadQuery code and modify ONLY the variable assignments and dimensions to match the requested BOM constraints. DO NOT alter the core geometric logic or add new workplanes unless requested."
+            
+            user_content = f"Target BOM/Specs: {state['bom_json']}\n\nWorking Template Code:\n```python\n{best_match['code']}\n```"
+            
+        else:
+            # AGENT 2B: ATOMIC CODER (Cache Miss or Repair Loop)
+            logger.info("Cache miss or Repair loop. Invoking Atomic Coder.")
+            sys_prompt = "You are an expert CadQuery engineer. Output ONLY valid python code. Assign the final shape to `result`."
+            
+            user_content = f"BOM/Specs: {state['bom_json']}\n"
+            
+            # Inject partial matches as few-shot examples
+            if matches:
+                user_content += "\nReference Examples for syntax/style:\n"
+                for m in matches:
+                    user_content += f"- {m['prompt']}\n```python\n{m['code']}\n```\n"
 
+            if state.get("error_traceback"):
+                user_content += f"\nPREVIOUS CODE FAILED with error:\n{state['error_traceback']}\nAnalyze the traceback and fix the code."
+
+        # 3. Generate and Extract
         raw_code = await self.llm.generate([
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": user_content}
-        ], temperature=0.2)
+        ], temperature=0.2, is_coder=True)
         
         clean_code = self.llm.extract_code(raw_code)
         return {"cad_code": clean_code}

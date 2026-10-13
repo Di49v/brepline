@@ -74,3 +74,18 @@ class CadRepository:
             self.client.table("feedback").insert(payload).execute()
         except Exception as e:
             logger.error(f"Failed to save feedback for job {job_id}: {e}")
+            
+    def search_similar_cad(self, query_embedding: list[float], threshold: float = 0.70, limit: int = 3) -> list[Dict[str, Any]]:
+        """
+        Executes the pgvector similarity search via Supabase RPC.
+        Returns matching CadQuery templates.
+        """
+        try:
+            response = self.client.rpc(
+                "match_cad_examples", 
+                {"query_embedding": query_embedding, "match_threshold": threshold, "match_count": limit}
+            ).execute()
+            return response.data
+        except Exception as e:
+            logger.error(f"Vector search failed: {e}")
+            return []

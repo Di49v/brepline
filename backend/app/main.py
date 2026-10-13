@@ -8,14 +8,15 @@ app = FastAPI(title="Brepline API", version="2.0.0")
 # Dynamic CORS Strategy
 if settings.environment == "development":
     # Open local development ports
-    origins = [
-        "http://localhost:5173",  # Vite default
+    origins = list(set([
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
         "http://localhost:3000",
-        "http://127.0.0.1:5173"
-    ]
+        *settings.cors_origins
+    ]))
 else:
     # Strict production origins parsing
-    origins = [o.strip() for o in settings.allowed_origins if o.strip()]
+    origins = settings.cors_origins
 
 app.add_middleware(
     CORSMiddleware,

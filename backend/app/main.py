@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv()  # Injects .env into os.environ for LangSmith
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings

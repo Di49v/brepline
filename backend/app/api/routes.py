@@ -78,14 +78,45 @@ async def create_job(
 ):
     """Initiates an LLM-driven CAD generation job using LangGraph."""
     job_id = uuid.uuid4().hex[:12]
-    JOB_STATES[job_id] = {"status": "queued", "log": ["Initializing multi-agent graph..."]}
+    JOB_STATES[job_id] = {"status": "queued", "log": ["planning"]}
     
     async def run_graph():
         JOB_STATES[job_id]["status"] = "running"
         try:
-            # Execute the LangGraph State Machine (Agent 0 -> Agent 4)
-            final_state = await orchestrator.execute_job(job_id, body.prompt)
+            initial_state = {
+                "job_id": job_id,
+                "raw_prompt": body.prompt,
+                "expanded_prompt": None,
+                "bom_json": None,
+                "cad_code": None,
+                "error_traceback": None,
+                "repair_attempts": 0,
+                "physics_report": None,
+                "final_result": None
+            }
             
+            # Stream the LangGraph execution live
+            final_state = dict(initial_state)
+            async for event in orchestrator.graph.astream(initial_state):
+                for node_name, node_state in event.items():
+                    final_state.update(node_state)
+                    
+                    # Map Agent nodes to the legacy logs App.jsx expects
+                    if node_name == "intent_analyzer":
+                        JOB_STATES[job_id]["log"].append("planning")
+                    elif node_name == "specifier":
+                        JOB_STATES[job_id]["log"].append("generating candidates")
+                    elif node_name == "coder":
+                        attempt = final_state.get('repair_attempts', 0)
+                        if attempt > 0:
+                            JOB_STATES[job_id]["log"].append(f"repair round {attempt}")
+                    elif node_name == "compiler":
+                        if not final_state.get("error_traceback"):
+                            JOB_STATES[job_id]["log"].append("best candidate found")
+                    elif node_name == "auditor":
+                        JOB_STATES[job_id]["log"].append("done")
+
+            # Handle Final State
             if final_state.get("error_traceback") and not final_state.get("final_result"):
                 JOB_STATES[job_id]["status"] = "error"
                 JOB_STATES[job_id]["error"] = final_state["error_traceback"]

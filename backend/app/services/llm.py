@@ -5,6 +5,7 @@ import logging
 import asyncio
 from typing import List, Dict, Any, Optional
 from openai import AsyncOpenAI
+from langsmith.wrappers import wrap_openai
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -12,27 +13,27 @@ logger = logging.getLogger(__name__)
 class LLMService:
     def __init__(self):
         # 1. Primary Reasoning Client (Agents 0, 1, and general tasks) - Defaults to local Ollama
-        self.reasoning_client = AsyncOpenAI(
+        self.reasoning_client = wrap_openai(AsyncOpenAI(
             base_url=settings.llm_base_url,
             api_key=settings.llm_api_key,
             timeout=120.0
-        )
+        ))
         
         # 2. Specialized Coder Client (Agent 2) - Configured for your teammate's fine-tuned model
-        self.coder_client = AsyncOpenAI(
+        self.coder_client = wrap_openai(AsyncOpenAI(
             base_url=settings.coder_base_url,
             api_key=settings.coder_api_key,
             timeout=120.0
-        )
+        ))
         
         # 3. Optional Separate Planner Endpoint (if configured via env)
         self.planner_client = None
         if os.getenv("PLAN_BASE_URL"):
-            self.planner_client = AsyncOpenAI(
+            self.planner_client = wrap_openai(AsyncOpenAI(
                 base_url=os.getenv("PLAN_BASE_URL"),
                 api_key=os.getenv("PLAN_API_KEY", settings.llm_api_key),
                 timeout=60.0
-            )
+            ))
 
     async def generate(
         self, 

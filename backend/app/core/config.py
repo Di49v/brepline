@@ -28,17 +28,17 @@ class Settings(BaseSettings):
         default="test_key",
         validation_alias=AliasChoices("SUPABASE_KEY", "SUPABASE_SERVICE_KEY", "supabase_key", "supabase_service_key")
     )
-    
+
     # LLM Configuration (Reasoning / Agents 0 & 1)
     llm_base_url: str = Field(default="http://localhost:11434/v1")
     llm_api_key: str = Field(default="ollama")
     llm_model: str = Field(default="qwen2.5-coder")
     llm_mode: str = Field(default="chat")
-    
-    # Coder Configuration (Agent 2)
+
+    # Coder Configuration (Agent 2 - Teammate's Model)
     coder_base_url: str = Field(default="http://localhost:11434/v1")
     coder_api_key: str = Field(default="ollama")
-    coder_model: str = Field(default="qwen2.5-coder:7b")
+    coder_model: str = Field(default="qwen2.5-coder")
 
     # CAD Execution
     out_dir: str = Field(default="/tmp/cad_out")

@@ -1,0 +1,27 @@
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Setup/Tooling
+.pytest_cache/
+.coverage
+htmlcov/
+.uv/
+
+# CAD Output & Data (Temporary sandboxes)
+cad_out/
+cad_data/
+/tmp/
+*.step
+*.stl

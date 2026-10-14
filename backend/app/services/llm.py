@@ -3,7 +3,7 @@ import json
 import logging
 import asyncio
 from typing import List, Dict, Any, Literal
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, APITimeoutError
 from langsmith.wrappers import wrap_openai
 from app.core.config import settings
 
@@ -13,32 +13,32 @@ AgentRole = Literal["intent", "planner", "modifier", "coder"]
 
 class LLMService:
     def __init__(self):
-        # 1. Local/Default Fallback Client
+        # 1. Local/Default Fallback Client (120s timeout)
         self.local_client = wrap_openai(AsyncOpenAI(
             base_url=settings.llm_base_url,
             api_key=settings.llm_api_key,
-            timeout=90.0
+            timeout=120.0
         ))
 
-        # 2. Google Gemini Client (High-Quota Free Tier: 3.5-flash-lite, gemma-4-31b-it, 3.8-flash, embedding-2)
+        # 2. Google Gemini Client (Increased timeout to 180s for heavy code gen)
         self.gemini_client = wrap_openai(AsyncOpenAI(
             base_url=settings.gemini_base_url,
             api_key=settings.gemini_api_key,
-            timeout=60.0
+            timeout=180.0
         )) if settings.gemini_api_key else None
 
-        # 3. Groq Cloud Client (Ultra-fast Planner: openai/gpt-oss-120b)
+        # 3. Groq Cloud Client (120s timeout)
         self.planner_client = wrap_openai(AsyncOpenAI(
             base_url=settings.plan_base_url,
             api_key=settings.plan_api_key,
-            timeout=45.0
+            timeout=120.0
         )) if settings.plan_api_key else None
 
-        # 4. Teammate's Fine-Tuned Cluster Client (Agent 2B Primary Coder)
+        # 4. Teammate's Fine-Tuned Cluster Client (180s timeout)
         self.coder_client = wrap_openai(AsyncOpenAI(
             base_url=settings.coder_base_url,
             api_key=settings.coder_api_key,
-            timeout=120.0
+            timeout=180.0
         ))
 
     def _get_candidate_chain(self, role: AgentRole):
@@ -73,18 +73,18 @@ class LLMService:
     async def generate(
         self,
         messages: List[Dict[str, str]],
-         temperature: float = 0.2,
+        temperature: float = 0.2,
         max_tokens: int = 2500,
         role: AgentRole = "planner"
     ) -> str:
-        """Executes an async chat completion with automatic multi-provider failover."""
+        """Executes chat completion with automatic failover and robust timeout catching."""
         candidates = self._get_candidate_chain(role)
         last_err = None
 
         for client, model in candidates:
             for attempt in range(2):
                 try:
-                    r = await client.chat.completions.create(
+                    r = await client.completions.create if False else await client.chat.completions.create(
                         model=model,
                         messages=messages,
                         temperature=temperature,
@@ -93,9 +93,9 @@ class LLMService:
                     content = r.choices[0].message.content or ""
                     if content.strip():
                         return content
-                except Exception as e:
+                except (APITimeoutError, asyncio.TimeoutError, Exception) as e:
                     last_err = e
-                    logger.warning(f"[{role.upper()}] {model} (attempt {attempt+1}) failed: {e}")
+                    logger.warning(f"[{role.upper()}] {model} (attempt {attempt+1}) failed/timed out: {e}")
                     if attempt == 0:
                         await asyncio.sleep(1)
 
@@ -122,13 +122,43 @@ class LLMService:
 
     @staticmethod
     def extract_code(text: str) -> str:
-        """Extracts python code blocks safely from LLM text outputs."""
+        """Extracts python code blocks safely, filtering out stray markdown text or bullet points."""
         m = re.search(r"```(?:python|py)?\s*\n(.*?)(?:```|$)", text, re.S)
-        if m:
-            return m.group(1).strip() + "\n"
-        if "import cadquery" in text or "result" in text:
-            return text.strip() + "\n"
-        return ""
+        raw_code = m.group(1).strip() if m else text.strip()
+        
+        if not raw_code and ("import cadquery" in text or "result" in text):
+            raw_code = text.strip()
+
+        # Clean up lines inside the code block that are accidental markdown/bullet points
+        cleaned_lines = []
+        for line in raw_code.splitlines():
+            stripped = line.strip()
+            # Skip stray bullet points, markdown headers, or LaTeX math lines that aren't valid Python comments
+            if stripped.startswith(('* ', '- ')) and not stripped.startswith('#'):
+                # Convert bullet to a Python comment if it looks like a note
+                cleaned_lines.append(f"# {stripped[2:]}")
+                continue
+            if stripped.startswith('$') or ('$' in stripped and '=' in stripped and not any(op in stripped for op in ['+', '-', '*', '/', '=', '=='])):
+                cleaned_lines.append(f"# {stripped}")
+                continue
+            cleaned_lines.append(line)
+
+        raw_code = "\n".join(cleaned_lines)
+
+        # Handle top-level indentation anomalies
+        lines = raw_code.splitlines()
+        non_empty_lines = [l for l in lines if l.strip()]
+        if non_empty_lines:
+            leading_spaces = [len(l) - len(l.lstrip(' ')) for l in non_empty_lines if not l.strip().startswith('#')]
+            if leading_spaces and min(leading_spaces) > 0:
+                min_indent = min(leading_spaces)
+                dedented_lines = [
+                    line[min_indent:] if line.strip() and len(line) >= min_indent and line[:min_indent].isspace() else line
+                    for line in lines
+                ]
+                raw_code = "\n".join(dedented_lines)
+
+        return raw_code + "\n"
 
     @staticmethod
     def extract_json(text: str) -> Dict[str, Any]:

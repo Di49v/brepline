@@ -152,15 +152,18 @@ class CadOrchestrator:
 
         # AGENT 2B: ATOMIC CODER (Cache Miss or Repair Loop)
         logger.info("Cache MISS or Repair Loop. Routing to Agent 2B (Atomic Coder).")
+        
         sys_prompt = (
-            "You are a Large Mechanical Model. Generate Python CadQuery code for the requested geometry. "
-            "Assign the final solid to `result` (or a dict of solids to `parts`). "
+            "You are an expert OpenCASCADE and CadQuery engineer. Output ONLY valid Python code inside a markdown block. "
+            "CRITICAL REQUIREMENT: You MUST assign your final combined solid object or assembly to a variable named exactly `result` "
+            "(e.g., `result = bracket` or `result = gear`). If you do not define `result`, the compilation will fail instantly. "
             "Pre-loaded helper functions available in the global namespace (do NOT redefine or import them):\n"
             "- `spur_gear(m, z, t, bore=0)` -> returns a cq.Workplane spur gear (module m, teeth z, thickness t, bore diameter)\n"
             "- `radial(shape, n, r=0)` -> copies `shape` n times around Z axis and unions them\n"
             "- `bolt_circle(body, n, r, d, face='>Z')` -> drills n through-holes of diameter d on radius r\n"
             "Ensure all boolean features overlap so `result` is a single connected solid."
         )
+        
         user_content = (
             f"Create a CadQuery model. Units are millimeters, Z up.\n"
             f"Specification: {state.get('expanded_prompt') or state['raw_prompt']}\n"

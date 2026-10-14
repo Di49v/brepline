@@ -37,16 +37,26 @@ class SandboxExecutor:
             return None
 
     async def run_code(self, code: str, wd: str, timeout: int = None) -> Dict[str, Any]:
-        """Runs the CAD script asynchronously in a sandboxed subprocess."""
+        """Runs the CAD script asynchronously in a sandboxed subprocess and loads meta.json + mesh.json."""
         timeout = timeout or settings.cad_timeout_seconds
         os.makedirs(wd, exist_ok=True)
         
         script_path = os.path.join(wd, "model.py")
-        with open(script_path, "w") as f:
+        with open(script_path, "w", encoding="utf-8") as f:
             f.write(code)
 
-        # Strip LLM/DB credentials from the child process environment
-        safe_env = {k: v for k, v in os.environ.items() if not k.startswith(("LLM_", "ACCESS_", "ADMIN_", "SUPABASE_"))}
+        # Strip LLM/DB credentials from the child process environment & force UTF-8 I/O
+        safe_env = {
+            k: v for k, v in os.environ.items()
+            if not k.startswith(("LLM_", "ACCESS_", "ADMIN_", "SUPABASE_", "GEMINI_", "PLAN_", "CODER_"))
+        }
+        safe_env["PYTHONIOENCODING"] = "utf-8"
+        safe_env["PYTHONUTF8"] = "1"
+
+        popen_kwargs: Dict[str, Any] = {}
+        if sys.platform.startswith("linux"):
+            popen_kwargs["preexec_fn"] = self._make_preexec()
+            popen_kwargs["start_new_session"] = True
 
         async with CAD_SEMAPHORE:
             try:
@@ -56,8 +66,7 @@ class SandboxExecutor:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     env=safe_env,
-                    preexec_fn=self._make_preexec(),
-                    start_new_session=True
+                    **popen_kwargs
                 )
                 
                 try:
@@ -67,14 +76,25 @@ class SandboxExecutor:
                     return {"ok": False, "error": f"Timeout after {timeout}s (model too complex)"}
                     
                 meta_path = os.path.join(wd, "meta.json")
+                mesh_path = os.path.join(wd, "mesh.json")
                 if os.path.exists(meta_path):
                     try:
-                        with open(meta_path, "r") as f:
-                            return json.load(f)
+                        with open(meta_path, "r", encoding="utf-8") as f:
+                            meta = json.load(f)
+                        # Merge mesh.json so App.jsx can render the 3D model!
+                        if meta.get("ok") and os.path.exists(mesh_path):
+                            with open(mesh_path, "r", encoding="utf-8") as mf:
+                                meta["mesh"] = json.load(mf)
+                        meta["files"] = {
+                            "step": os.path.exists(os.path.join(wd, "model.step")),
+                            "stl": os.path.exists(os.path.join(wd, "model.stl")),
+                            "py": os.path.exists(script_path)
+                        }
+                        return meta
                     except json.JSONDecodeError:
                         pass
                 
-                err_out = (stderr.decode() if stderr else "")[-600:]
+                err_out = (stderr.decode("utf-8", errors="replace") if stderr else "")[-600:]
                 return {"ok": False, "error": f"Runner crashed (rc={process.returncode}): {err_out}"}
 
             except Exception as e:

@@ -1,4 +1,4 @@
-"""Executed in a sandboxed subprocess by cadpipe.run_sandbox.
+"""Executed in a sandboxed subprocess by SandboxExecutor.run_code.
 
 usage: python runner.py <code.py> <out_dir>
 Writes out_dir/meta.json, out_dir/mesh.json, out_dir/model.step, out_dir/model.stl
@@ -15,7 +15,7 @@ def main():
     meta = {"ok": False}
 
     def done():
-        with open(os.path.join(out, "meta.json"), "w") as f:
+        with open(os.path.join(out, "meta.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f)
 
     try:
@@ -23,10 +23,19 @@ def main():
         import numpy
         from helpers import radial, bolt_circle, spur_gear
 
-        src = open(code_path).read()
-        ns = {"__name__": "__cad__", "cq": cq, "math": math, "np": numpy,
-              "numpy": numpy, "radial": radial, "bolt_circle": bolt_circle,
-              "spur_gear": spur_gear}
+        with open(code_path, "r", encoding="utf-8") as f:
+            src = f.read()
+
+        ns = {
+            "__name__": "__cad__",
+            "cq": cq,
+            "math": math,
+            "np": numpy,
+            "numpy": numpy,
+            "radial": radial,
+            "bolt_circle": bolt_circle,
+            "spur_gear": spur_gear,
+        }
         exec(compile(src, "model.py", "exec"), ns)
 
         res, parts = ns.get("result"), ns.get("parts")
@@ -52,8 +61,12 @@ def main():
             meta["area"] = float(shape.Area())
             c = shape.Center()
             meta["com"] = [c.x, c.y, c.z]
-            meta["counts"] = {"solids": len(solids), "faces": len(shape.Faces()),
-                              "edges": len(shape.Edges()), "vertices": len(shape.Vertices())}
+            meta["counts"] = {
+                "solids": len(solids),
+                "faces": len(shape.Faces()),
+                "edges": len(shape.Edges()),
+                "vertices": len(shape.Vertices()),
+            }
         except Exception:
             pass
 
@@ -70,9 +83,11 @@ def main():
             for a, b, c in t:
                 tris += [base + a, base + b, base + c]
                 tri_part.append(pi)
-        with open(os.path.join(out, "mesh.json"), "w") as f:
-            json.dump({"verts": verts, "tris": tris, "tri_part": tri_part,
-                       "parts": names}, f)
+        with open(os.path.join(out, "mesh.json"), "w", encoding="utf-8") as f:
+            json.dump(
+                {"verts": verts, "tris": tris, "tri_part": tri_part, "parts": names},
+                f,
+            )
 
         wp = cq.Workplane("XY").newObject([shape])
         cq.exporters.export(wp, os.path.join(out, "model.step"))

@@ -144,8 +144,9 @@ class CadOrchestrator:
             user_content = f"Target BOM:\n{bom}\n\nCached Template Code:\n```python\n{best_match['code']}\n```"
             raw_code = await self.llm.generate(
                 [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_content}],
-                temperature=0.1,
-                role="modifier"
+                temperature=0.2,
+                max_tokens=4000,  # <-- Increased to prevent mid-line token truncation
+                role="coder"
             )
             return {"cad_code": self.llm.extract_code(raw_code) or best_match["code"], "cached_hit": True}
 

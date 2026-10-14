@@ -1,4 +1,3 @@
-import os
 from pathlib import Path
 from typing import List
 from pydantic import Field, AliasChoices
@@ -29,22 +28,35 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("SUPABASE_KEY", "SUPABASE_SERVICE_KEY", "supabase_key", "supabase_service_key")
     )
 
-    # LLM Configuration (Reasoning / Agents 0 & 1)
-    llm_base_url: str = Field(default="http://localhost:11434/v1")
-    llm_api_key: str = Field(default="ollama")
-    llm_model: str = Field(default="qwen2.5-coder")
-    llm_mode: str = Field(default="chat")
+    # Google Gemini Cloud (High-Quota Models + Embeddings)
+    gemini_base_url: str = Field(default="https://generativelanguage.googleapis.com/v1beta/openai/")
+    gemini_api_key: str = Field(default="")
+    intent_model: str = Field(default="gemini-3.5-flash-lite")
+    modifier_model: str = Field(default="gemma-4-31b-it")
+    coder_fallback_model: str = Field(default="gemini-3.8-flash")
+    embedding_model: str = Field(default="gemini-embedding-2")
 
-    # Coder Configuration (Agent 2 - Teammate's Model)
+    # Groq Cloud Planner (Agent 1)
+    plan_base_url: str = Field(default="https://api.groq.com/openai/v1")
+    plan_api_key: str = Field(default="")
+    plan_model: str = Field(default="openai/gpt-oss-120b")
+
+    # Teammate's Cluster Coder (Agent 2B)
     coder_base_url: str = Field(default="http://localhost:11434/v1")
     coder_api_key: str = Field(default="ollama")
-    coder_model: str = Field(default="qwen2.5-coder")
+    coder_model: str = Field(default="brepline")
+
+    # Local Fallback LLM Configuration
+    llm_base_url: str = Field(default="http://localhost:11434/v1")
+    llm_api_key: str = Field(default="ollama")
+    llm_model: str = Field(default="qwen2.5-coder:7b")
+    llm_mode: str = Field(default="chat")
 
     # CAD Execution
     out_dir: str = Field(default="/tmp/cad_out")
     cad_workers: int = Field(default=2)
-    cad_timeout_seconds: int = Field(default=90)
-    cad_mem_limit_mb: int = Field(default=4096)
+    cad_timeout_seconds: int = Field(default=90, validation_alias=AliasChoices("CAD_TIMEOUT", "cad_timeout_seconds"))
+    cad_mem_limit_mb: int = Field(default=4096, validation_alias=AliasChoices("CAD_MEM_MB", "cad_mem_limit_mb"))
 
     @property
     def cors_origins(self) -> List[str]:

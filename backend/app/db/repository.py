@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from app.db.client import get_supabase_client
 
 logger = logging.getLogger(__name__)
@@ -9,12 +9,8 @@ class CadRepository:
         self.client = get_supabase_client()
 
     def save_generation(self, record: Dict[str, Any]) -> None:
-        """
-        Persists a completed CAD generation job to PostgreSQL.
-        Replaces: Firebase generations collection + local JSONL append.
-        """
+        """Persists a completed CAD generation job to PostgreSQL."""
         try:
-            # Map the application record to the SQL schema defined in Milestone 1
             payload = {
                 "job_id": record.get("job"),
                 "source": record.get("source", "user"),
@@ -34,7 +30,8 @@ class CadRepository:
                     "volume_mm3": record.get("volume_mm3"),
                     "mass_g": record.get("mass_g"),
                     "attempts": record.get("attempts"),
-                    "elapsed_s": record.get("elapsed_s")
+                    "elapsed_s": record.get("elapsed_s"),
+                    "physics": record.get("physics")
                 },
                 "llm_model": record.get("llm_model")
             }
@@ -43,10 +40,17 @@ class CadRepository:
         except Exception as e:
             logger.error(f"Failed to save generation {record.get('job')}: {e}")
 
+    def get_generation(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieves a previous generation by job_id for conversational refinement."""
+        try:
+            res = self.client.table("generations").select("*").eq("job_id", job_id).limit(1).execute()
+            return res.data[0] if res.data else None
+        except Exception as e:
+            logger.error(f"Failed to fetch generation {job_id}: {e}")
+            return None
+
     def save_failure(self, record: Dict[str, Any]) -> None:
-        """
-        Persists a failed attempt to PostgreSQL.
-        """
+        """Persists a failed attempt to PostgreSQL."""
         try:
             payload = {
                 "job_id": record.get("job"),
@@ -61,9 +65,7 @@ class CadRepository:
             logger.error(f"Failed to save failure for job {record.get('job')}: {e}")
 
     def save_feedback(self, job_id: str, vote: str, comment: str, ip_hash: str) -> None:
-        """
-        Persists user feedback on a generation.
-        """
+        """Persists user feedback on a generation."""
         try:
             payload = {
                 "job_id": job_id,
@@ -74,7 +76,7 @@ class CadRepository:
             self.client.table("feedback").insert(payload).execute()
         except Exception as e:
             logger.error(f"Failed to save feedback for job {job_id}: {e}")
-            
+
     def search_similar_cad(self, query_embedding: list[float], threshold: float = 0.70, limit: int = 3) -> list[Dict[str, Any]]:
         """
         Executes the pgvector similarity search via Supabase RPC.
@@ -85,7 +87,19 @@ class CadRepository:
                 "match_cad_examples", 
                 {"query_embedding": query_embedding, "match_threshold": threshold, "match_count": limit}
             ).execute()
-            return response.data
+            return response.data or []
         except Exception as e:
             logger.error(f"Vector search failed: {e}")
             return []
+
+    def save_example_to_cache(self, tags: List[str], prompt: str, code: str, embedding: List[float]) -> None:
+        """Saves newly verified canonical geometry into cad_examples for future cache hits."""
+        try:
+            self.client.table("cad_examples").insert({
+                "tags": tags,
+                "prompt": prompt,
+                "code": code,
+                "embedding": embedding
+            }).execute()
+        except Exception as e:
+            logger.warning(f"Failed to cache example '{prompt[:40]}': {e}")

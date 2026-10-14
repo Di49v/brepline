@@ -1,6 +1,5 @@
-import operator
 import logging
-from typing import TypedDict, Annotated, List, Dict, Any, Optional
+from typing import TypedDict, Dict, Any, Optional
 from langgraph.graph import StateGraph, END
 from app.services.llm import LLMService
 from app.sandbox.executor import SandboxExecutor
@@ -9,13 +8,26 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# 1. Define the System State
+MATERIAL_DENSITIES_G_CM3 = {
+    "Al 6061": 2.70,
+    "Steel": 7.85,
+    "Titanium": 4.43,
+    "Brass": 8.50,
+    "Copper": 8.96,
+    "PLA": 1.24,
+    "ABS": 1.04,
+}
+
 class CadGraphState(TypedDict):
     job_id: str
     raw_prompt: str
+    material: str
+    fresh: bool
+    parent_job: Optional[str]
     expanded_prompt: Optional[str]
     bom_json: Optional[Dict[str, Any]]
     cad_code: Optional[str]
+    cached_hit: bool
     error_traceback: Optional[str]
     repair_attempts: int
     physics_report: Optional[Dict[str, Any]]
@@ -62,71 +74,117 @@ class CadOrchestrator:
     # --- Node Implementations ---
 
     async def node_intent_analyzer(self, state: CadGraphState) -> Dict[str, Any]:
-        """Agent 0: Expands sparse prompts and extracts implicit mechanical requirements."""
-        sys_prompt = "You are a Requirements Engineer. Expand the user's CAD request to include reasonable default mechanical constraints if missing (e.g. wall thickness, tolerances). Output ONLY the expanded prompt."
-        expanded = await self.llm.generate([
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": state["raw_prompt"]}
-        ], temperature=0.3, max_tokens=300)
-        
+        """Agent 0: Expands sparse prompts and strips material names so geometry is material-agnostic."""
+        sys_prompt = (
+            "You are Agent 0: Mechanical Requirements Engineer. Expand the user's CAD prompt into "
+            "a clear, material-agnostic geometric specification in millimeters (Z-axis up). "
+            "CRITICAL: Remove all material names (e.g., Copper, Aluminum, Steel, PLA) so the geometric "
+            "description is 100% independent of material. Output ONLY the expanded geometric prompt."
+        )
+        expanded = await self.llm.generate(
+            [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": state["raw_prompt"]}
+            ],
+            temperature=0.2,
+            max_tokens=350,
+            role="intent"
+        )
         return {"expanded_prompt": expanded.strip()}
 
     async def node_specifier(self, state: CadGraphState) -> Dict[str, Any]:
-        """Agent 1: Decomposes the prompt into a structured JSON BOM and interface constraints."""
-        sys_prompt = "You are a CAD Planner. Convert the prompt into a JSON object: {'parts': [{'name': '...', 'type': '...', 'dimensions': {}}], 'shared_interfaces': {}}."
-        raw_json = await self.llm.generate([
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": state["expanded_prompt"]}
-        ], temperature=0.1, max_tokens=800, planner=True)
-        
+        """Agent 1: Decomposes prompt into a structured BOM with a canonical material-agnostic search query."""
+        sys_prompt = (
+            "You are Agent 1: Chief Mechanical Decomposer. Convert the geometric specification into a strict JSON object:\n"
+            "{\n"
+            "  \"object\": \"short 2-4 word part name (no material names)\",\n"
+            "  \"canonical_query\": \"standardized material-agnostic description of the geometry and dimensions for vector cache lookup\",\n"
+            "  \"parts\": [{\"id\": \"main_body\", \"type\": \"primitive_or_feature\", \"dimensions\": {}}],\n"
+            "  \"shared_interfaces\": {}\n"
+            "}\n"
+            "Output ONLY valid JSON."
+        )
+        raw_json = await self.llm.generate(
+            [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": state["expanded_prompt"] or state["raw_prompt"]}
+            ],
+            temperature=0.1,
+            max_tokens=800,
+            role="planner"
+        )
         return {"bom_json": self.llm.extract_json(raw_json)}
 
     async def node_coder(self, state: CadGraphState) -> Dict[str, Any]:
-        """Agent 2: Generates CadQuery python code using Vector Search routing."""
+        """Agent 2A (Parametric Modifier on Cache Hit) & Agent 2B (Atomic Coder on Cache Miss)."""
+        bom = state.get("bom_json") or {}
         
         # 1. Generate Semantic Embedding of the Intent
-        embedding = await self.llm.get_embedding(state["expanded_prompt"] or state["raw_prompt"])
-        
+        canonical_query = bom.get("canonical_query") or state.get("expanded_prompt") or state["raw_prompt"]
+
         # 2. Query Supabase pgvector
-        matches = self.repo.search_similar_cad(embedding, threshold=0.70, limit=2)
-        
+        matches = []
+        if not state.get("fresh"):
+            try:
+                embedding = await self.llm.get_embedding(canonical_query)
+                matches = self.repo.search_similar_cad(embedding, threshold=0.70, limit=2)
+            except Exception as e:
+                logger.warning(f"Vector cache lookup skipped: {e}")
+
         best_match = matches[0] if matches else None
-        
+
         if best_match and best_match["similarity"] >= 0.85 and not state.get("error_traceback"):
             # AGENT 2A: PARAMETRIC MODIFIER (High Confidence Cache Hit)
-            logger.info(f"High similarity hit ({best_match['similarity']}). Invoking Modifier.")
-            sys_prompt = "You are a CAD Parametric Modifier. Take the provided working CadQuery code and modify ONLY the variable assignments and dimensions to match the requested BOM constraints. DO NOT alter the core geometric logic or add new workplanes unless requested."
-            
-            user_content = f"Target BOM/Specs: {state['bom_json']}\n\nWorking Template Code:\n```python\n{best_match['code']}\n```"
-            
-        else:
-            # AGENT 2B: ATOMIC CODER (Cache Miss or Repair Loop)
-            logger.info("Cache miss or Repair loop. Invoking Atomic Coder.")
-            sys_prompt = "You are an expert CadQuery engineer. Output ONLY valid python code. Assign the final shape to `result`."
-            
-            user_content = f"BOM/Specs: {state['bom_json']}\n"
-            
-            # Inject partial matches as few-shot examples
-            if matches:
-                user_content += "\nReference Examples for syntax/style:\n"
-                for m in matches:
-                    user_content += f"- {m['prompt']}\n```python\n{m['code']}\n```\n"
+            logger.info(f"Cache HIT ({best_match['similarity']:.2f}) on '{canonical_query}'. Routing to Agent 2A (Modifier).")
+            sys_prompt = (
+                "You are Agent 2A: Parametric CAD Modifier. You are given a verified CadQuery script from cache. "
+                "If the Target BOM dimensions match the template, return the template code UNCHANGED. "
+                "If any dimensions differ, update ONLY those numeric parameters. Output ONLY valid Python code."
+            )
+            user_content = f"Target BOM:\n{bom}\n\nCached Template Code:\n```python\n{best_match['code']}\n```"
+            raw_code = await self.llm.generate(
+                [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_content}],
+                temperature=0.1,
+                role="modifier"
+            )
+            return {"cad_code": self.llm.extract_code(raw_code) or best_match["code"], "cached_hit": True}
 
-            if state.get("error_traceback"):
-                user_content += f"\nPREVIOUS CODE FAILED with error:\n{state['error_traceback']}\nAnalyze the traceback and fix the code."
+        # AGENT 2B: ATOMIC CODER (Cache Miss or Repair Loop)
+        logger.info("Cache MISS or Repair Loop. Routing to Agent 2B (Atomic Coder).")
+        sys_prompt = (
+            "You are a Large Mechanical Model. Generate Python CadQuery code for the requested geometry. "
+            "Assign the final solid to `result`. Ensure all features overlap so `result` is a single connected solid."
+        )
+        user_content = (
+            f"Create a CadQuery model. Units are millimeters, Z up.\n"
+            f"Specification: {state.get('expanded_prompt') or state['raw_prompt']}\n"
+            f"BOM: {bom}\n"
+        )
+        # Inject partial matches as few-shot examples
+        if matches:
+            user_content += "\nReference Examples:\n"
+            for m in matches:
+                user_content += f"- {m['prompt']}\n```python\n{m['code']}\n```\n"
+
+        if state.get("error_traceback"):
+            user_content += f"\nPREVIOUS CODE FAILED with error:\n{state['error_traceback']}\nFix the CadQuery code."
 
         # 3. Generate and Extract
-        raw_code = await self.llm.generate([
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": user_content}
-        ], temperature=0.2, is_coder=True)
-        
-        clean_code = self.llm.extract_code(raw_code)
-        return {"cad_code": clean_code}
+        raw_code = await self.llm.generate(
+            [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_content}],
+            temperature=0.2,
+            role="coder"
+        )
+        return {"cad_code": self.llm.extract_code(raw_code), "cached_hit": False}
 
     async def node_compiler(self, state: CadGraphState) -> Dict[str, Any]:
-        """Agent 3: Executes code in isolated subprocess. Returns metrics or traceback."""
-        wd = f"{settings.out_dir}/{state['job_id']}_r{state['repair_attempts']}"
+        if not state.get("cad_code"):
+            return {
+                "error_traceback": "Coder returned empty code block.",
+                "repair_attempts": state["repair_attempts"] + 1
+            }
+
+        wd = f"{settings.out_dir}/{state['job_id']}"
         exec_result = await self.sandbox.run_code(state["cad_code"], wd)
 
         if not exec_result.get("ok"):
@@ -134,11 +192,8 @@ class CadOrchestrator:
                 "error_traceback": exec_result.get("error", "Unknown runtime error"),
                 "repair_attempts": state["repair_attempts"] + 1
             }
-        
-        return {
-            "error_traceback": None,
-            "final_result": exec_result
-        }
+
+        return {"error_traceback": None, "final_result": exec_result}
 
     def route_compiler_output(self, state: CadGraphState) -> str:
         """Determines if the pipeline should repair, proceed to physics, or fail."""
@@ -150,44 +205,86 @@ class CadOrchestrator:
         return "success"
 
     async def node_auditor(self, state: CadGraphState) -> Dict[str, Any]:
-        """Agent 4: Heuristic Physics check (Volume, Mass, Bounding Box constraints)."""
+        """Agent 4: Computes material mass/physics and auto-caches verified geometry."""
         res = state.get("final_result", {})
-        vol = res.get("volume", 0)
-        
-        # Basic heuristic: calculate mass assuming Aluminum 6061 (density ~ 2.7e-3 g/mm^3)
-        mass_g = vol * 0.0027 
+        vol_mm3 = float(res.get("volume") or 0.0)
+        mat = state.get("material", "Al 6061")
+        density_g_cm3 = MATERIAL_DENSITIES_G_CM3.get(mat, 2.70)
+        mass_g = round(vol_mm3 * (density_g_cm3 / 1000.0), 2)
+        n_solids = res.get("n_solids") or (res.get("counts") or {}).get("solids", 1)
+
+        warning = None
+        if n_solids and n_solids > 1:
+            warning = f"result has {n_solids} disconnected solids; make features overlap so they fuse into one"
+
         report = {
-            "estimated_mass_g": round(mass_g, 2),
-            "volume_mm3": round(vol, 2),
-            "safety_warning": "Mass exceeds 5kg limit" if mass_g > 5000 else "Within heuristic safety margins."
+            "mass_g": mass_g,
+            "density_g_cm3": density_g_cm3,
+            "volume_mm3": round(vol_mm3, 2),
+            "verified": bool(res.get("valid", True)) and (n_solids == 1),
+            "warning": warning
         }
-        
-        # Persist success to database
+
+        bom = state.get("bom_json") or {}
+        canonical_query = bom.get("canonical_query") or state.get("expanded_prompt") or state["raw_prompt"]
+
+        # Persist to Supabase generations table
         self.repo.save_generation({
             "job": state["job_id"],
             "prompt": state["raw_prompt"],
+            "material": mat,
+            "route": "cache_modifier" if state.get("cached_hit") else "atomic_coder",
+            "parent_job": state.get("parent_job"),
+            "plan": bom,
             "code": state["cad_code"],
             "ok": True,
-            "score": 10,
-            "metadata": {"physics": report}
+            "verified": report["verified"],
+            "score": 10 if report["verified"] else 7,
+            "bbox": res.get("bbox"),
+            "volume_mm3": report["volume_mm3"],
+            "mass_g": mass_g,
+            "physics": report,
+            "attempts": state["repair_attempts"] + 1,
+            "llm_model": settings.coder_model
         })
 
-        return {"physics_report": report}
+        # Auto-seed verified single-solid geometry into cad_examples using the material-agnostic canonical query
+        if not state.get("cached_hit") and report["verified"] and state.get("cad_code"):
+            try:
+                emb = await self.llm.get_embedding(canonical_query)
+                self.repo.save_example_to_cache(
+                    tags=[bom.get("object", "part")],
+                    prompt=canonical_query,
+                    code=state["cad_code"],
+                    embedding=emb
+                )
+            except Exception as e:
+                logger.warning(f"Auto-cache save skipped: {e}")
 
-    async def execute_job(self, job_id: str, prompt: str) -> Dict[str, Any]:
-        """Entry point for the FastAPI route."""
-        initial_state = {
+        return {"physics_report": report}
+    
+    async def execute_job(
+        self,
+        job_id: str,
+        prompt: str,
+        material: str = "Al 6061",
+        fresh: bool = False,
+        parent_job: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Direct non-streaming entry point for CLI scripts and Pytest suites."""
+        initial_state: CadGraphState = {
             "job_id": job_id,
             "raw_prompt": prompt,
+            "material": material,
+            "fresh": fresh,
+            "parent_job": parent_job,
             "expanded_prompt": None,
             "bom_json": None,
             "cad_code": None,
+            "cached_hit": False,
             "error_traceback": None,
             "repair_attempts": 0,
             "physics_report": None,
             "final_result": None
         }
-        
-        # Execute LangGraph asynchronously
-        final_state = await self.graph.ainvoke(initial_state)
-        return final_state
+        return await self.graph.ainvoke(initial_state)

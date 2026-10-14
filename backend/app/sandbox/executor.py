@@ -3,6 +3,7 @@ import sys
 import json
 import logging
 import asyncio
+import subprocess
 from typing import Dict, Any
 from app.core.config import settings
 
@@ -36,6 +37,22 @@ class SandboxExecutor:
         except ImportError:
             return None
 
+    def _run_subprocess_sync(
+        self,
+        cmd: list[str],
+        env: Dict[str, str],
+        timeout: int,
+        popen_kwargs: Dict[str, Any]
+    ) -> subprocess.CompletedProcess:
+        """Executes the sandbox subprocess synchronously inside a worker thread (Windows & Linux safe)."""
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            env=env,
+            timeout=timeout,
+            **popen_kwargs
+        )
+
     async def run_code(self, code: str, wd: str, timeout: int = None) -> Dict[str, Any]:
         """Runs the CAD script asynchronously in a sandboxed subprocess and loads meta.json + mesh.json."""
         timeout = timeout or settings.cad_timeout_seconds
@@ -58,21 +75,19 @@ class SandboxExecutor:
             popen_kwargs["preexec_fn"] = self._make_preexec()
             popen_kwargs["start_new_session"] = True
 
+        cmd = [sys.executable, self.runner_path, script_path, wd]
+
         async with CAD_SEMAPHORE:
             try:
-                # Use asyncio.create_subprocess_exec for non-blocking IO
-                process = await asyncio.create_subprocess_exec(
-                    sys.executable, self.runner_path, script_path, wd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    env=safe_env,
-                    **popen_kwargs
-                )
-                
                 try:
-                    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-                except asyncio.TimeoutError:
-                    process.kill()
+                    proc = await asyncio.to_thread(
+                        self._run_subprocess_sync,
+                        cmd,
+                        safe_env,
+                        timeout,
+                        popen_kwargs
+                    )
+                except subprocess.TimeoutExpired:
                     return {"ok": False, "error": f"Timeout after {timeout}s (model too complex)"}
                     
                 meta_path = os.path.join(wd, "meta.json")
@@ -94,9 +109,9 @@ class SandboxExecutor:
                     except json.JSONDecodeError:
                         pass
                 
-                err_out = (stderr.decode("utf-8", errors="replace") if stderr else "")[-600:]
-                return {"ok": False, "error": f"Runner crashed (rc={process.returncode}): {err_out}"}
+                err_out = (proc.stderr.decode("utf-8", errors="replace") if proc.stderr else "")[-600:]
+                return {"ok": False, "error": f"Runner crashed (rc={proc.returncode}): {err_out}"}
 
             except Exception as e:
-                logger.error(f"Sandbox execution failed: {e}")
-                return {"ok": False, "error": f"Could not start sandbox: {e}"}
+                logger.exception("Sandbox execution failed")
+                return {"ok": False, "error": f"Could not start sandbox: {repr(e)}"}

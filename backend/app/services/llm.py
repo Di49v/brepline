@@ -74,25 +74,45 @@ class LLMService:
         self,
         messages: List[Dict[str, str]],
         temperature: float = 0.2,
-        max_tokens: int = 2500,
+        max_tokens: int = 4096,
         role: AgentRole = "planner"
     ) -> str:
-        """Executes chat completion with automatic failover and robust timeout catching."""
+        """Executes chat completion with reasoning-token headroom and <thought> stripping."""
         candidates = self._get_candidate_chain(role)
         last_err = None
+
+        # Ensure reasoning models (gpt-oss, gemma-4, gemini-3.8) have enough token budget
+        # for both internal chain-of-thought AND the final JSON/code output.
+        effective_max_tokens = max(max_tokens, 4096 if role != "coder" else 8192)
 
         for client, model in candidates:
             for attempt in range(2):
                 try:
-                    r = await client.completions.create if False else await client.chat.completions.create(
-                        model=model,
-                        messages=messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens
-                    )
-                    content = r.choices[0].message.content or ""
-                    if content.strip():
-                        return content
+                    kwargs: Dict[str, Any] = {
+                        "model": model,
+                        "messages": messages,
+                        "temperature": temperature,
+                        "max_tokens": effective_max_tokens,
+                    }
+                    # Keep Groq gpt-oss reasoning concise and fast
+                    if "gpt-oss" in model:
+                        kwargs["reasoning_effort"] = "low"
+
+                    r = await client.chat.completions.create(**kwargs)
+                    choice = r.choices[0]
+                    raw_content = choice.message.content or ""
+
+                    # Strip Google/Gemma <thought>...</thought> blocks before checking content
+                    clean_content = self.strip_thoughts(raw_content)
+
+                    if clean_content.strip():
+                        return clean_content
+
+                    # If content was empty because reasoning consumed all tokens, don't retry same model
+                    if choice.finish_reason == "length":
+                        logger.warning(f"[{role.upper()}] {model} hit token limit during reasoning; rotating provider.")
+                        break
+
                 except (APITimeoutError, asyncio.TimeoutError, Exception) as e:
                     last_err = e
                     logger.warning(f"[{role.upper()}] {model} (attempt {attempt+1}) failed/timed out: {e}")
@@ -100,6 +120,17 @@ class LLMService:
                         await asyncio.sleep(1)
 
         raise RuntimeError(f"All LLM providers failed for role={role}. Last error: {last_err}")
+
+    @staticmethod
+    def strip_thoughts(text: str) -> str:
+        """Removes <thought>...</thought> or <think>...</think> blocks emitted by reasoning models."""
+        if not text:
+            return ""
+        # Remove closed <thought>...</thought> and <think>...</think> blocks
+        text = re.sub(r"<(?:thought|think)>.*?</(?:thought|think)>", "", text, flags=re.S | re.I)
+        # If the model got truncated inside an unclosed <thought> tag, strip from <thought> to end
+        text = re.sub(r"<(?:thought|think)>.*\$", "", text, flags=re.S | re.I)
+        return text.strip()
 
     async def get_embedding(self, text: str) -> list[float]:
         """Generates a 768-dim vector via Gemini Embedding 2 (or local nomic-embed-text fallback)."""
@@ -120,50 +151,58 @@ class LLMService:
         )
         return response.data[0].embedding
 
+    
+
     @staticmethod
     def extract_code(text: str) -> str:
-        """Extracts python code blocks safely, filtering out stray markdown text or bullet points."""
-        m = re.search(r"```(?:python|py)?\s*\n(.*?)(?:```|$)", text, re.S)
-        raw_code = m.group(1).strip() if m else text.strip()
-        
-        if not raw_code and ("import cadquery" in text or "result" in text):
-            raw_code = text.strip()
+        """Extracts Python code safely after stripping reasoning tags and markdown noise."""
+        cleaned = LLMService.strip_thoughts(text)
+        if not cleaned:
+            return ""
 
-        # Clean up lines inside the code block that are accidental markdown/bullet points
-        cleaned_lines = []
+        m = re.search(r"```(?:python|py)?\s*\n(.*?)(?:```|\$)", cleaned, re.S)
+        if m:
+            raw_code = m.group(1).strip()
+        elif "import cadquery" in cleaned or "result" in cleaned:
+            raw_code = cleaned.strip()
+        else:
+            return ""
+
+        # Filter out stray markdown lines if any slipped inside the fence
+        valid_lines = []
         for line in raw_code.splitlines():
-            stripped = line.strip()
-            # Skip stray bullet points, markdown headers, or LaTeX math lines that aren't valid Python comments
-            if stripped.startswith(('* ', '- ')) and not stripped.startswith('#'):
-                # Convert bullet to a Python comment if it looks like a note
-                cleaned_lines.append(f"# {stripped[2:]}")
+            s = line.strip()
+            # 1. Skip stray tags or markdown fences
+            if s.startswith(("<thought>", "</thought>", "<think>", "</think>", "```")):
                 continue
-            if stripped.startswith('$') or ('$' in stripped and '=' in stripped and not any(op in stripped for op in ['+', '-', '*', '/', '=', '=='])):
-                cleaned_lines.append(f"# {stripped}")
+            # 2. Convert stray markdown bullets or numbered lists into safe Python comments
+            if (s.startswith(("* ", "- ")) or re.match(r"^\d+\.\s", s)) and not s.startswith("#"):
+                valid_lines.append(f"# {s}")
                 continue
-            cleaned_lines.append(line)
+            # 3. Convert any line containing LaTeX math ($) into a safe Python comment
+            if "$" in s and not s.startswith("#"):
+                valid_lines.append(f"# {s}")
+                continue
+            valid_lines.append(line)
 
-        raw_code = "\n".join(cleaned_lines)
+        raw_code = "\n".join(valid_lines)
 
-        # Handle top-level indentation anomalies
+        # Normalize top-level indentation if the entire block was indented
         lines = raw_code.splitlines()
-        non_empty_lines = [l for l in lines if l.strip()]
-        if non_empty_lines:
-            leading_spaces = [len(l) - len(l.lstrip(' ')) for l in non_empty_lines if not l.strip().startswith('#')]
-            if leading_spaces and min(leading_spaces) > 0:
-                min_indent = min(leading_spaces)
-                dedented_lines = [
-                    line[min_indent:] if line.strip() and len(line) >= min_indent and line[:min_indent].isspace() else line
-                    for line in lines
-                ]
-                raw_code = "\n".join(dedented_lines)
+        non_empty = [l for l in lines if l.strip() and not l.strip().startswith("#")]
+        if non_empty:
+            min_indent = min(len(l) - len(l.lstrip(" ")) for l in non_empty)
+            if min_indent > 0:
+                lines = [l[min_indent:] if len(l) >= min_indent and l[:min_indent].isspace() else l for l in lines]
+                raw_code = "\n".join(lines)
 
-        return raw_code + "\n"
+        return (raw_code.strip() + "\n") if raw_code.strip() else ""
 
     @staticmethod
     def extract_json(text: str) -> Dict[str, Any]:
-        """Safely extracts JSON objects from LLM outputs."""
-        m = re.search(r"\{.*\}", text, re.S)
+        """Extracts JSON object safely after stripping <thought> blocks."""
+        cleaned = LLMService.strip_thoughts(text)
+        m = re.search(r"\{.*\}", cleaned, re.S)
         if not m:
             return {}
         try:

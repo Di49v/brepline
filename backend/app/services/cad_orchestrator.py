@@ -87,7 +87,7 @@ class CadOrchestrator:
                 {"role": "user", "content": state["raw_prompt"]}
             ],
             temperature=0.2,
-            max_tokens=350,
+            max_tokens=2048,
             role="intent"
         )
         return {"expanded_prompt": expanded.strip()}
@@ -110,7 +110,7 @@ class CadOrchestrator:
                 {"role": "user", "content": state["expanded_prompt"] or state["raw_prompt"]}
             ],
             temperature=0.1,
-            max_tokens=800,
+            max_tokens=4096,
             role="planner"
         )
         return {"bom_json": self.llm.extract_json(raw_json)}
@@ -145,7 +145,7 @@ class CadOrchestrator:
             raw_code = await self.llm.generate(
                 [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_content}],
                 temperature=0.2,
-                max_tokens=4000,  # <-- Increased to prevent mid-line token truncation
+                max_tokens=8192,  # <-- Increased to prevent mid-line token truncation
                 role="coder"
             )
             return {"cad_code": self.llm.extract_code(raw_code) or best_match["code"], "cached_hit": True}
@@ -182,6 +182,7 @@ class CadOrchestrator:
         raw_code = await self.llm.generate(
             [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_content}],
             temperature=0.2,
+            max_tokens=8192,
             role="coder"
         )
         return {"cad_code": self.llm.extract_code(raw_code), "cached_hit": False}

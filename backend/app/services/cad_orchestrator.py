@@ -74,12 +74,19 @@ class CadOrchestrator:
     # --- Node Implementations ---
 
     async def node_intent_analyzer(self, state: CadGraphState) -> Dict[str, Any]:
-        """Agent 0: Expands sparse prompts and strips material names so geometry is material-agnostic."""
+        """Agent 0: Expands sparse prompts into clean, water-tight 3D CAD geometry specs."""
         sys_prompt = (
-            "You are Agent 0: Mechanical Requirements Engineer. Expand the user's CAD prompt into "
-            "a clear, material-agnostic geometric specification in millimeters (Z-axis up). "
-            "CRITICAL: Remove all material names (e.g., Copper, Aluminum, Steel, PLA) so the geometric "
-            "description is 100% independent of material. Output ONLY the expanded geometric prompt."
+            "You are Agent 0: Industrial CAD Architect. Expand the user's CAD prompt into "
+            "a clear, material-agnostic geometric specification in millimeters (Z-axis up).\n"
+            "CRITICAL RULES:\n"
+            "1. Remove specific metal/plastic brand names (e.g., Al 6061, PLA) so the geometry is reusable.\n"
+            "2. For multi-component objects (e.g., a car, rocket, drone, furniture), clearly define each "
+            "visual sub-component (e.g., chassis body, cabin/windshield, 4 wheels, nose cone, fuselage, fins, nozzle) "
+            "with concrete dimensions and exact (X, Y, Z) placement so they touch/mate cleanly.\n"
+            "3. Keep major bodies as water-tight solids unless a through-hole/bore is explicitly needed. "
+            "Do NOT invent hidden internal bulkheads, hollow thin-wall shelling on complex lofts, or ±0.1mm fastener tolerances "
+            "that complicate B-Rep boolean operations.\n"
+            "Output ONLY the concise expanded geometric specification."
         )
         expanded = await self.llm.generate(
             [
@@ -93,13 +100,16 @@ class CadOrchestrator:
         return {"expanded_prompt": expanded.strip()}
 
     async def node_specifier(self, state: CadGraphState) -> Dict[str, Any]:
-        """Agent 1: Decomposes prompt into a structured BOM with a canonical material-agnostic search query."""
+        """Agent 1: Decomposes prompt into a structured BOM with sub-part roles."""
         sys_prompt = (
             "You are Agent 1: Chief Mechanical Decomposer. Convert the geometric specification into a strict JSON object:\n"
             "{\n"
             "  \"object\": \"short 2-4 word part name (no material names)\",\n"
+            "  \"is_assembly\": true or false,\n"
             "  \"canonical_query\": \"standardized material-agnostic description of the geometry and dimensions for vector cache lookup\",\n"
-            "  \"parts\": [{\"id\": \"main_body\", \"type\": \"primitive_or_feature\", \"dimensions\": {}}],\n"
+            "  \"parts\": [\n"
+            "    {\"id\": \"part_name\", \"type\": \"primitive_or_feature\", \"dimensions\": {}, \"position_mm\": [0, 0, 0]}\n"
+            "  ],\n"
             "  \"shared_interfaces\": {}\n"
             "}\n"
             "Output ONLY valid JSON."
@@ -139,14 +149,15 @@ class CadOrchestrator:
             sys_prompt = (
                 "You are Agent 2A: Parametric CAD Modifier. You are given a verified CadQuery script from cache. "
                 "If the Target BOM dimensions match the template, return the template code UNCHANGED. "
-                "If any dimensions differ, update ONLY those numeric parameters. Output ONLY valid Python code."
+                "If any dimensions differ, update ONLY those numeric parameters. "
+                "CRITICAL: Keep the final `result` (or `parts`) assignment intact. Output ONLY valid Python code."
             )
             user_content = f"Target BOM:\n{bom}\n\nCached Template Code:\n```python\n{best_match['code']}\n```"
             raw_code = await self.llm.generate(
                 [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_content}],
-                temperature=0.2,
-                max_tokens=8192,  # <-- Increased to prevent mid-line token truncation
-                role="coder"
+                temperature=0.1,
+                max_tokens=8192,
+                role="modifier"
             )
             return {"cad_code": self.llm.extract_code(raw_code) or best_match["code"], "cached_hit": True}
 
@@ -154,16 +165,20 @@ class CadOrchestrator:
         logger.info("Cache MISS or Repair Loop. Routing to Agent 2B (Atomic Coder).")
         
         sys_prompt = (
-            "You are an expert OpenCASCADE and CadQuery engineer. Output ONLY valid Python code inside a markdown block. "
-            "CRITICAL REQUIREMENT: You MUST assign your final combined solid object or assembly to a variable named exactly `result` "
-            "(e.g., `result = bracket` or `result = gear`). If you do not define `result`, the compilation will fail instantly. "
-            "Pre-loaded helper functions available in the global namespace (do NOT redefine or import them):\n"
-            "- `spur_gear(m, z, t, bore=0)` -> returns a cq.Workplane spur gear (module m, teeth z, thickness t, bore diameter)\n"
-            "- `radial(shape, n, r=0)` -> copies `shape` n times around Z axis and unions them\n"
-            "- `bolt_circle(body, n, r, d, face='>Z')` -> drills n through-holes of diameter d on radius r\n"
-            "Ensure all boolean features overlap so `result` is a single connected solid."
+            "You are an expert OpenCASCADE and CadQuery engineer. Output ONLY valid Python code inside a ```python ``` block.\n"
+            "CRITICAL REQUIREMENTS:\n"
+            "1. Always `import cadquery as cq` and `import math`.\n"
+            "2. Pre-loaded helper functions available in the global namespace (do NOT redefine or import them):\n"
+            "   - `spur_gear(m, z, t, bore=0)` -> returns a cq.Workplane spur gear (module m, teeth z, thickness t, bore diameter)\n"
+            "   - `radial(shape, n, r=0)` -> copies `shape` n times around Z axis and unions them\n"
+            "   - `bolt_circle(body, n, r, d, face='>Z')` -> drills n through-holes of diameter d on radius r\n"
+            "3. For single mechanical parts (gears, brackets, flanges), union all features into a single connected solid and assign `result = ...`.\n"
+            "4. For multi-part assemblies (e.g., rockets, cars, drones), model each sub-component cleanly, assign a dictionary of named sub-parts "
+            "`parts = {'body': body, 'nose_cone': nose, 'fins': fins}` AND ALSO union them into `result` (e.g., `result = body.union(nose).union(fins)`). "
+            "Avoid `.shell()` on complex multi-body unions as it fails in OpenCASCADE; use solid primitives/lofts/revolves instead.\n"
+            "5. The last line of your script MUST define `result`."
         )
-        
+
         user_content = (
             f"Create a CadQuery model. Units are millimeters, Z up.\n"
             f"Specification: {state.get('expanded_prompt') or state['raw_prompt']}\n"
@@ -176,13 +191,16 @@ class CadOrchestrator:
                 user_content += f"- {m['prompt']}\n```python\n{m['code']}\n```\n"
 
         if state.get("error_traceback"):
-            user_content += f"\nPREVIOUS CODE FAILED with error:\n{state['error_traceback']}\nFix the CadQuery code."
+            user_content += (
+                f"\nPREVIOUS CODE:\n```python\n{state.get('cad_code', '')}\n```\n"
+                f"FAILED WITH ERROR:\n{state['error_traceback']}\n"
+                f"Fix the CadQuery code and ensure `result` is assigned at the end."
+            )
 
-        # 3. Generate and Extract
         raw_code = await self.llm.generate(
             [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_content}],
             temperature=0.2,
-            max_tokens=8192,
+            max_tokens=16384,
             role="coder"
         )
         return {"cad_code": self.llm.extract_code(raw_code), "cached_hit": False}
@@ -222,16 +240,17 @@ class CadOrchestrator:
         density_g_cm3 = MATERIAL_DENSITIES_G_CM3.get(mat, 2.70)
         mass_g = round(vol_mm3 * (density_g_cm3 / 1000.0), 2)
         n_solids = res.get("n_solids") or (res.get("counts") or {}).get("solids", 1)
+        has_named_parts = bool((res.get("mesh") or {}).get("parts"))
 
         warning = None
-        if n_solids and n_solids > 1:
+        if n_solids and n_solids > 1 and not has_named_parts:
             warning = f"result has {n_solids} disconnected solids; make features overlap so they fuse into one"
 
         report = {
             "mass_g": mass_g,
             "density_g_cm3": density_g_cm3,
             "volume_mm3": round(vol_mm3, 2),
-            "verified": bool(res.get("valid", True)) and (n_solids == 1),
+            "verified": bool(res.get("valid", True)) and (n_solids == 1 or has_named_parts),
             "warning": warning
         }
 
@@ -272,7 +291,7 @@ class CadOrchestrator:
                 logger.warning(f"Auto-cache save skipped: {e}")
 
         return {"physics_report": report}
-    
+
     async def execute_job(
         self,
         job_id: str,

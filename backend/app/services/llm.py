@@ -20,7 +20,7 @@ class LLMService:
             timeout=120.0
         ))
 
-        # 2. Google Gemini Client (Increased timeout to 180s for heavy code gen)
+        # 2. Google Gemini Client (180s timeout for deep spatial reasoning + code gen)
         self.gemini_client = wrap_openai(AsyncOpenAI(
             base_url=settings.gemini_base_url,
             api_key=settings.gemini_api_key,
@@ -77,13 +77,13 @@ class LLMService:
         max_tokens: int = 4096,
         role: AgentRole = "planner"
     ) -> str:
-        """Executes chat completion with reasoning-token headroom and <thought> stripping."""
+        """Executes chat completion with full reasoning headroom and truncation protection."""
         candidates = self._get_candidate_chain(role)
         last_err = None
 
-        # Ensure reasoning models (gpt-oss, gemma-4, gemini-3.8) have enough token budget
-        # for both internal chain-of-thought AND the final JSON/code output.
-        effective_max_tokens = max(max_tokens, 4096 if role != "coder" else 8192)
+        # Give reasoning models plenty of room for BOTH deep spatial thinking AND full code output
+        role_min_tokens = 16384 if role == "coder" else (8192 if role == "planner" else 4096)
+        effective_max_tokens = max(max_tokens, role_min_tokens)
 
         for client, model in candidates:
             for attempt in range(2):
@@ -94,24 +94,29 @@ class LLMService:
                         "temperature": temperature,
                         "max_tokens": effective_max_tokens,
                     }
-                    # Keep Groq gpt-oss reasoning concise and fast
+                    # Use balanced medium reasoning on gpt-oss so it thinks thoroughly without overflowing
                     if "gpt-oss" in model:
-                        kwargs["reasoning_effort"] = "low"
+                        kwargs["reasoning_effort"] = "medium"
 
                     r = await client.chat.completions.create(**kwargs)
                     choice = r.choices[0]
                     raw_content = choice.message.content or ""
 
-                    # Strip Google/Gemma <thought>...</thought> blocks before checking content
+                    # Strip <thought>...</thought> blocks first
                     clean_content = self.strip_thoughts(raw_content)
+
+                    # CRITICAL: If finish_reason == "length", the output was cut off mid-stream!
+                    if choice.finish_reason == "length":
+                        # Only accept if a complete closing code fence or JSON brace exists
+                        if role in ("coder", "modifier") and "```" not in clean_content[clean_content.find("```")+3:]:
+                            logger.warning(f"[{role.upper()}] {model} truncated code mid-stream (finish_reason=length); rotating provider.")
+                            break
+                        if role == "planner" and not clean_content.rstrip().endswith("}"):
+                            logger.warning(f"[{role.upper()}] {model} truncated JSON mid-stream (finish_reason=length); rotating provider.")
+                            break
 
                     if clean_content.strip():
                         return clean_content
-
-                    # If content was empty because reasoning consumed all tokens, don't retry same model
-                    if choice.finish_reason == "length":
-                        logger.warning(f"[{role.upper()}] {model} hit token limit during reasoning; rotating provider.")
-                        break
 
                 except (APITimeoutError, asyncio.TimeoutError, Exception) as e:
                     last_err = e
@@ -139,7 +144,7 @@ class LLMService:
                 response = await self.gemini_client.embeddings.create(
                     model=settings.embedding_model,
                     input=text,
-                    dimensions=768  # MRL truncation to match Supabase vector(768)
+                    dimensions=768
                 )
                 return response.data[0].embedding
             except Exception as e:
@@ -163,7 +168,7 @@ class LLMService:
         m = re.search(r"```(?:python|py)?\s*\n(.*?)(?:```|\$)", cleaned, re.S)
         if m:
             raw_code = m.group(1).strip()
-        elif "import cadquery" in cleaned or "result" in cleaned:
+        elif "import cadquery" in cleaned or "result" in cleaned or "parts" in cleaned:
             raw_code = cleaned.strip()
         else:
             return ""

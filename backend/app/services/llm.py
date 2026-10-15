@@ -77,52 +77,47 @@ class LLMService:
         max_tokens: int = 4096,
         role: AgentRole = "planner"
     ) -> str:
-        """Executes chat completion with full reasoning headroom and truncation protection."""
+        """Executes chat completion with full 16K reasoning headroom and instant provider failover."""
         candidates = self._get_candidate_chain(role)
         last_err = None
 
-        # Give reasoning models plenty of room for BOTH deep spatial thinking AND full code output
+        # Full 16K headroom so gemma-4-31b-it / gemini-3.8-flash never truncate 9K-12K first-pass builds
         role_min_tokens = 16384 if role == "coder" else (8192 if role == "planner" else 4096)
         effective_max_tokens = max(max_tokens, role_min_tokens)
 
         for client, model in candidates:
-            for attempt in range(2):
-                try:
-                    kwargs: Dict[str, Any] = {
-                        "model": model,
-                        "messages": messages,
-                        "temperature": temperature,
-                        "max_tokens": effective_max_tokens,
-                    }
-                    # Use balanced medium reasoning on gpt-oss so it thinks thoroughly without overflowing
-                    if "gpt-oss" in model:
-                        kwargs["reasoning_effort"] = "medium"
+            try:
+                kwargs: Dict[str, Any] = {
+                    "model": model,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": effective_max_tokens,
+                }
+                if "gpt-oss" in model:
+                    kwargs["reasoning_effort"] = "medium"
 
-                    r = await client.chat.completions.create(**kwargs)
-                    choice = r.choices[0]
-                    raw_content = choice.message.content or ""
+                r = await client.chat.completions.create(**kwargs)
+                choice = r.choices[0]
+                raw_content = choice.message.content or ""
 
-                    # Strip <thought>...</thought> blocks first
-                    clean_content = self.strip_thoughts(raw_content)
+                clean_content = self.strip_thoughts(raw_content)
 
-                    # CRITICAL: If finish_reason == "length", the output was cut off mid-stream!
-                    if choice.finish_reason == "length":
-                        # Only accept if a complete closing code fence or JSON brace exists
-                        if role in ("coder", "modifier") and "```" not in clean_content[clean_content.find("```")+3:]:
-                            logger.warning(f"[{role.upper()}] {model} truncated code mid-stream (finish_reason=length); rotating provider.")
-                            break
-                        if role == "planner" and not clean_content.rstrip().endswith("}"):
-                            logger.warning(f"[{role.upper()}] {model} truncated JSON mid-stream (finish_reason=length); rotating provider.")
-                            break
+                if choice.finish_reason == "length":
+                    if role in ("coder", "modifier") and "```" not in clean_content[clean_content.find("```")+3:]:
+                        logger.warning(f"[{role.upper()}] {model} hit token limit mid-code; rotating to next model.")
+                        continue
+                    if role == "planner" and not clean_content.rstrip().endswith("}"):
+                        logger.warning(f"[{role.upper()}] {model} hit token limit mid-JSON; rotating to next model.")
+                        continue
 
-                    if clean_content.strip():
-                        return clean_content
+                if clean_content.strip():
+                    return clean_content
 
-                except (APITimeoutError, asyncio.TimeoutError, Exception) as e:
-                    last_err = e
-                    logger.warning(f"[{role.upper()}] {model} (attempt {attempt+1}) failed/timed out: {e}")
-                    if attempt == 0:
-                        await asyncio.sleep(1)
+            except (APITimeoutError, asyncio.TimeoutError, Exception) as e:
+                last_err = e
+                # Immediately rotate to the next healthy model in the chain instead of waiting on a congested one
+                logger.warning(f"[{role.upper()}] {model} failed/rate-limited ({e}); failing over to next model.")
+                continue
 
         raise RuntimeError(f"All LLM providers failed for role={role}. Last error: {last_err}")
 

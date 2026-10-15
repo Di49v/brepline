@@ -113,6 +113,7 @@ async def create_job(
                 "parent_job": body.parent_job,
                 "expanded_prompt": None,
                 "bom_json": None,
+                "cache_matches": None,  # <-- Added to match CadGraphState
                 "cad_code": None,
                 "cached_hit": False,
                 "error_traceback": None,
@@ -132,10 +133,10 @@ async def create_job(
                         JOB_STATES[job_id]["log"].append("planning")
                     elif node_name == "specifier":
                         JOB_STATES[job_id]["log"].append("generating candidates")
-                    elif node_name == "coder":
-                        if final_state.get("cached_hit"):
-                            JOB_STATES[job_id]["log"].append("served from cache")
-                        elif final_state.get("repair_attempts", 0) > 0:
+                    elif node_name == "modifier":
+                        JOB_STATES[job_id]["log"].append("served from cache")
+                    elif node_name == "atomic_coder":
+                        if final_state.get("repair_attempts", 0) > 0:
                             JOB_STATES[job_id]["log"].append(f"repair round {final_state['repair_attempts']}")
                     elif node_name == "compiler":
                         if not final_state.get("error_traceback"):

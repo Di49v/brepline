@@ -1,5 +1,5 @@
 import logging
-from typing import TypedDict, Dict, Any, Optional
+from typing import TypedDict, Dict, Any, Optional, List
 from langgraph.graph import StateGraph, END
 from app.services.llm import LLMService
 from app.sandbox.executor import SandboxExecutor
@@ -26,6 +26,7 @@ class CadGraphState(TypedDict):
     parent_job: Optional[str]
     expanded_prompt: Optional[str]
     bom_json: Optional[Dict[str, Any]]
+    cache_matches: Optional[List[Dict[str, Any]]]
     cad_code: Optional[str]
     cached_hit: bool
     error_traceback: Optional[str]
@@ -41,28 +42,40 @@ class CadOrchestrator:
         self.graph = self._build_graph()
 
     def _build_graph(self):
-        """Constructs the LangGraph state machine."""
+        """Constructs the LangGraph state machine with separate Modifier and Atomic Coder nodes."""
         workflow = StateGraph(CadGraphState)
 
         # Add Nodes (Agents)
         workflow.add_node("intent_analyzer", self.node_intent_analyzer)
         workflow.add_node("specifier", self.node_specifier)
-        workflow.add_node("coder", self.node_coder)
+        workflow.add_node("modifier", self.node_modifier)          # Agent 2A (Cache Hit >= 0.85)
+        workflow.add_node("atomic_coder", self.node_atomic_coder)  # Agent 2B (Cache Miss / Repair)
         workflow.add_node("compiler", self.node_compiler)
         workflow.add_node("auditor", self.node_auditor)
 
         # Define Edges (Routing)
         workflow.set_entry_point("intent_analyzer")
         workflow.add_edge("intent_analyzer", "specifier")
-        workflow.add_edge("specifier", "coder")  # Cache/Router logic injects here later
-        workflow.add_edge("coder", "compiler")
-        
-        # Conditional Routing from Compiler (Success vs Error)
+
+        # Conditional Routing from Specifier -> Modifier (2A) vs Atomic Coder (2B)
+        workflow.add_conditional_edges(
+            "specifier",
+            self.route_coder_strategy,
+            {
+                "modify": "modifier",
+                "create": "atomic_coder"
+            }
+        )
+
+        workflow.add_edge("modifier", "compiler")
+        workflow.add_edge("atomic_coder", "compiler")
+
+        # Conditional Routing from Compiler (Repair always routes to atomic_coder)
         workflow.add_conditional_edges(
             "compiler",
             self.route_compiler_output,
             {
-                "repair": "coder",
+                "repair": "atomic_coder",
                 "success": "auditor",
                 "fatal": END
             }
@@ -70,6 +83,22 @@ class CadOrchestrator:
         workflow.add_edge("auditor", END)
 
         return workflow.compile()
+
+    def route_coder_strategy(self, state: CadGraphState) -> str:
+        """Pure synchronous router: inspects pre-fetched cache_matches from node_specifier."""
+        if state.get("fresh") or state.get("error_traceback"):
+            return "create"
+
+        matches = state.get("cache_matches") or []
+        if matches and matches[0].get("similarity", 0.0) >= 0.85:
+            logger.info(
+                f"High similarity cache hit ({matches[0]['similarity']:.2f}). "
+                f"Routing to Agent 2A (modifier)."
+            )
+            return "modify"
+
+        logger.info("Cache miss (or similarity < 0.85). Routing to Agent 2B (atomic_coder).")
+        return "create"
 
     # --- Node Implementations ---
 
@@ -100,7 +129,7 @@ class CadOrchestrator:
         return {"expanded_prompt": expanded.strip()}
 
     async def node_specifier(self, state: CadGraphState) -> Dict[str, Any]:
-        """Agent 1: Decomposes prompt into a structured BOM with sub-part roles."""
+        """Agent 1: Decomposes prompt into a structured BOM and queries pgvector semantic cache."""
         sys_prompt = (
             "You are Agent 1: Chief Mechanical Decomposer. Convert the geometric specification into a strict JSON object:\n"
             "{\n"
@@ -123,47 +152,57 @@ class CadOrchestrator:
             max_tokens=4096,
             role="planner"
         )
-        return {"bom_json": self.llm.extract_json(raw_json)}
+        bom = self.llm.extract_json(raw_json)
 
-    async def node_coder(self, state: CadGraphState) -> Dict[str, Any]:
-        """Agent 2A (Parametric Modifier on Cache Hit) & Agent 2B (Atomic Coder on Cache Miss)."""
-        bom = state.get("bom_json") or {}
-        
-        # 1. Generate Semantic Embedding of the Intent
-        canonical_query = bom.get("canonical_query") or state.get("expanded_prompt") or state["raw_prompt"]
-
-        # 2. Query Supabase pgvector
-        matches = []
+        # Pre-fetch pgvector semantic matches here so route_coder_strategy can route cleanly
+        matches: List[Dict[str, Any]] = []
         if not state.get("fresh"):
+            canonical_query = bom.get("canonical_query") or state.get("expanded_prompt") or state["raw_prompt"]
             try:
                 embedding = await self.llm.get_embedding(canonical_query)
                 matches = self.repo.search_similar_cad(embedding, threshold=0.70, limit=2)
             except Exception as e:
                 logger.warning(f"Vector cache lookup skipped: {e}")
 
-        best_match = matches[0] if matches else None
+        return {"bom_json": bom, "cache_matches": matches}
 
-        if best_match and best_match["similarity"] >= 0.85 and not state.get("error_traceback"):
-            # AGENT 2A: PARAMETRIC MODIFIER (High Confidence Cache Hit)
-            logger.info(f"Cache HIT ({best_match['similarity']:.2f}) on '{canonical_query}'. Routing to Agent 2A (Modifier).")
-            sys_prompt = (
-                "You are Agent 2A: Parametric CAD Modifier. You are given a verified CadQuery script from cache. "
-                "If the Target BOM dimensions match the template, return the template code UNCHANGED. "
-                "If any dimensions differ, update ONLY those numeric parameters. "
-                "CRITICAL: Keep the final `result` (or `parts`) assignment intact. Output ONLY valid Python code."
-            )
-            user_content = f"Target BOM:\n{bom}\n\nCached Template Code:\n```python\n{best_match['code']}\n```"
-            raw_code = await self.llm.generate(
-                [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_content}],
-                temperature=0.1,
-                max_tokens=8192,
-                role="modifier"
-            )
-            return {"cad_code": self.llm.extract_code(raw_code) or best_match["code"], "cached_hit": True}
+    async def node_modifier(self, state: CadGraphState) -> Dict[str, Any]:
+        """Agent 2A: Surgical Parametric Modifier (High-Confidence Cache Hit >= 0.85)."""
+        matches = state.get("cache_matches") or []
+        best_match = matches[0]
+        bom = state.get("bom_json") or {}
+        canonical_query = bom.get("canonical_query") or state.get("expanded_prompt") or state["raw_prompt"]
 
-        # AGENT 2B: ATOMIC CODER (Cache Miss or Repair Loop)
-        logger.info("Cache MISS or Repair Loop. Routing to Agent 2B (Atomic Coder).")
-        
+        logger.info(f"Cache HIT ({best_match['similarity']:.2f}) on '{canonical_query}'. Executing Agent 2A (Modifier).")
+        sys_prompt = (
+            "You are Agent 2A: Parametric CAD Modifier. You are given a verified CadQuery script from cache. "
+            "If the Target BOM dimensions match the template, return the template code UNCHANGED. "
+            "If any dimensions differ, update ONLY those numeric parameters. "
+            "Do NOT alter the structural logic or function signatures. "
+            "CRITICAL: Keep the final `result` (or `parts`) assignment intact. Output ONLY valid Python code."
+        )
+        user_content = (
+            f"Target BOM:\n{bom}\n\n"
+            f"Cached Template Code:\n```python\n{best_match['code']}\n```"
+        )
+
+        raw_code = await self.llm.generate(
+            [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_content}],
+            temperature=0.1,
+            max_tokens=8192,
+            role="modifier"
+        )
+        return {
+            "cad_code": self.llm.extract_code(raw_code) or best_match["code"],
+            "cached_hit": True
+        }
+
+    async def node_atomic_coder(self, state: CadGraphState) -> Dict[str, Any]:
+        """Agent 2B: Atomic Coder (Cache Miss or Self-Healing Repair Loop)."""
+        logger.info("Executing Agent 2B (Atomic Coder).")
+        bom = state.get("bom_json") or {}
+        matches = state.get("cache_matches") or []
+
         sys_prompt = (
             "You are an expert OpenCASCADE and CadQuery engineer. Output ONLY valid Python code inside a ```python ``` block.\n"
             "CRITICAL REQUIREMENTS:\n"
@@ -184,7 +223,7 @@ class CadOrchestrator:
             f"Specification: {state.get('expanded_prompt') or state['raw_prompt']}\n"
             f"BOM: {bom}\n"
         )
-        # Inject partial matches as few-shot examples
+        # Inject partial matches (0.70 <= similarity < 0.85) as few-shot reference examples
         if matches:
             user_content += "\nReference Examples:\n"
             for m in matches:
@@ -203,7 +242,10 @@ class CadOrchestrator:
             max_tokens=16384,
             role="coder"
         )
-        return {"cad_code": self.llm.extract_code(raw_code), "cached_hit": False}
+        return {
+            "cad_code": self.llm.extract_code(raw_code),
+            "cached_hit": False
+        }
 
     async def node_compiler(self, state: CadGraphState) -> Dict[str, Any]:
         if not state.get("cad_code"):
@@ -277,7 +319,7 @@ class CadOrchestrator:
             "llm_model": settings.coder_model
         })
 
-        # Auto-seed verified single-solid geometry into cad_examples using the material-agnostic canonical query
+        # Auto-seed verified geometry into cad_examples using the material-agnostic canonical query
         if not state.get("cached_hit") and report["verified"] and state.get("cad_code"):
             try:
                 emb = await self.llm.get_embedding(canonical_query)
@@ -309,6 +351,7 @@ class CadOrchestrator:
             "parent_job": parent_job,
             "expanded_prompt": None,
             "bom_json": None,
+            "cache_matches": None,
             "cad_code": None,
             "cached_hit": False,
             "error_traceback": None,

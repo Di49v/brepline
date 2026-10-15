@@ -1,9 +1,13 @@
+from dotenv import load_dotenv
+
+# Load environment variables from backend/.env
+load_dotenv()
+
 import os
 import asyncio
 import logging
 from openai import AsyncOpenAI
 from supabase import create_client
-from dotenv import load_dotenv
 
 # Load the examples from your existing library
 from examples_lib import EXAMPLES
@@ -11,8 +15,6 @@ from examples_lib import EXAMPLES
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Load environment variables from backend/.env
-load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")

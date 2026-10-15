@@ -103,18 +103,19 @@ class CadOrchestrator:
     # --- Node Implementations ---
 
     async def node_intent_analyzer(self, state: CadGraphState) -> Dict[str, Any]:
-        """Agent 0: Expands sparse prompts into clean, water-tight 3D CAD geometry specs."""
+        """Agent 0: Expands sparse prompts into clean, contoured 3D CAD geometry specs."""
         sys_prompt = (
             "You are Agent 0: Industrial CAD Architect. Expand the user's CAD prompt into "
-            "a clear, material-agnostic geometric specification in millimeters (Z-axis up).\n"
-            "CRITICAL RULES:\n"
-            "1. Remove specific metal/plastic brand names (e.g., Al 6061, PLA) so the geometry is reusable.\n"
-            "2. For multi-component objects (e.g., a car, rocket, drone, furniture), clearly define each "
-            "visual sub-component (e.g., chassis body, cabin/windshield, 4 wheels, nose cone, fuselage, fins, nozzle) "
-            "with concrete dimensions and exact (X, Y, Z) placement so they touch/mate cleanly.\n"
-            "3. Keep major bodies as water-tight solids unless a through-hole/bore is explicitly needed. "
-            "Do NOT invent hidden internal bulkheads, hollow thin-wall shelling on complex lofts, or ±0.1mm fastener tolerances "
-            "that complicate B-Rep boolean operations.\n"
+            "a clear, material-agnostic geometric specification in millimeters.\n"
+            "COORDINATE SYSTEM: +X is Front/Forward, +Y is Left/Right (Wheel Axle Axis), +Z is Up.\n"
+            "CRITICAL GEOMETRIC RULES:\n"
+            "1. Remove specific material names (e.g., Al 6061, PLA).\n"
+            "2. NEVER specify skeletal parts (frames, forks, swingarms, handlebars, legs) as large (L x W x H) bounding boxes! "
+            "Specify them as tubular cylinders/struts with actual tube diameters (e.g., 25mm-40mm tube OD) so they don't become giant solid bricks.\n"
+            "3. For contoured bodies (car bodies, fuel tanks, seats, fairings), specify their 2D side-profile silhouette in the XZ plane "
+            "(with key (X, Z) polygon vertices) extruded symmetrically along Y, rather than rectangular boxes.\n"
+            "4. For wheels, specify outer tire diameter, rim/hub recess diameter, width along the Y-axis axle, and exact (X, Y, Z) center coordinates.\n"
+            "5. Keep major bodies as water-tight solids without fragile .shell() operations.\n"
             "Output ONLY the concise expanded geometric specification."
         )
         expanded = await self.llm.generate(
@@ -127,7 +128,7 @@ class CadOrchestrator:
             role="intent"
         )
         return {"expanded_prompt": expanded.strip()}
-
+    
     async def node_specifier(self, state: CadGraphState) -> Dict[str, Any]:
         """Agent 1: Decomposes prompt into a structured BOM and queries pgvector semantic cache."""
         sys_prompt = (
@@ -205,21 +206,29 @@ class CadOrchestrator:
 
         sys_prompt = (
             "You are an expert OpenCASCADE and CadQuery engineer. Output ONLY valid Python code inside a ```python ``` block.\n"
-            "CRITICAL REQUIREMENTS:\n"
+            "COORDINATE CONVENTION: +X = Forward/Length, +Y = Left/Right Width (Axle Axis), +Z = Up/Height.\n"
+            "CRITICAL CAD MODELING RULES:\n"
             "1. Always `import cadquery as cq` and `import math`.\n"
-            "2. Pre-loaded helper functions available in the global namespace (do NOT redefine or import them):\n"
-            "   - `spur_gear(m, z, t, bore=0)` -> returns a cq.Workplane spur gear (module m, teeth z, thickness t, bore diameter)\n"
+            "2. Pre-loaded helpers available in global namespace (do NOT redefine or import them):\n"
+            "   - `spur_gear(m, z, t, bore=0)` -> returns a cq.Workplane spur gear\n"
             "   - `radial(shape, n, r=0)` -> copies `shape` n times around Z axis and unions them\n"
             "   - `bolt_circle(body, n, r, d, face='>Z')` -> drills n through-holes of diameter d on radius r\n"
-            "3. For single mechanical parts (gears, brackets, flanges), union all features into a single connected solid and assign `result = ...`.\n"
-            "4. For multi-part assemblies (e.g., rockets, cars, drones), model each sub-component cleanly, assign a dictionary of named sub-parts "
+            "3. NO BOXY BRICKS FOR VEHICLES/ASSEMBLIES:\n"
+            "   - Do NOT model car bodies, fuel tanks, seats, or fairings using `cq.Workplane('XY').box(...)`!\n"
+            "   - Instead, draw their 2D side silhouette on `cq.Workplane('XZ').polyline([...]).close().extrude(width/2, both=True)`.\n"
+            "   - Model frames, forks, handlebars, and struts using cylinders or swept/extruded tubes (radius 12-25mm), NOT huge bounding boxes.\n"
+            "   - Model wheels on `cq.Workplane('XZ')` (so the cylinder extrudes along the Y axle axis: `.circle(r_tire).extrude(width/2, both=True)`), "
+            "and cut or join an inner rim/axle cylinder so the wheel has realistic depth.\n"
+            "4. For single mechanical parts, union all features into a single connected solid and assign `result = ...`.\n"
+            "5. For multi-part assemblies (e.g., rockets, cars, drones), model each sub-component cleanly, assign a dictionary of named sub-parts "
             "`parts = {'body': body, 'nose_cone': nose, 'fins': fins}` AND ALSO union them into `result` (e.g., `result = body.union(nose).union(fins)`). "
             "Avoid `.shell()` on complex multi-body unions as it fails in OpenCASCADE; use solid primitives/lofts/revolves instead.\n"
-            "5. The last line of your script MUST define `result`."
+            "AND ALSO assign `result` at the end (e.g., unioning them or `cq.Compound.makeCompound`).\n"
+            "6. The last line of your script MUST define `result`."
         )
 
         user_content = (
-            f"Create a CadQuery model. Units are millimeters, Z up.\n"
+            f"Create a CadQuery model. Units are millimeters, +X forward, +Y left/right, +Z up.\n"
             f"Specification: {state.get('expanded_prompt') or state['raw_prompt']}\n"
             f"BOM: {bom}\n"
         )

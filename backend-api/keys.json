@@ -1,0 +1,37 @@
+{
+  "keys": [
+    {
+      "id": "3267498b",
+      "name": "qasdf",
+      "env": "live",
+      "scopes": [
+        "generate",
+        "read",
+        "usage"
+      ],
+      "prefix": "bp_live_m4G1",
+      "last4": "lqn0",
+      "hash": "766a262ff7690c461b82ad805f31beb484ebba8025c62f32506948eeb8f0e6cc",
+      "created": 1792167729,
+      "used": 0,
+      "last_used": null
+    },
+    {
+      "id": "0af573d4",
+      "name": "Untitled key",
+      "env": "live",
+      "scopes": [
+        "generate",
+        "read",
+        "usage"
+      ],
+      "prefix": "bp_live_PAiM",
+      "last4": "2hn4",
+      "hash": "a208710455dce5f20a408842ce4668756e13da8f340c884c1e9ec88d76f8e8c2",
+      "created": 1792167820,
+      "used": 0,
+      "last_used": null
+    }
+  ],
+  "generations": []
+}

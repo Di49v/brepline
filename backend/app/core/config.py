@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     plan_model: str = Field(default="openai/gpt-oss-120b")
 
     # Teammate's Cluster Coder (Agent 2B)
-    coder_base_url: str = Field(default="http://localhost:11434/v1")
+    coder_base_url: str = Field(default="https://port-shepherd-competent-potentially.trycloudflare.com/v1")
     coder_api_key: str = Field(default="ollama")
     coder_model: str = Field(default="brepline")
 

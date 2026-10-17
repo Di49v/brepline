@@ -14,6 +14,7 @@ if settings.environment == "development":
     # Open local development ports
     origins = list(set([
         "http://localhost:5173",
+        "http://localhost:5174",
         "http://127.0.0.1:5173",
         "http://localhost:3000",
         *settings.cors_origins

@@ -18,8 +18,11 @@ RUN uv sync --frozen --no-dev
 # Copy the rest of the backend application code
 COPY . .
 
-# Expose FastAPI port
+# Ensure the sandbox output directory exists
+RUN mkdir -p /app/out
+
+# Expose port
 EXPOSE 7860
 
-# Run Uvicorn server bound to all interfaces
-CMD ["uv", "run", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "7860"]
+# Use sh -c so ${PORT:-7860} expands on Render (10000), Railway, and local Docker (7860)
+CMD ["sh", "-c", "uv run uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-7860}"]

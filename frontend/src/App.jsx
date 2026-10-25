@@ -481,6 +481,7 @@ function MeshModal({ s, onClose, onGoPricing }) {
     return () => window.removeEventListener('keydown', onKey)
   }, [s.open, s.job, s.info, s.mesh, onClose])
 
+  // Run 60 FPS Crash / Wind-Tunnel Animation + Backend Physics Recalculation
   const runCrashSim = async () => {
     setAuto(false)
     let cr = 0.22
@@ -503,7 +504,7 @@ function MeshModal({ s, onClose, onGoPricing }) {
     }
 
     const tStart = performance.now()
-    const duration = 1800
+    const duration = 1800 // 1.8s 60fps impact animation
     setSimAnim({ active: true, running: true, progress: 0, crumpleRatio: cr, obstacle })
 
     const step = now => {
@@ -539,13 +540,14 @@ function MeshModal({ s, onClose, onGoPricing }) {
             <button className={'btn' + (wire ? ' on' : '')} onClick={() => setWire(w => !w)}>{wire ? 'Wireframe' : 'Shaded'}</button>
             <button className={'btn' + (auto ? ' on' : '')} onClick={() => setAuto(a => !a)}>Auto-rotate</button>
             <button className="btn" onClick={() => { resetSim(); setRk(k => k + 1) }}>Reset view</button>
-            <button className="btn p gdl" onClick={() => dl(s.job, s.f)}><Ic n="dl"/>Download {s.f}</button>
+            <button className="btn p gdl" onClick={() => dl(s.job, s.f)}><Ic n="dl" />Download {s.f}</button>
             <button className="btn gclose" onClick={onClose}>Close</button>
           </div>
         </div>
         <div className="mvw">
           {s.open && s.mesh
-            ? <MeshViewer auto={auto} axes={axes} clearKey={ck} dims={dims} grid={grid} measure={measure} mesh={s.mesh} onMeasure={setPts} partColors={partColors} resetKey={rk} simState={simAnim} wire={wire}/>
+            ? <MeshViewer mesh={s.mesh} wire={wire} auto={auto} resetKey={rk} dims={dims} axes={axes} grid={grid}
+                measure={measure} clearKey={ck} onMeasure={setPts} partColors={partColors} simState={simAnim} />
             : <div className="mv nomesh">Preview not available</div>}
           <div className="vt">
             {tgl(dims, setDims, 'Dimensions')}
@@ -557,7 +559,7 @@ function MeshModal({ s, onClose, onGoPricing }) {
             {tgl(info, setInfo, 'Info')}
             <button className={'btn' + (lab ? ' on' : '')} onClick={() => { setLab(l => !l); if (!lab) setInfo(false) }}>Crash Lab</button>
           </div>
-          {info && !lab && s.info ? <InfoPanel measureOn={measure} mesh={s.mesh} pts={pts} v={s.info}/> : null}
+          {info && !lab && s.info ? <InfoPanel v={s.info} mesh={s.mesh} pts={pts} measureOn={measure} /> : null}
 
           {lab && (
             <div className="ip" style={{ width: 320, maxHeight: '82%', overflowY: 'auto' }}>

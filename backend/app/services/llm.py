@@ -11,61 +11,103 @@ logger = logging.getLogger(__name__)
 
 AgentRole = Literal["intent", "planner", "modifier", "coder"]
 
+
 class LLMService:
+    """
+    Multi-Provider, Per-Model Key-Sharded LLM Orchestration Service.
+    
+    Because cloud providers (Google Gemini, Groq) enforce RPM/TPM rate limits
+    per (API_Key, Model_Name) pair, this service maintains a pool of clients
+    for each provider and rotates keys independently per model name.
+    """
+
     def __init__(self):
-        # 1. Local/Default Fallback Client (120s timeout)
+        # 1. Local/Default Fallback Client
         self.local_client = wrap_openai(AsyncOpenAI(
             base_url=settings.llm_base_url,
             api_key=settings.llm_api_key,
             timeout=120.0
         ))
 
-        # 2. Google Gemini Client (180s timeout for deep spatial reasoning + code gen)
-        self.gemini_client = wrap_openai(AsyncOpenAI(
-            base_url=settings.gemini_base_url,
-            api_key=settings.gemini_api_key,
-            timeout=180.0
-        )) if settings.gemini_api_key else None
+        # 2. Google Gemini Client Pool (Sharded across all keys in GEMINI_API_KEYS / GEMINI_API_KEY)
+        self.gemini_clients: List[Any] = [
+            wrap_openai(AsyncOpenAI(
+                base_url=settings.gemini_base_url,
+                api_key=key,
+                timeout=180.0
+            ))
+            for key in settings.gemini_key_pool
+        ]
 
-        # 3. Groq Cloud Client (120s timeout)
-        self.planner_client = wrap_openai(AsyncOpenAI(
-            base_url=settings.plan_base_url,
-            api_key=settings.plan_api_key,
-            timeout=120.0
-        )) if settings.plan_api_key else None
+        # 3. Groq Cloud Client Pool (Sharded across all keys in PLAN_API_KEYS / PLAN_API_KEY)
+        self.planner_clients: List[Any] = [
+            wrap_openai(AsyncOpenAI(
+                base_url=settings.plan_base_url,
+                api_key=key,
+                timeout=120.0
+            ))
+            for key in settings.plan_key_pool
+        ]
 
-        # 4. Teammate's Fine-Tuned Cluster Client (180s timeout)
+        # 4. Teammate's Fine-Tuned Cluster Client
         self.coder_client = wrap_openai(AsyncOpenAI(
             base_url=settings.coder_base_url,
             api_key=settings.coder_api_key,
             timeout=180.0
         ))
 
-    def _get_candidate_chain(self, role: AgentRole):
-        """Returns an ordered list of (client, model_name) tuples for automatic failover."""
-        chain = []
+        # Per-model round-robin cursor: maps model_name -> next key index
+        self._model_cursors: Dict[str, int] = {}
+
+    def _sharded_clients_for_model(self, pool: List[Any], model: str) -> List[Any]:
+        """
+        Returns the client pool ordered starting from this model's current round-robin cursor,
+        and advances the cursor so the next call to the SAME model uses the next API key.
+        """
+        if not pool:
+            return []
+        n = len(pool)
+        idx = self._model_cursors.get(model, 0) % n
+        self._model_cursors[model] = (idx + 1) % n
+        return pool[idx:] + pool[:idx]
+
+    def _get_candidate_chain(self, role: AgentRole) -> List[tuple[Any, str]]:
+        """
+        Builds an ordered list of (client, model_name) pairs.
+        If multiple API keys exist for a provider, rotates through all keys for a model
+        before failing over to the next model architecture.
+        """
+        chain: List[tuple[Any, str]] = []
+
+        def add_pool(pool: List[Any], model: str):
+            for c in self._sharded_clients_for_model(pool, model):
+                chain.append((c, model))
+
         if role == "intent":
-            if self.gemini_client:
-                chain.append((self.gemini_client, settings.intent_model))
-            if self.planner_client:
-                chain.append((self.planner_client, settings.plan_model))
+            add_pool(self.gemini_clients, settings.intent_model)
+            add_pool(self.planner_clients, settings.plan_model)
+            add_pool(self.gemini_clients, settings.modifier_model)
+
         elif role == "planner":
-            if self.planner_client:
-                chain.append((self.planner_client, settings.plan_model))
-            if self.gemini_client:
-                chain.append((self.gemini_client, settings.modifier_model))
+            add_pool(self.planner_clients, settings.plan_model)
+            add_pool(self.gemini_clients, settings.modifier_model)
+            add_pool(self.gemini_clients, settings.intent_model)
+
         elif role == "modifier":
-            if self.gemini_client:
-                chain.append((self.gemini_client, settings.modifier_model))
-            if self.planner_client:
-                chain.append((self.planner_client, settings.plan_model))
+            add_pool(self.gemini_clients, settings.modifier_model)
+            add_pool(self.planner_clients, settings.plan_model)
+            add_pool(self.gemini_clients, settings.coder_fallback_model)
+
         elif role == "coder":
-            chain.append((self.coder_client, settings.coder_model))
-            if self.gemini_client:
-                chain.append((self.gemini_client, settings.coder_fallback_model))
-                chain.append((self.gemini_client, settings.modifier_model))
-            if self.planner_client:
-                chain.append((self.planner_client, settings.plan_model))
+            # 1. Teammate's fine-tuned cluster (skip if pointing to unstarted localhost)
+            if "localhost" not in settings.coder_base_url:
+                chain.append((self.coder_client, settings.coder_model))
+            # 2. Gemini 3.8 Flash (all keys)
+            add_pool(self.gemini_clients, settings.coder_fallback_model)
+            # 3. Groq gpt-oss-120b (ultra-fast ~5s coder, all keys)
+            add_pool(self.planner_clients, settings.plan_model)
+            # 4. Gemma 4 31B IT (all keys)
+            add_pool(self.gemini_clients, settings.modifier_model)
 
         chain.append((self.local_client, settings.llm_model))
         return chain
@@ -77,7 +119,7 @@ class LLMService:
         max_tokens: int = 4096,
         role: AgentRole = "planner"
     ) -> str:
-        """Executes chat completion with full 16K reasoning headroom and instant provider failover."""
+        """Executes chat completion with per-model key rotation and truncation protection."""
         candidates = self._get_candidate_chain(role)
         last_err = None
 
@@ -85,7 +127,7 @@ class LLMService:
         role_min_tokens = 16384 if role == "coder" else (8192 if role == "planner" else 4096)
         effective_max_tokens = max(max_tokens, role_min_tokens)
 
-        for client, model in candidates:
+        for idx, (client, model) in enumerate(candidates):
             try:
                 kwargs: Dict[str, Any] = {
                     "model": model,
@@ -103,11 +145,11 @@ class LLMService:
                 clean_content = self.strip_thoughts(raw_content)
 
                 if choice.finish_reason == "length":
-                    if role in ("coder", "modifier") and "```" not in clean_content[clean_content.find("```")+3:]:
-                        logger.warning(f"[{role.upper()}] {model} hit token limit mid-code; rotating to next model.")
+                    if role in ("coder", "modifier") and "```" not in clean_content[clean_content.find("```") + 3:]:
+                        logger.warning(f"[{role.upper()}] {model} (candidate #{idx+1}) hit token limit mid-code; rotating.")
                         continue
                     if role == "planner" and not clean_content.rstrip().endswith("}"):
-                        logger.warning(f"[{role.upper()}] {model} hit token limit mid-JSON; rotating to next model.")
+                        logger.warning(f"[{role.upper()}] {model} (candidate #{idx+1}) hit token limit mid-JSON; rotating.")
                         continue
 
                 if clean_content.strip():
@@ -116,10 +158,10 @@ class LLMService:
             except (APITimeoutError, asyncio.TimeoutError, Exception) as e:
                 last_err = e
                 # Immediately rotate to the next healthy model in the chain instead of waiting on a congested one
-                logger.warning(f"[{role.upper()}] {model} failed/rate-limited ({e}); failing over to next model.")
+                logger.warning(f"[{role.upper()}] {model} (candidate #{idx+1}) failed ({e}); rotating immediately.")
                 continue
 
-        raise RuntimeError(f"All LLM providers failed for role={role}. Last error: {last_err}")
+        raise RuntimeError(f"All LLM providers and key shards failed for role={role}. Last error: {last_err}")
 
     @staticmethod
     def strip_thoughts(text: str) -> str:
@@ -133,25 +175,23 @@ class LLMService:
         return text.strip()
 
     async def get_embedding(self, text: str) -> list[float]:
-        """Generates a 768-dim vector via Gemini Embedding 2 (or local nomic-embed-text fallback)."""
-        if self.gemini_client:
+        """Generates a 768-dim vector via sharded Gemini Embedding 2 keys (or local fallback)."""
+        for client in self._sharded_clients_for_model(self.gemini_clients, settings.embedding_model):
             try:
-                response = await self.gemini_client.embeddings.create(
+                response = await client.embeddings.create(
                     model=settings.embedding_model,
                     input=text,
                     dimensions=768
                 )
                 return response.data[0].embedding
             except Exception as e:
-                logger.warning(f"Gemini embedding failed, falling back to local Ollama: {e}")
+                logger.warning(f"Gemini embedding shard failed, trying next key/fallback: {e}")
 
         response = await self.local_client.embeddings.create(
             model="nomic-embed-text",
             input=text
         )
         return response.data[0].embedding
-
-    
 
     @staticmethod
     def extract_code(text: str) -> str:

@@ -6,6 +6,20 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 BACKEND_DIR = Path(__file__).resolve().parent.parent.parent
 ENV_PATH = BACKEND_DIR / ".env"
 
+
+def _parse_key_list(primary: str, multi: str) -> List[str]:
+    """Combines single key and comma-separated key pools into a deduplicated list."""
+    raw = f"{multi},{primary}" if multi else primary
+    seen = set()
+    keys: List[str] = []
+    for k in ( raw or "" ).split(","):
+        clean = k.strip().strip('"').strip("'")
+        if clean and clean not in seen:
+            seen.add(clean)
+            keys.append(clean)
+    return keys
+
+
 class Settings(BaseSettings):
     # API & Security
     environment: str = Field(default="development")
@@ -28,17 +42,25 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("SUPABASE_KEY", "SUPABASE_SERVICE_KEY", "supabase_key", "supabase_service_key")
     )
 
-    # Google Gemini Cloud (High-Quota Models + Embeddings)
+    # Google Gemini Cloud (Supports single GEMINI_API_KEY or comma-separated GEMINI_API_KEYS)
     gemini_base_url: str = Field(default="https://generativelanguage.googleapis.com/v1beta/openai/")
     gemini_api_key: str = Field(default="")
+    gemini_api_keys: str = Field(
+        default="",
+        validation_alias=AliasChoices("GEMINI_API_KEYS", "gemini_api_keys")
+    )
     intent_model: str = Field(default="gemini-3.5-flash-lite")
     modifier_model: str = Field(default="gemma-4-31b-it")
     coder_fallback_model: str = Field(default="gemini-3.8-flash")
     embedding_model: str = Field(default="gemini-embedding-2")
 
-    # Groq Cloud Planner (Agent 1)
+    # Groq Cloud Planner (Supports single PLAN_API_KEY or comma-separated PLAN_API_KEYS)
     plan_base_url: str = Field(default="https://api.groq.com/openai/v1")
     plan_api_key: str = Field(default="")
+    plan_api_keys: str = Field(
+        default="",
+        validation_alias=AliasChoices("PLAN_API_KEYS", "GROQ_API_KEYS", "plan_api_keys")
+    )
     plan_model: str = Field(default="openai/gpt-oss-120b")
 
     # Teammate's Cluster Coder (Agent 2B)
@@ -57,6 +79,16 @@ class Settings(BaseSettings):
     cad_workers: int = Field(default=2)
     cad_timeout_seconds: int = Field(default=90, validation_alias=AliasChoices("CAD_TIMEOUT", "cad_timeout_seconds"))
     cad_mem_limit_mb: int = Field(default=4096, validation_alias=AliasChoices("CAD_MEM_MB", "cad_mem_limit_mb"))
+
+    @property
+    def gemini_key_pool(self) -> List[str]:
+        """Returns all configured Gemini API keys for per-model sharding."""
+        return _parse_key_list(self.gemini_api_key, self.gemini_api_keys)
+
+    @property
+    def plan_key_pool(self) -> List[str]:
+        """Returns all configured Groq API keys for per-model sharding."""
+        return _parse_key_list(self.plan_api_key, self.plan_api_keys)
 
     @property
     def cors_origins(self) -> List[str]:

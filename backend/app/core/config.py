@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     )
     supabase_key: str = Field(
         default="test_key",
-        validation_alias=AliasChoices("SUPABASE_KEY", "SUPABASE_SERVICE_KEY", "supabase_key", "supabase_service_key")
+        validation_alias=AliasChoices("SUPABASE_KEY", "SUPABASE_SECRET_KEY", "supabase_key", "SUPABASE_SECRET_key")
     )
 
     # Google Gemini Cloud (Supports single GEMINI_API_KEY or comma-separated GEMINI_API_KEYS)

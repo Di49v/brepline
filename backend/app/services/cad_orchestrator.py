@@ -2,21 +2,29 @@ import logging
 from typing import TypedDict, Dict, Any, Optional, List
 from langgraph.graph import StateGraph, END
 from app.services.llm import LLMService
+from app.services.physics_engine import PhysicsEngine, MATERIAL_DENSITIES_G_CM3
+from app.services.assembler import CadAssembler
 from app.sandbox.executor import SandboxExecutor
 from app.db.repository import CadRepository
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-MATERIAL_DENSITIES_G_CM3 = {
-    "Al 6061": 2.70,
-    "Steel": 7.85,
-    "Titanium": 4.43,
-    "Brass": 8.50,
-    "Copper": 8.96,
-    "PLA": 1.24,
-    "ABS": 1.04,
+CANONICAL_ARCHETYPES = {
+    "cylindrical_tube",
+    "ogive_cone",
+    "conical_frustum",
+    "radial_fin_set",
+    "spur_gear",
+    "flanged_plate",
+    "l_bracket",
+    "enclosure_box",
+    "wheel_set",
+    "tubular_frame",
+    "contoured_body",
+    "custom_part",
 }
+
 
 class CadGraphState(TypedDict):
     job_id: str
@@ -26,13 +34,27 @@ class CadGraphState(TypedDict):
     parent_job: Optional[str]
     expanded_prompt: Optional[str]
     bom_json: Optional[Dict[str, Any]]
+    # Iterative Sub-Part Queue State
+    part_queue: List[Dict[str, Any]]
+    current_part: Optional[Dict[str, Any]]
+    current_part_index: int
+    total_parts: int
     cache_matches: Optional[List[Dict[str, Any]]]
+    current_part_code: Optional[str]
+    current_part_cached: bool
+    part_repair_attempts: int
+    compiled_parts: Dict[str, Dict[str, Any]]
+    # Live UI Streaming Fields
+    progress_log: Optional[str]
+    latest_part_mesh: Optional[Dict[str, Any]]
+    # Master Assembly & Audit State
     cad_code: Optional[str]
     cached_hit: bool
     error_traceback: Optional[str]
     repair_attempts: int
     physics_report: Optional[Dict[str, Any]]
     final_result: Optional[Dict[str, Any]]
+
 
 class CadOrchestrator:
     def __init__(self):
@@ -42,63 +64,103 @@ class CadOrchestrator:
         self.graph = self._build_graph()
 
     def _build_graph(self):
-        """Constructs the LangGraph state machine with separate Modifier and Atomic Coder nodes."""
+        """
+        Constructs the Iterative Sub-Part LangGraph State Machine:
+        intent_analyzer -> specifier -> subpart_router -> (modifier | atomic_coder) -> part_compiler
+             ^                                                                              |
+             |_______________________ (next part in part_queue) ____________________________|
+                                                                                            v
+                                                                                  assembler_and_auditor -> END
+        """
         workflow = StateGraph(CadGraphState)
 
-        # Add Nodes (Agents)
         workflow.add_node("intent_analyzer", self.node_intent_analyzer)
         workflow.add_node("specifier", self.node_specifier)
-        workflow.add_node("modifier", self.node_modifier)          # Agent 2A (Cache Hit >= 0.85)
-        workflow.add_node("atomic_coder", self.node_atomic_coder)  # Agent 2B (Cache Miss / Repair)
-        workflow.add_node("compiler", self.node_compiler)
+        workflow.add_node("subpart_router", self.node_subpart_router)
+        workflow.add_node("modifier", self.node_modifier)
+        workflow.add_node("atomic_coder", self.node_atomic_coder)
+        workflow.add_node("part_compiler", self.node_part_compiler)
         workflow.add_node("auditor", self.node_auditor)
 
-        # Define Edges (Routing)
         workflow.set_entry_point("intent_analyzer")
         workflow.add_edge("intent_analyzer", "specifier")
+        workflow.add_edge("specifier", "subpart_router")
 
-        # Conditional Routing from Specifier -> Modifier (2A) vs Atomic Coder (2B)
+        # Route each sub-part to Agent 2A (modifier) or Agent 2B (atomic_coder)
         workflow.add_conditional_edges(
-            "specifier",
+            "subpart_router",
             self.route_coder_strategy,
             {
                 "modify": "modifier",
-                "create": "atomic_coder"
+                "create": "atomic_coder",
             }
         )
 
-        workflow.add_edge("modifier", "compiler")
-        workflow.add_edge("atomic_coder", "compiler")
+        workflow.add_edge("modifier", "part_compiler")
+        workflow.add_edge("atomic_coder", "part_compiler")
 
-        # Conditional Routing from Compiler (Repair always routes to atomic_coder)
+        # After compiling a sub-part: repair it, move to next sub-part, or finish at auditor
         workflow.add_conditional_edges(
-            "compiler",
-            self.route_compiler_output,
+            "part_compiler",
+            self.route_part_compiler_output,
             {
-                "repair": "atomic_coder",
-                "success": "auditor",
-                "fatal": END
+                "repair_part": "atomic_coder",
+                "next_part": "subpart_router",
+                "assemble": "auditor",
+                "fatal": END,
             }
         )
-        workflow.add_edge("auditor", END)
 
+        workflow.add_edge("auditor", END)
         return workflow.compile()
 
+    # --- Conditional Routers ---
+
     def route_coder_strategy(self, state: CadGraphState) -> str:
-        """Pure synchronous router: inspects pre-fetched cache_matches from node_specifier."""
+        """
+        Dual-Gate Archetype Router:
+        Routes to `modifier` (Agent 2A) ONLY if similarity >= 0.86 AND the cached
+        item shares the target archetype_tag (preventing slow/bad cross-shape edits).
+        """
         if state.get("fresh") or state.get("error_traceback"):
             return "create"
 
         matches = state.get("cache_matches") or []
-        if matches and matches[0].get("similarity", 0.0) >= 0.85:
-            logger.info(
-                f"High similarity cache hit ({matches[0]['similarity']:.2f}). "
-                f"Routing to Agent 2A (modifier)."
-            )
+        if not matches:
+            return "create"
+
+        best = matches[0]
+        sim = float(best.get("similarity") or 0.0)
+        part = state.get("current_part") or {}
+        target_tag = str(part.get("archetype_tag") or "").lower().strip()
+        cached_tags = [str(t).lower().strip() for t in (best.get("tags") or [])]
+
+        # Gate 1: Exact whole-object match (>= 0.90) or matching archetype tag (>= 0.86)
+        tag_matches = (not target_tag) or (target_tag in cached_tags) or ("subpart" in cached_tags and sim >= 0.88)
+        if sim >= 0.86 and (tag_matches or sim >= 0.91):
+            logger.info(f"Dual-Gate Cache HIT ({sim:.2f}, tag={target_tag}). Routing to Agent 2A (modifier).")
             return "modify"
 
-        logger.info("Cache miss (or similarity < 0.85). Routing to Agent 2B (atomic_coder).")
+        logger.info(f"Cache MISS or sibling mismatch (sim={sim:.2f}, tag={target_tag}). Routing to Agent 2B (atomic_coder).")
         return "create"
+
+    def route_part_compiler_output(self, state: CadGraphState) -> str:
+        """Routes sub-part compilation result: repair current part, pop next part, or assemble."""
+        if state.get("error_traceback"):
+            if state.get("part_repair_attempts", 0) < 2:
+                return "repair_part"
+            # If a secondary sub-part failed after 2 repair attempts but we already have compiled parts,
+            # skip the broken sub-part and assemble what we have rather than failing the whole job!
+            if state.get("compiled_parts"):
+                logger.warning("Skipping failed secondary sub-part after 2 repair attempts; continuing queue.")
+                if state.get("part_queue"):
+                    return "next_part"
+                return "assemble"
+            return "fatal"
+
+        if state.get("part_queue"):
+            return "next_part"
+        return "assemble"
 
     # --- Node Implementations ---
 
@@ -127,22 +189,41 @@ class CadOrchestrator:
             max_tokens=2048,
             role="intent"
         )
-        return {"expanded_prompt": expanded.strip()}
-    
+        return {
+            "expanded_prompt": expanded.strip(),
+            "progress_log": "planning geometry & physics constraints"
+        }
+
     async def node_specifier(self, state: CadGraphState) -> Dict[str, Any]:
-        """Agent 1: Decomposes prompt into a structured BOM and queries pgvector semantic cache."""
+        """
+        Agent 1: Decomposes specification into 1 to 4 functional sub-assemblies
+        with universal topological archetypes for high-hit-rate vector caching.
+        """
         sys_prompt = (
-            "You are Agent 1: Chief Mechanical Decomposer. Convert the geometric specification into a strict JSON object:\n"
+            "You are Agent 1: Chief Mechanical Decomposer. Convert the geometric specification into a strict JSON BOM.\n"
+            "CRITICAL DECOMPOSITION RULES:\n"
+            "1. For single mechanical parts (e.g., bracket, spur gear, flange, washer, enclosure, bolt), set `is_assembly: false` "
+            "and output EXACTLY 1 part in `parts` with `position_mm: [0, 0, 0]`.\n"
+            "2. For multi-component vehicles/machines (e.g., rocket, car, motorcycle, drone), set `is_assembly: true` "
+            "and decompose into 2 to 4 major functional sub-assemblies (MAX 4 parts! Group symmetric arrays like 'all 4 wheels' or 'all 4 fins' into a SINGLE part entry!).\n"
+            "3. Each part MUST include:\n"
+            "   - `id`: short snake_case name (e.g., 'nose_cone', 'fuselage_body', 'fin_set', 'wheel_set').\n"
+            "   - `archetype_tag`: choose ONE canonical shape family from: "
+            "['cylindrical_tube', 'ogive_cone', 'conical_frustum', 'radial_fin_set', 'spur_gear', 'flanged_plate', 'l_bracket', 'enclosure_box', 'wheel_set', 'tubular_frame', 'contoured_body', 'custom_part'].\n"
+            "   - `archetype_query`: a material-agnostic, origin-centered geometric description of JUST this sub-part for vector lookup.\n"
+            "   - `dimensions`: dictionary of key numeric dimensions in mm.\n"
+            "   - `position_mm`: [X, Y, Z] world translation offset where this sub-part's local (0,0,0) origin sits in the final assembly.\n"
+            "   - `default_material`: optimal material from ['Al 6061', 'Steel', 'Titanium', 'Brass', 'Copper', 'PLA', 'ABS'].\n"
+            "Output ONLY valid JSON matching:\n"
             "{\n"
-            "  \"object\": \"short 2-4 word part name (no material names)\",\n"
-            "  \"is_assembly\": true or false,\n"
-            "  \"canonical_query\": \"standardized material-agnostic description of the geometry and dimensions for vector cache lookup\",\n"
+            "  \"object\": \"short 2-4 word name\",\n"
+            "  \"is_assembly\": true,\n"
+            "  \"canonical_query\": \"full object description\",\n"
             "  \"parts\": [\n"
-            "    {\"id\": \"part_name\", \"type\": \"primitive_or_feature\", \"dimensions\": {}, \"position_mm\": [0, 0, 0]}\n"
+            "    {\"id\": \"main_body\", \"archetype_tag\": \"contoured_body\", \"archetype_query\": \"...\", \"dimensions\": {}, \"position_mm\": [0, 0, 0], \"default_material\": \"Al 6061\"}\n"
             "  ],\n"
             "  \"shared_interfaces\": {}\n"
-            "}\n"
-            "Output ONLY valid JSON."
+            "}"
         )
         raw_json = await self.llm.generate(
             [
@@ -154,36 +235,89 @@ class CadOrchestrator:
             role="planner"
         )
         bom = self.llm.extract_json(raw_json)
+        parts_list = bom.get("parts") or []
 
-        # Pre-fetch pgvector semantic matches here so route_coder_strategy can route cleanly
+        # Fallback if LLM returned empty parts array
+        if not parts_list:
+            parts_list = [{
+                "id": "main_body",
+                "archetype_tag": "custom_part",
+                "archetype_query": bom.get("canonical_query") or state.get("expanded_prompt") or state["raw_prompt"],
+                "dimensions": {},
+                "position_mm": [0.0, 0.0, 0.0],
+                "default_material": state.get("material", "Al 6061")
+            }]
+            bom["parts"] = parts_list
+
+        # Cap at 4 functional sub-assemblies to guarantee fast build times
+        parts_list = parts_list[:4]
+        bom["parts"] = parts_list
+
+        part_names = ", ".join(p.get("id", f"part_{i+1}") for i, p in enumerate(parts_list))
+        return {
+            "bom_json": bom,
+            "part_queue": list(parts_list),
+            "total_parts": len(parts_list),
+            "current_part_index": 0,
+            "compiled_parts": {},
+            "progress_log": f"decomposed into {len(parts_list)} component(s): {part_names}"
+        }
+
+    async def node_subpart_router(self, state: CadGraphState) -> Dict[str, Any]:
+        """Pops the next sub-part from `part_queue` and performs pgvector archetype lookup."""
+        queue = list(state.get("part_queue") or [])
+        if not queue:
+            return {"current_part": None, "cache_matches": []}
+
+        current_part = queue.pop(0)
+        idx = state.get("current_part_index", 0) + 1
+        total = state.get("total_parts", 1)
+        pid = current_part.get("id", f"part_{idx}")
+
+        # Build search query: if single-part job, use full canonical_query; if sub-part, use archetype_query
+        bom = state.get("bom_json") or {}
+        if total == 1:
+            query = bom.get("canonical_query") or current_part.get("archetype_query") or state.get("expanded_prompt") or state["raw_prompt"]
+        else:
+            query = current_part.get("archetype_query") or f"{current_part.get('archetype_tag', '')} {pid} {current_part.get('dimensions', {})}"
+
         matches: List[Dict[str, Any]] = []
         if not state.get("fresh"):
-            canonical_query = bom.get("canonical_query") or state.get("expanded_prompt") or state["raw_prompt"]
             try:
-                embedding = await self.llm.get_embedding(canonical_query)
-                matches = self.repo.search_similar_cad(embedding, threshold=0.70, limit=2)
+                embedding = await self.llm.get_embedding(query)
+                matches = self.repo.search_similar_cad(embedding, threshold=0.72, limit=2)
             except Exception as e:
-                logger.warning(f"Vector cache lookup skipped: {e}")
+                logger.warning(f"Sub-part vector lookup skipped for {pid}: {e}")
 
-        return {"bom_json": bom, "cache_matches": matches}
+        return {
+            "part_queue": queue,
+            "current_part": current_part,
+            "current_part_index": idx,
+            "cache_matches": matches,
+            "part_repair_attempts": 0,
+            "error_traceback": None,
+            "progress_log": f"building component ({idx}/{total}): {pid}"
+        }
 
     async def node_modifier(self, state: CadGraphState) -> Dict[str, Any]:
-        """Agent 2A: Surgical Parametric Modifier (High-Confidence Cache Hit >= 0.85)."""
+        """Agent 2A: Surgical Parametric Modifier for a matched sub-part or template."""
         matches = state.get("cache_matches") or []
         best_match = matches[0]
-        bom = state.get("bom_json") or {}
-        canonical_query = bom.get("canonical_query") or state.get("expanded_prompt") or state["raw_prompt"]
+        part = state.get("current_part") or {}
+        pid = part.get("id", "main_body")
+        idx = state.get("current_part_index", 1)
+        total = state.get("total_parts", 1)
 
-        logger.info(f"Cache HIT ({best_match['similarity']:.2f}) on '{canonical_query}'. Executing Agent 2A (Modifier).")
+        logger.info(f"[{idx}/{total}] Cache HIT ({best_match['similarity']:.2f}) for '{pid}'. Running Agent 2A.")
         sys_prompt = (
             "You are Agent 2A: Parametric CAD Modifier. You are given a verified CadQuery script from cache. "
-            "If the Target BOM dimensions match the template, return the template code UNCHANGED. "
+            "If the Target Sub-Part dimensions match the template, return the template code UNCHANGED. "
             "If any dimensions differ, update ONLY those numeric parameters. "
             "Do NOT alter the structural logic or function signatures. "
-            "CRITICAL: Keep the final `result` (or `parts`) assignment intact. Output ONLY valid Python code."
+            "CRITICAL: Keep the final `result = ...` assignment intact. Output ONLY valid Python code."
         )
         user_content = (
-            f"Target BOM:\n{bom}\n\n"
+            f"Target Sub-Part Specification:\n{part}\n\n"
             f"Cached Template Code:\n```python\n{best_match['code']}\n```"
         )
 
@@ -193,19 +327,27 @@ class CadOrchestrator:
             max_tokens=8192,
             role="modifier"
         )
+        extracted = self.llm.extract_code(raw_code) or best_match["code"]
         return {
-            "cad_code": self.llm.extract_code(raw_code) or best_match["code"],
-            "cached_hit": True
+            "current_part_code": extracted,
+            "current_part_cached": True,
+            "cached_hit": state.get("cached_hit", False) or (total == 1),
+            "progress_log": f"adapted {pid} ({idx}/{total}) from pgvector cache"
         }
 
     async def node_atomic_coder(self, state: CadGraphState) -> Dict[str, Any]:
-        """Agent 2B: Atomic Coder (Cache Miss or Self-Healing Repair Loop)."""
-        logger.info("Executing Agent 2B (Atomic Coder).")
-        bom = state.get("bom_json") or {}
+        """Agent 2B: Generates origin-centered CadQuery code for `current_part`."""
+        part = state.get("current_part") or {}
+        pid = part.get("id", "main_body")
+        idx = state.get("current_part_index", 1)
+        total = state.get("total_parts", 1)
         matches = state.get("cache_matches") or []
+        bom = state.get("bom_json") or {}
+
+        logger.info(f"[{idx}/{total}] Executing Agent 2B (Atomic Coder) for sub-part '{pid}'.")
 
         sys_prompt = (
-            "You are an expert OpenCASCADE and CadQuery engineer. Output ONLY valid Python code inside a ```python ``` block.\n"
+            "You are Agent 2B: Expert OpenCASCADE and CadQuery Engineer. Output ONLY valid Python code inside a ```python ``` block.\n"
             "COORDINATE CONVENTION: +X = Forward/Length, +Y = Left/Right Width (Axle Axis), +Z = Up/Height.\n"
             "CRITICAL CAD MODELING RULES:\n"
             "1. Always `import cadquery as cq` and `import math`.\n"
@@ -213,135 +355,215 @@ class CadOrchestrator:
             "   - `spur_gear(m, z, t, bore=0)` -> returns a cq.Workplane spur gear\n"
             "   - `radial(shape, n, r=0)` -> copies `shape` n times around Z axis and unions them\n"
             "   - `bolt_circle(body, n, r, d, face='>Z')` -> drills n through-holes of diameter d on radius r\n"
-            "3. NO BOXY BRICKS FOR VEHICLES/ASSEMBLIES:\n"
-            "   - Do NOT model car bodies, fuel tanks, seats, or fairings using `cq.Workplane('XY').box(...)`!\n"
-            "   - Instead, draw their 2D side silhouette on `cq.Workplane('XZ').polyline([...]).close().extrude(width/2, both=True)`.\n"
-            "   - Model frames, forks, handlebars, and struts using cylinders or swept/extruded tubes (radius 12-25mm), NOT huge bounding boxes.\n"
-            "   - Model wheels on `cq.Workplane('XZ')` (so the cylinder extrudes along the Y axle axis: `.circle(r_tire).extrude(width/2, both=True)`), "
-            "and cut or join an inner rim/axle cylinder so the wheel has realistic depth.\n"
-            "4. For single mechanical parts, union all features into a single connected solid and assign `result = ...`.\n"
-            "5. For multi-part assemblies (e.g., rockets, cars, drones), model each sub-component cleanly, assign a dictionary of named sub-parts "
-            "`parts = {'body': body, 'nose_cone': nose, 'fins': fins}` AND ALSO union them into `result` (e.g., `result = body.union(nose).union(fins)`). "
-            "Avoid `.shell()` on complex multi-body unions as it fails in OpenCASCADE; use solid primitives/lofts/revolves instead.\n"
-            "AND ALSO assign `result` at the end (e.g., unioning them or `cq.Compound.makeCompound`).\n"
-            "6. The last line of your script MUST define `result`."
+            "3. BUILD ONLY THE REQUESTED COMPONENT AROUND LOCAL ORIGIN (0, 0, 0):\n"
+            "   - Do NOT apply the assembly's world `position_mm` translation inside this script; the Master Assembler will translate it later.\n"
+            "   - Exception: if building a symmetric pair/array (like `wheel_set` or `fin_set`), place the wheels/fins at their relative offsets around (0,0,0) and union them into `result`.\n"
+            "4. NO BOXY BRICKS FOR VEHICLES/ASSEMBLIES:\n"
+            "   - For car bodies, fuel tanks, seats, or fairings, sketch a 2D side silhouette on `cq.Workplane('XZ').polyline([...]).close().extrude(width/2, both=True)`.\n"
+            "   - For frames, forks, handlebars, and struts, use cylinders/tubes (radius 12-25mm), NOT huge bounding boxes.\n"
+            "   - For wheels, sketch on `cq.Workplane('XZ').circle(r_tire).extrude(width/2, both=True)` so the axle runs along Y.\n"
+            "5. Avoid `.shell()` or fragile `.fillet()` on complex intersections. Assign the final solid to `result` on the last line."
         )
 
-        user_content = (
-            f"Create a CadQuery model. Units are millimeters, +X forward, +Y left/right, +Z up.\n"
-            f"Specification: {state.get('expanded_prompt') or state['raw_prompt']}\n"
-            f"BOM: {bom}\n"
-        )
-        # Inject partial matches (0.70 <= similarity < 0.85) as few-shot reference examples
+        if total == 1:
+            spec_text = state.get("expanded_prompt") or state["raw_prompt"]
+            user_content = (
+                f"Create a complete CadQuery model centered at origin (0,0,0). Units: mm.\n"
+                f"Specification: {spec_text}\n"
+                f"Part Details: {part}\n"
+            )
+        else:
+            user_content = (
+                f"Build ONLY sub-component `{pid}` (part {idx} of {total} for `{bom.get('object', 'assembly')}`).\n"
+                f"Build it centered at local origin (0, 0, 0) (do NOT apply world offset {part.get('position_mm')} yet).\n"
+                f"Sub-Part Archetype & Description: {part.get('archetype_query')}\n"
+                f"Target Dimensions (mm): {part.get('dimensions')}\n"
+                f"Full Assembly Context (for mating reference only): {state.get('expanded_prompt')}\n"
+            )
+
         if matches:
-            user_content += "\nReference Examples:\n"
-            for m in matches:
+            user_content += "\nReference CadQuery Examples:\n"
+            for m in matches[:1]:
                 user_content += f"- {m['prompt']}\n```python\n{m['code']}\n```\n"
 
         if state.get("error_traceback"):
             user_content += (
-                f"\nPREVIOUS CODE:\n```python\n{state.get('cad_code', '')}\n```\n"
+                f"\nPREVIOUS CODE FOR `{pid}`:\n```python\n{state.get('current_part_code', '')}\n```\n"
                 f"FAILED WITH ERROR:\n{state['error_traceback']}\n"
-                f"Fix the CadQuery code and ensure `result` is assigned at the end."
+                f"Fix the CadQuery code for `{pid}` and ensure `result` is defined at the end."
             )
 
         raw_code = await self.llm.generate(
             [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_content}],
             temperature=0.2,
-            max_tokens=16384,
+            max_tokens=12288,
             role="coder"
         )
         return {
-            "cad_code": self.llm.extract_code(raw_code),
-            "cached_hit": False
+            "current_part_code": self.llm.extract_code(raw_code),
+            "current_part_cached": False
         }
 
-    async def node_compiler(self, state: CadGraphState) -> Dict[str, Any]:
-        if not state.get("cad_code"):
+    async def node_part_compiler(self, state: CadGraphState) -> Dict[str, Any]:
+        """
+        Agent 3: Compiles `current_part_code` in isolation, caches verified sub-parts
+        into Supabase `cad_examples`, and streams intermediate 3D preview mesh.
+        """
+        part = state.get("current_part") or {}
+        pid = part.get("id", "main_body")
+        idx = state.get("current_part_index", 1)
+        total = state.get("total_parts", 1)
+        code = state.get("current_part_code") or ""
+
+        if not code.strip():
+            attempts = state.get("part_repair_attempts", 0) + 1
             return {
-                "error_traceback": "Coder returned empty code block.",
-                "repair_attempts": state["repair_attempts"] + 1
+                "error_traceback": f"Coder returned empty code block for sub-part `{pid}`.",
+                "part_repair_attempts": attempts,
+                "repair_attempts": state.get("repair_attempts", 0) + 1,
+                "progress_log": f"repairing {pid} (round {attempts})"
             }
 
-        wd = f"{settings.out_dir}/{state['job_id']}"
-        exec_result = await self.sandbox.run_code(state["cad_code"], wd)
+        # Execute in a dedicated sub-folder for this sub-part (or main folder if 1 part)
+        wd = f"{settings.out_dir}/{state['job_id']}" if total == 1 else f"{settings.out_dir}/{state['job_id']}/sub_{pid}"
+        exec_result = await self.sandbox.run_code(code, wd)
 
         if not exec_result.get("ok"):
+            attempts = state.get("part_repair_attempts", 0) + 1
+            err_msg = exec_result.get("error", "Unknown runtime error")
+            short_err = err_msg.strip().splitlines()[-1][:90] if err_msg else "runtime error"
             return {
-                "error_traceback": exec_result.get("error", "Unknown runtime error"),
-                "repair_attempts": state["repair_attempts"] + 1
+                "error_traceback": err_msg,
+                "part_repair_attempts": attempts,
+                "repair_attempts": state.get("repair_attempts", 0) + 1,
+                "progress_log": f"repairing {pid} (round {attempts}): {short_err}"
             }
 
-        return {"error_traceback": None, "final_result": exec_result}
+        # Verified Sub-Part! Auto-cache this sub-part into `public.cad_examples` if it was freshly generated
+        archetype_tag = str(part.get("archetype_tag") or "custom_part").strip()
+        archetype_query = part.get("archetype_query") or f"{archetype_tag}: {pid} {part.get('dimensions', {})}"
 
-    def route_compiler_output(self, state: CadGraphState) -> str:
-        """Determines if the pipeline should repair, proceed to physics, or fail."""
-        if state.get("error_traceback"):
-            if state["repair_attempts"] >= 3:
-                logger.error(f"Job {state['job_id']} failed after 3 repair attempts.")
-                return "fatal"
-            return "repair"
-        return "success"
+        if not state.get("current_part_cached") and exec_result.get("valid", True):
+            try:
+                emb = await self.llm.get_embedding(archetype_query)
+                self.repo.save_example_to_cache(
+                    tags=[archetype_tag, "subpart", pid],
+                    prompt=archetype_query,
+                    code=code,
+                    embedding=emb
+                )
+            except Exception as e:
+                logger.warning(f"Sub-part cache save skipped for {pid}: {e}")
 
-    async def node_auditor(self, state: CadGraphState) -> Dict[str, Any]:
-        """Agent 4: Computes material mass/physics and auto-caches verified geometry."""
-        res = state.get("final_result", {})
-        vol_mm3 = float(res.get("volume") or 0.0)
-        mat = state.get("material", "Al 6061")
-        density_g_cm3 = MATERIAL_DENSITIES_G_CM3.get(mat, 2.70)
-        mass_g = round(vol_mm3 * (density_g_cm3 / 1000.0), 2)
-        n_solids = res.get("n_solids") or (res.get("counts") or {}).get("solids", 1)
-        has_named_parts = bool((res.get("mesh") or {}).get("parts"))
-
-        warning = None
-        if n_solids and n_solids > 1 and not has_named_parts:
-            warning = f"result has {n_solids} disconnected solids; make features overlap so they fuse into one"
-
-        report = {
-            "mass_g": mass_g,
-            "density_g_cm3": density_g_cm3,
-            "volume_mm3": round(vol_mm3, 2),
-            "verified": bool(res.get("valid", True)) and (n_solids == 1 or has_named_parts),
-            "warning": warning
+        compiled = dict(state.get("compiled_parts") or {})
+        compiled[pid] = {
+            "code": code,
+            "volume_mm3": float(exec_result.get("volume") or 0.0),
+            "bbox": exec_result.get("bbox") or [0.0, 0.0, 0.0],
+            "bbox_min": exec_result.get("bbox_min") or [0.0, 0.0, 0.0],
+            "translate_mm": part.get("position_mm") or [0.0, 0.0, 0.0],
+            "material": part.get("default_material") or state.get("material", "Al 6061"),
+            "archetype_tag": archetype_tag,
+            "exec_result": exec_result,
         }
 
+        return {
+            "error_traceback": None,
+            "compiled_parts": compiled,
+            "latest_part_mesh": exec_result.get("mesh"),
+            "progress_log": f"verified {pid} ({idx}/{total}) · cached [{archetype_tag}]"
+        }
+
+    async def node_auditor(self, state: CadGraphState) -> Dict[str, Any]:
+        """
+        Agent 4: Master Assembler & Multi-Physics Edge-Case Simulator.
+        Stitches all verified sub-parts into the final assembly, compiles the master
+        STEP/STL/mesh, and executes the analytical physics & material optimization audit.
+        """
+        compiled_parts = state.get("compiled_parts") or {}
         bom = state.get("bom_json") or {}
+        bom_parts = bom.get("parts") or []
+        mat = state.get("material", "Al 6061")
+
+        # If single part, reuse its already-compiled result directly without re-running sandbox!
+        if len(compiled_parts) == 1:
+            only_id, only_data = next(iter(compiled_parts.items()))
+            pos = only_data.get("translate_mm") or [0.0, 0.0, 0.0]
+            if pos == [0.0, 0.0, 0.0] or pos == [0, 0, 0]:
+                master_code = only_data["code"]
+                res = only_data["exec_result"]
+            else:
+                master_code = CadAssembler.stitch_assembly(compiled_parts, bom_parts)
+                wd = f"{settings.out_dir}/{state['job_id']}"
+                res = await self.sandbox.run_code(master_code, wd)
+        else:
+            master_code = CadAssembler.stitch_assembly(compiled_parts, bom_parts)
+            wd = f"{settings.out_dir}/{state['job_id']}"
+            res = await self.sandbox.run_code(master_code, wd)
+
+            # Fallback if stitched union had an issue: use the largest verified sub-part
+            if not res.get("ok") and compiled_parts:
+                largest_id = max(compiled_parts, key=lambda k: compiled_parts[k].get("volume_mm3", 0.0))
+                master_code = compiled_parts[largest_id]["code"]
+                res = compiled_parts[largest_id]["exec_result"]
+
+        vol_mm3 = float(res.get("volume") or 0.0)
+        bbox = res.get("bbox") or [100.0, 100.0, 100.0]
+        n_solids = res.get("n_solids") or (res.get("counts") or {}).get("solids", 1)
+        has_named_parts = bool((res.get("mesh") or {}).get("parts")) or len(compiled_parts) > 1
+
+        # Run First-Principles Physics & Crash/Wind/Buckling Audit
+        report = PhysicsEngine.run_full_audit(
+            volume_mm3=vol_mm3,
+            bbox=bbox,
+            material=mat,
+            n_solids=n_solids,
+            has_named_parts=has_named_parts,
+            valid=bool(res.get("valid", True)),
+            compiled_parts=compiled_parts,
+        )
+
         canonical_query = bom.get("canonical_query") or state.get("expanded_prompt") or state["raw_prompt"]
 
-        # Persist to Supabase generations table
+        # Persist completed generation to Supabase `generations` table
         self.repo.save_generation({
             "job": state["job_id"],
             "prompt": state["raw_prompt"],
             "material": mat,
-            "route": "cache_modifier" if state.get("cached_hit") else "atomic_coder",
+            "route": "cache_modifier" if state.get("cached_hit") else "iterative_assembly",
             "parent_job": state.get("parent_job"),
             "plan": bom,
-            "code": state["cad_code"],
+            "code": master_code,
             "ok": True,
             "verified": report["verified"],
-            "score": 10 if report["verified"] else 7,
-            "bbox": res.get("bbox"),
+            "score": 10 if report["verified"] else 8,
+            "bbox": bbox,
             "volume_mm3": report["volume_mm3"],
-            "mass_g": mass_g,
+            "mass_g": report["mass_g"],
             "physics": report,
-            "attempts": state["repair_attempts"] + 1,
+            "attempts": state.get("repair_attempts", 0) + 1,
             "llm_model": settings.coder_model
         })
 
-        # Auto-seed verified geometry into cad_examples using the material-agnostic canonical query
-        if not state.get("cached_hit") and report["verified"] and state.get("cad_code"):
+        # Also cache the complete stitched assembly under its canonical query if multi-part
+        if len(compiled_parts) > 1 and report["verified"] and master_code:
             try:
                 emb = await self.llm.get_embedding(canonical_query)
                 self.repo.save_example_to_cache(
-                    tags=[bom.get("object", "part")],
+                    tags=[bom.get("object", "assembly"), "assembly"],
                     prompt=canonical_query,
-                    code=state["cad_code"],
+                    code=master_code,
                     embedding=emb
                 )
             except Exception as e:
-                logger.warning(f"Auto-cache save skipped: {e}")
+                logger.warning(f"Master assembly cache save skipped: {e}")
 
-        return {"physics_report": report}
+        return {
+            "cad_code": master_code,
+            "final_result": res,
+            "physics_report": report,
+            "progress_log": f"done · safety factor {report['overall_safety_factor']}x"
+        }
 
     async def execute_job(
         self,
@@ -360,7 +582,17 @@ class CadOrchestrator:
             "parent_job": parent_job,
             "expanded_prompt": None,
             "bom_json": None,
+            "part_queue": [],
+            "current_part": None,
+            "current_part_index": 0,
+            "total_parts": 1,
             "cache_matches": None,
+            "current_part_code": None,
+            "current_part_cached": False,
+            "part_repair_attempts": 0,
+            "compiled_parts": {},
+            "progress_log": None,
+            "latest_part_mesh": None,
             "cad_code": None,
             "cached_hit": False,
             "error_traceback": None,

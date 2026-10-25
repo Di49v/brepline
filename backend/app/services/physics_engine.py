@@ -18,7 +18,7 @@ MATERIAL_LIBRARY: Dict[str, Dict[str, Any]] = {
         "youngs_gpa": 68.9,
         "sea_kj_kg": 28.0,   # Specific Energy Absorption in progressive crush
         "cost_usd_kg": 3.20,
-        "color_hex": "#94a3b8"
+        "color_hex": "#94a3b8"  # Brushed Aluminum Silver
     },
     "Steel": {
         "density_g_cm3": 7.85,
@@ -27,7 +27,7 @@ MATERIAL_LIBRARY: Dict[str, Dict[str, Any]] = {
         "youngs_gpa": 200.0,
         "sea_kj_kg": 22.0,
         "cost_usd_kg": 1.10,
-        "color_hex": "#64748b"
+        "color_hex": "#ef4444"  # Automotive Body Crimson / Steel
     },
     "Titanium": {
         "density_g_cm3": 4.43,
@@ -36,7 +36,16 @@ MATERIAL_LIBRARY: Dict[str, Dict[str, Any]] = {
         "youngs_gpa": 113.8,
         "sea_kj_kg": 42.0,
         "cost_usd_kg": 28.00,
-        "color_hex": "#cbd5e1"
+        "color_hex": "#cbd5e1"  # Aerospace Titanium Grey
+    },
+    "Carbon Fiber": {
+        "density_g_cm3": 1.60,
+        "yield_mpa": 600.0,
+        "ultimate_mpa": 750.0,
+        "youngs_gpa": 135.0,
+        "sea_kj_kg": 55.0,
+        "cost_usd_kg": 42.00,
+        "color_hex": "#334155"  # Matte Carbon Slate
     },
     "Brass": {
         "density_g_cm3": 8.50,
@@ -45,7 +54,7 @@ MATERIAL_LIBRARY: Dict[str, Dict[str, Any]] = {
         "youngs_gpa": 105.0,
         "sea_kj_kg": 14.0,
         "cost_usd_kg": 6.50,
-        "color_hex": "#eab308"
+        "color_hex": "#eab308"  # Machined Brass Gold
     },
     "Copper": {
         "density_g_cm3": 8.96,
@@ -54,7 +63,25 @@ MATERIAL_LIBRARY: Dict[str, Dict[str, Any]] = {
         "youngs_gpa": 117.0,
         "sea_kj_kg": 11.0,
         "cost_usd_kg": 9.40,
-        "color_hex": "#f97316"
+        "color_hex": "#f97316"  # Copper Orange
+    },
+    "Glass": {
+        "density_g_cm3": 2.50,
+        "yield_mpa": 45.0,
+        "ultimate_mpa": 50.0,
+        "youngs_gpa": 70.0,
+        "sea_kj_kg": 4.0,
+        "cost_usd_kg": 2.40,
+        "color_hex": "#38bdf8"  # Translucent Sky-Blue Windshield Glass
+    },
+    "Rubber": {
+        "density_g_cm3": 1.15,
+        "yield_mpa": 18.0,
+        "ultimate_mpa": 25.0,
+        "youngs_gpa": 0.05,
+        "sea_kj_kg": 12.0,
+        "cost_usd_kg": 2.80,
+        "color_hex": "#1e293b"  # Tire Vulcanized Black
     },
     "PLA": {
         "density_g_cm3": 1.24,
@@ -63,7 +90,7 @@ MATERIAL_LIBRARY: Dict[str, Dict[str, Any]] = {
         "youngs_gpa": 3.5,
         "sea_kj_kg": 8.5,
         "cost_usd_kg": 18.00,
-        "color_hex": "#38bdf8"
+        "color_hex": "#2fb67c"  # Emerald Polymer
     },
     "ABS": {
         "density_g_cm3": 1.04,
@@ -72,7 +99,7 @@ MATERIAL_LIBRARY: Dict[str, Dict[str, Any]] = {
         "youngs_gpa": 2.3,
         "sea_kj_kg": 10.5,
         "cost_usd_kg": 16.00,
-        "color_hex": "#a855f7"
+        "color_hex": "#a855f7"  # Violet Engineering ABS
     },
 }
 

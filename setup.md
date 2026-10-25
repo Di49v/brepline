@@ -129,7 +129,7 @@ MAX_CONCURRENT_JOBS=2
 
 # Supabase Credentials (Use the SECRET service_role key for backend writes)
 SUPABASE_URL=https://<your-project-id>.supabase.co
-SUPABASE_SERVICE_KEY=<your-service-role-key>
+SUPABASE_SECRET_KEY=<your-service-role-key>
 
 # LangSmith Observability (Optional)
 LANGCHAIN_TRACING_V2=false

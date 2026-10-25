@@ -147,6 +147,9 @@ function Thinking({ state, logs, t0, secs, onStop, partialMesh }) {
     : state === 'done' ? `Thought for ${dur(secs || 0)}`
     : state === 'stopped' ? `Stopped after ${dur(secs || 0)}`
     : `Failed after ${dur(secs || 0)}`
+
+  const verifiedLine = [...lines].reverse().find(l => /^verified /i.test(l)) || 'Latest compiled sub-part'
+
   return (
     <div className={'think ' + state}>
       <div className="th-h">
@@ -155,7 +158,7 @@ function Thinking({ state, logs, t0, secs, onStop, partialMesh }) {
           <span>{head}</span>
           {busy && <span className="th-s">{dur(live)}</span>}
         </button>
-        {busy && onStop && <button className="btn th-x" onClick={onStop}><PI k="stop"/>Stop</button>}
+        {busy && onStop && <button className="btn th-x" onClick={onStop}><PI k="stop" />Stop</button>}
       </div>
       {open && (
         <ol className="th-l" ref={listRef}>
@@ -164,12 +167,14 @@ function Thinking({ state, logs, t0, secs, onStop, partialMesh }) {
             : <li className="cur">Waiting for the engine…</li>}
         </ol>
       )}
-      {busy && open && partialMesh && (
-        <div style={{ marginTop: 10, borderRadius: 8, overflow: 'hidden', border: '1px solid var(--edge, #333)', maxWidth: 280 }}>
-          <div style={{ fontSize: 11, padding: '4px 8px', opacity: 0.85, background: 'rgba(0,0,0,0.2)' }}>
-            Live Sub-Part Compiler Preview
+      {busy && open && partialMesh && partialMesh.verts && partialMesh.verts.length > 0 && (
+        <div style={{ marginTop: 10, borderRadius: 8, overflow: 'hidden', border: '1px solid var(--edge, #333)', maxWidth: 320, background: 'rgba(0,0,0,0.18)' }}>
+          <div style={{ fontSize: 11, padding: '5px 10px', opacity: 0.9, borderBottom: '1px solid var(--edge, #333)' }}>
+            ✓ {verifiedLine}
           </div>
-          <Thumb mesh={partialMesh} alt="Sub-part preview" />
+          <div style={{ width: '100%', height: 180, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <Thumb mesh={partialMesh} alt="Sub-part preview" />
+          </div>
         </div>
       )}
       {busy && open && live > 45 && <div className="th-n">Complex multi-part assemblies compile component by component.</div>}
@@ -188,7 +193,7 @@ function SidebarGen({ items, onStop, onOpen }) {
       <div className="sgh"><i className="sgd" />Generating{items.length > 1 ? ` · ${items.length}` : ''}</div>
       <button className="sgt" onClick={() => onOpen(it.id)} title={it.text}>{it.text}</button>
       <div className="sgm">{has ? STAGE_TITLE[stageOf(it.logs)] : 'Starting'} · {dur(sec)}</div>
-      <button className="btn sgs" onClick={onStop}><PI k="stop"/>Stop</button>
+      <button className="btn sgs" onClick={onStop}><PI k="stop" />Stop</button>
     </div>
   )
 }
@@ -201,7 +206,7 @@ function Toasts({ list, onClose, onOpen }) {
       {list.map(t => (
         <div key={t.id} className={'toast ' + t.kind}>
           <button className="to-b" onClick={() => onOpen(t)}><b>{t.title}</b><span>{t.body}</span></button>
-          <button className="to-x" aria-label="Dismiss" onClick={() => onClose(t.id)}><PI k="x"/></button>
+          <button className="to-x" aria-label="Dismiss" onClick={() => onClose(t.id)}><PI k="x" /></button>
         </div>
       ))}
     </div>
@@ -324,7 +329,7 @@ function Result({ v, onOpen3d, onRefine, onEditShape }) {
       {v.warning && <div style={{ margin: '6px 0', fontSize: 13, opacity: 0.8 }}>Note: {v.warning}</div>}
       <div className="cad">
         <div className="prev" onClick={() => onOpen3d(v)}>
-          {v.mesh ? <Thumb alt={v.title} mesh={v.mesh} partColors={partColors}/> : <PartIcon/>}
+          {v.mesh ? <Thumb mesh={v.mesh} alt={v.title} partColors={partColors} /> : <PartIcon />}
         </div>
         <div className="meta">
           <div><small>Mass</small>{fmtMass(v.mass_g)}</div>
@@ -335,8 +340,8 @@ function Result({ v, onOpen3d, onRefine, onEditShape }) {
           </div>
         </div>
         <div className="acts">
-          <button className="btn p" onClick={() => dl(v.job, v.f)}><Ic n="dl"/>Download {v.f}</button>
-          <button className="btn" onClick={() => onOpen3d(v)}><Ic n="exp"/>Enlarge 3D & Crash Lab</button>
+          <button className="btn p" onClick={() => dl(v.job, v.f)}><Ic n="dl" />Download {v.f}</button>
+          <button className="btn" onClick={() => onOpen3d(v)}><Ic n="exp" />Enlarge 3D & Crash Lab</button>
           <button className="btn" onClick={() => onRefine(v)}>Refine</button>
           {v.shape && <button className="btn" onClick={() => onEditShape(v)}>Edit shape</button>}
           <button className="btn" onClick={() => setShowCode(s => !s)}>{showCode ? 'Hide code' : 'View code'}</button>
@@ -831,9 +836,12 @@ export default function App() {
   }))
   const addMsg = M => setChats(cs => cs.map(c => (c.id === cur.id ? { ...c, msgs: [...c.msgs, M] } : c)))
   useEffect(() => { if (!chats.some(c => c.id === activeId)) setActiveId(chats[chats.length - 1].id) }, [chats, activeId])
+
+  // FIXED: Only auto-scroll when a new message is added or chat tab changes, NEVER on 1s log poll ticks!
   useEffect(() => {
     msgsRef.current?.scrollTo({ top: 1e9, behavior: 'smooth' })
-  }, [msgs])
+  }, [msgs.length, activeId])
+
   const patch = (id, o) => setMsgs(p => p.map(x => (x.id === id ? { ...x, ...o } : x)))
   const busyList = allMsgs.filter(m => m.busy)
   const busyCount = busyList.length
@@ -847,14 +855,25 @@ export default function App() {
     aborts.current[id] = ac
     const t0 = Date.now()
     let lastLogs = []
+    let lastVertCount = 0
     patch(id, { busy: true, err: null, stopped: false, logs: [], partialMesh: null, t0 })
     try {
       const r = await generate(
         { prompt: text, material: m, parentJob: parent, fresh },
-        lines => { if (lines.length) { lastLogs = lines; patch(id, { logs: lines }) } },
+        lines => {
+          if (lines.length && (lines.length !== lastLogs.length || lines[lines.length - 1] !== lastLogs[lastLogs.length - 1])) {
+            lastLogs = lines
+            patch(id, { logs: lines })
+          }
+        },
         ac.signal,
         job => { ac.job = job },
-        partialMesh => { if (partialMesh && partialMesh.verts) patch(id, { partialMesh }) }
+        partialMesh => {
+          if (partialMesh && partialMesh.verts && partialMesh.verts.length !== lastVertCount) {
+            lastVertCount = partialMesh.verts.length
+            patch(id, { partialMesh })
+          }
+        }
       )
       if (ac.signal.aborted) throw new DOMException('Aborted', 'AbortError')
       const secs = Math.round((Date.now() - t0) / 1000)
@@ -1030,17 +1049,17 @@ export default function App() {
         <button className="new" onClick={newDesign}><Ic n="plus" />New design</button>
         <nav>
           {NAV.map(([v, label, icon]) => (
-            <button key={v} className={view === v ? 'on' : ''} onClick={() => go(v)}><Ic n={icon}/>{label}{v === 'chat' && busyCount > 0 && <span className="nb" title="Generating">{busyCount}</span>}</button>
+            <button key={v} className={view === v ? 'on' : ''} onClick={() => go(v)}><Ic n={icon} />{label}{v === 'chat' && busyCount > 0 && <span className="nb" title="Generating">{busyCount}</span>}</button>
           ))}
         </nav>
-        <SidebarGen items={busyList} onOpen={openTurn} onStop={stopAll}/>
+        <SidebarGen items={busyList} onStop={stopAll} onOpen={openTurn} />
         <div className="cap">Recent</div>
         <div className="rlist">
           {chats.filter(c => c.msgs.length).slice().reverse().slice(0, 10).map(c => (
             <div key={c.id} className={'ri' + (c.id === cur.id && view === 'chat' ? ' on' : '')} onClick={() => openChat(c.id)} title={c.msgs[0].text}>
               {c.msgs.some(m => m.busy) && <i className="sgd" title="Generating" />}
               <span className="rt">{c.msgs[0].text.slice(0, 42)}</span>
-              <button className="rx" title="Delete chat" aria-label="Delete chat" onClick={e => { e.stopPropagation(); askRemoveChat(c) }}><PI k="x"/></button>
+              <button className="rx" title="Delete chat" aria-label="Delete chat" onClick={e => { e.stopPropagation(); askRemoveChat(c) }}><PI k="x" /></button>
             </div>
           ))}
         </div>
@@ -1070,7 +1089,7 @@ export default function App() {
       <main>
         <header>
           <div className="hl">
-            <button className="btn sbt" title="Toggle sidebar (Ctrl+B)" aria-label="Toggle sidebar" onClick={toggleSb}><Ic n="side"/></button>
+            <button className="btn sbt" title="Toggle sidebar (Ctrl+B)" aria-label="Toggle sidebar" onClick={toggleSb}><Ic n="side" /></button>
             <select id="model" value={model} onChange={e => setModel(e.target.value)}>
               <option>Brepline-1</option>
             </select>
@@ -1117,8 +1136,8 @@ export default function App() {
                             <div className="ut">{M.text}</div>
                             <div className="tb">
                               <CopyBtn text={M.text} />
-                              <button title="Edit" onClick={() => patch(M.id, { editing: true })}><PI k="pen"/></button>
-                              <button title="Delete" aria-label="Delete" onClick={() => askRemoveTurn(M.id, M.text.slice(0, 42))}><PI k="x"/></button>
+                              <button title="Edit" onClick={() => patch(M.id, { editing: true })}><PI k="pen" /></button>
+                              <button title="Delete" aria-label="Delete" onClick={() => askRemoveTurn(M.id, M.text.slice(0, 42))}><PI k="x" /></button>
                             </div>
                           </>
                         )}
@@ -1129,7 +1148,7 @@ export default function App() {
                       <div className="t">
                         <div className="body">
                           {loading ? (
-                            <Thinking logs={M.logs} partialMesh={M.partialMesh} state="busy" t0={M.t0} onStop={() => stopOne(M.id)} />
+                            <Thinking state="busy" logs={M.logs} t0={M.t0} partialMesh={M.partialMesh} onStop={() => stopOne(M.id)} />
                           ) : v ? (
                             <>
                               <Thinking state="done" logs={v.think && v.think.logs} secs={v.think && v.think.secs} />
@@ -1153,9 +1172,9 @@ export default function App() {
                             <div className="tb">
                               {M.vers.length > 1 && (
                                 <span className="pg">
-                                  <button disabled={!M.cur} onClick={() => nav(M.id, -1)}><PI k="l"/></button>
+                                  <button disabled={!M.cur} onClick={() => nav(M.id, -1)}><PI k="l" /></button>
                                   {M.cur + 1} / {M.vers.length}
-                                  <button disabled={M.cur >= M.vers.length - 1} onClick={() => nav(M.id, 1)}><PI k="r"/></button>
+                                  <button disabled={M.cur >= M.vers.length - 1} onClick={() => nav(M.id, 1)}><PI k="r" /></button>
                                 </span>
                               )}
                               {v && <CopyBtn text={plain(v)} />}
@@ -1218,8 +1237,8 @@ export default function App() {
                 </div>
                 <span className="sp" />
                 {busyCount
-                  ? <button className="send stop" aria-label="Stop generating" title="Stop generating" onClick={stopAll}><PI k="stop"/></button>
-                  : <button className="send" aria-label="Send" onClick={() => send()}><Ic n="up"/></button>}
+                  ? <button className="send stop" aria-label="Stop generating" title="Stop generating" onClick={stopAll}><PI k="stop" /></button>
+                  : <button className="send" aria-label="Send" onClick={() => send()}><Ic n="up" /></button>}
               </div>
             </div>
             <div className="foot">Brepline can make mistakes. Verify dimensions before manufacturing.</div>
@@ -1236,7 +1255,7 @@ export default function App() {
                 <div key={h.id} className="hrow" onClick={() => openTurn(h.id)}>
                   <div><b>{h.t}</b><small>{busyList.some(m => m.id === h.id) ? 'Generating…' : h.d}</small></div>
                   <span className="tag">{h.f}</span>
-                  <button className="hx" title="Delete" aria-label="Delete" onClick={e => { e.stopPropagation(); askRemoveTurn(h.id, h.t) }}><PI k="x"/></button>
+                  <button className="hx" title="Delete" aria-label="Delete" onClick={e => { e.stopPropagation(); askRemoveTurn(h.id, h.t) }}><PI k="x" /></button>
                 </div>
               )) : <p style={{ color: 'var(--mute)' }}>No conversations yet.</p>}
             </div>
@@ -1259,9 +1278,9 @@ export default function App() {
             <div className="grid">
               {shownFiles.map(x => (
                 <div className="f" key={x.fid}>
-                  <button className="fx" title="Delete" aria-label="Delete file" onClick={() => askRemoveFile(x)}><PI k="x"/></button>
+                  <button className="fx" title="Delete" aria-label="Delete file" onClick={() => askRemoveFile(x)}><PI k="x" /></button>
                   <div className="prev" onClick={() => open3d(x.v)}>
-                    {x.v.mesh ? <Thumb alt={x.n} mesh={x.v.mesh} partColors={x.v.physics?.part_colors} /> : <PartIcon/>}
+                    {x.v.mesh ? <Thumb mesh={x.v.mesh} alt={x.n} partColors={x.v.physics && x.v.physics.part_colors} /> : <PartIcon />}
                   </div>
                   <div className="in">
                     <b>{x.n}.{x.f.toLowerCase()}</b>
@@ -1269,8 +1288,8 @@ export default function App() {
                     <div className="row">
                       <span className="tag">{x.f}</span>
                       <span style={{ display: 'flex', gap: 6 }}>
-                        <button className="btn" title="View in 3D" onClick={() => open3d(x.v)}><Ic n="exp"/>3D</button>
-                        <button className="btn" title="Download" onClick={() => dl(x.v.job, x.f)}><Ic n="dl"/></button>
+                        <button className="btn" title="View in 3D" onClick={() => open3d(x.v)}><Ic n="exp" />3D</button>
+                        <button className="btn" title="Download" onClick={() => dl(x.v.job, x.f)}><Ic n="dl" /></button>
                       </span>
                     </div>
                   </div>
@@ -1292,8 +1311,8 @@ export default function App() {
                 <h3>General</h3><p>Basic workspace preferences.</p>
                 <div className="srow"><div><b>Language</b><small>Interface language</small></div>
                   <select><option>English</option><option>Hindi</option><option>Punjabi</option></select></div>
-                <div className="srow"><div><b>Send with Enter</b><small>Use Shift+Enter for a new line</small></div><Sw def/></div>
-                <div className="srow"><div><b>Show example prompts</b><small>Display suggestions on the start screen</small></div><Sw def/></div>
+                <div className="srow"><div><b>Send with Enter</b><small>Use Shift+Enter for a new line</small></div><Sw def /></div>
+                <div className="srow"><div><b>Show example prompts</b><small>Display suggestions on the start screen</small></div><Sw def /></div>
               </div>
 
               <div className={'panel' + (panel === 'appearance' ? ' on' : '')}>
@@ -1310,7 +1329,7 @@ export default function App() {
                       <button key={c} aria-label={c} className={accent === c ? 'on' : ''} style={{ background: c }} onClick={() => setAccent(c)} />
                     ))}
                   </div></div>
-                <div className="srow"><div><b>Reduce motion</b><small>Turn off animations</small></div><Sw onChange="{setReduce}"/></div>
+                <div className="srow"><div><b>Reduce motion</b><small>Turn off animations</small></div><Sw onChange={setReduce} /></div>
               </div>
 
               <div className={'panel' + (panel === 'model' ? ' on' : '')}>
@@ -1349,8 +1368,8 @@ export default function App() {
         </section>
       </main>
 
-      <MeshModal onClose={close3d} s={v3} onGoPricing={() => go('pricing')} />
-      <ShapeEditor initial={shapeEd.initial} material={mat} onClose={closeShape} onResult={addShapeResult} open={shapeEd.open} parentJob={shapeEd.parent}/>
+      <MeshModal s={v3} onClose={close3d} onGoPricing={() => go('pricing')} />
+      <ShapeEditor open={shapeEd.open} initial={shapeEd.initial} material={mat} parentJob={shapeEd.parent} onClose={closeShape} onResult={addShapeResult} />
       <Toasts list={toasts} onClose={id => setToasts(p => p.filter(x => x.id !== id))}
         onOpen={t => { setToasts(p => p.filter(x => x.id !== t.id)); openTurn(t.msgId) }} />
       <Confirm cf={cf} onClose={closeCf} />

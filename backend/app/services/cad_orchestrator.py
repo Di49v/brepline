@@ -147,7 +147,7 @@ class CadOrchestrator:
 
         logger.info(f"Cache MISS (sim={sim:.2f}, target_tag={target_tag}). Routing to Agent 2B (atomic_coder).")
         return "create"
-    
+
     def route_part_compiler_output(self, state: CadGraphState) -> str:
         """Routes sub-part compilation result: repair current part, pop next part, or assemble."""
         if state.get("error_traceback"):
@@ -173,7 +173,10 @@ class CadOrchestrator:
         sys_prompt = (
             "You are Agent 0: Industrial CAD Architect. Expand the user's CAD prompt into "
             "a clear, material-agnostic geometric specification in millimeters.\n"
-            "COORDINATE SYSTEM: +X is Front/Forward, +Y is Left/Right (Wheel Axle Axis), +Z is Up.\n"
+            "COORDINATE SYSTEM CONVENTIONS:\n"
+            "- Always Z-axis UP (+Z is vertical height).\n"
+            "- Axisymmetric vertical objects (rockets, towers, bottles, pillars, gears, flanges) MUST stand vertically along the +Z axis (base at Z=0, apex at Z=height).\n"
+            "- Ground vehicles (cars, motorcycles, trucks) face along +X (length), with wheel axles along +Y (width) and height along +Z.\n"
             "CRITICAL GEOMETRIC RULES:\n"
             "1. Remove specific material names (e.g., Al 6061, PLA).\n"
             "2. NEVER specify skeletal parts (frames, forks, swingarms, handlebars, legs) as large (L x W x H) bounding boxes! "
@@ -197,7 +200,7 @@ class CadOrchestrator:
             "expanded_prompt": expanded.strip(),
             "progress_log": "planning geometry & physics constraints"
         }
-        
+
     async def node_specifier(self, state: CadGraphState) -> Dict[str, Any]:
         """
         Agent 1: Decomposes specification into 1 to 4 functional sub-assemblies
@@ -210,16 +213,18 @@ class CadOrchestrator:
             "and output EXACTLY 1 part in `parts` with `position_mm: [0, 0, 0]`.\n"
             "2. For multi-component vehicles/machines (e.g., rocket, car, motorcycle, drone), set `is_assembly: true` "
             "and decompose into 2 to 4 major functional sub-assemblies (MAX 4 parts! Group symmetric arrays like 'all 4 wheels' or 'all 4 fins' into a SINGLE part entry!).\n"
-            "3. Each part MUST include:\n"
-            "   - `id`: short snake_case name (e.g., 'chassis_body', 'cabin_glass', 'wheel_set', 'nose_cone', 'fuselage_body', 'fin_set').\n"
+            "3. AXIS ALIGNMENT:\n"
+            "   - Rockets/towers stand vertically along +Z! E.g. if `fuselage_tube` has height 1200mm at `position_mm: [0, 0, 0]`, then `nose_cone` MUST be at `position_mm: [0, 0, 1200]`, and `fin_set` MUST include `body_radius_mm` (equal to fuselage outer radius) in its `dimensions` at `position_mm: [0, 0, 0]`.\n"
+            "4. Each part MUST include:\n"
+            "   - `id`: short snake_case name (e.g., 'chassis_body', 'cabin_glass', 'wheel_set', 'nose_cone', 'fuselage_tube', 'fin_set').\n"
             "   - `archetype_tag`: choose ONE canonical shape family from: "
             "['cylindrical_tube', 'ogive_cone', 'conical_frustum', 'radial_fin_set', 'spur_gear', 'flanged_plate', 'l_bracket', 'enclosure_box', 'wheel_set', 'tubular_frame', 'contoured_body', 'custom_part'].\n"
-            "   - `archetype_query`: MUST start with `<archetype_tag>: ` followed by a standardized, material-agnostic description of the shape and its key dimensions in mm.\n"
-            "   - `dimensions`: dictionary of ALL numeric dimensions AND hole/cutout features in mm.\n"
+            "   - `archetype_query`: MUST start with `<archetype_tag>: ` followed by a standardized, material-agnostic description of the shape along +Z and its key dimensions in mm.\n"
+            "   - `dimensions`: dictionary of ALL numeric dimensions (including `body_radius_mm` for fins) AND hole/cutout features in mm.\n"
             "   - `position_mm`: [X, Y, Z] world translation offset where this sub-part's local (0,0,0) origin sits in the final assembly.\n"
             "   - `default_material`: choose realistic material for this sub-part from ['Al 6061', 'Steel', 'Titanium', 'Carbon Fiber', 'Brass', 'Copper', 'Glass', 'Rubber', 'PLA', 'ABS'] "
             "(e.g., 'Glass' for windows/windshields/canopies, 'Rubber' for tires/wheels, 'Steel' or 'Al 6061' for body/chassis, 'Titanium' for nose cones/nozzles).\n"
-            "   - `color_hex`: realistic hex color for 3D rendering (e.g., '#38bdf8' sky-blue for glass/windows, '#ef4444' crimson red for car body/fins, '#1e293b' dark charcoal for rubber tires, '#cbd5e1' silver for fuselage/metal).\n"
+            "   - `color_hex`: realistic hex color for 3D rendering (e.g., '#38bdf8' sky-blue for glass/windows, '#ef4444' crimson red for car body/fins, '#1e293b' dark charcoal for rubber tires, '#cbd5e1' silver for fuselage/metal, '#f59e0b' gold/amber for nose cone).\n"
             "Output ONLY valid JSON matching:\n"
             "{\n"
             "  \"object\": \"short 2-4 word name\",\n"
@@ -299,6 +304,7 @@ class CadOrchestrator:
             except Exception as e:
                 logger.warning(f"Sub-part vector lookup skipped for {pid}: {e}")
 
+        mat_label = current_part.get("default_material", state.get("material", "Al 6061"))
         return {
             "part_queue": queue,
             "current_part": current_part,
@@ -306,7 +312,7 @@ class CadOrchestrator:
             "cache_matches": matches,
             "part_repair_attempts": 0,
             "error_traceback": None,
-            "progress_log": f"building component ({idx}/{total}): {pid} [{ current_part.get('default_material', state.get('material', 'Al 6061')) }]"
+            "progress_log": f"building component ({idx}/{total}): {pid} [{mat_label}]"
         }
 
     async def node_modifier(self, state: CadGraphState) -> Dict[str, Any]:
@@ -317,21 +323,25 @@ class CadOrchestrator:
         pid = part.get("id", "main_body")
         idx = state.get("current_part_index", 1)
         total = state.get("total_parts", 1)
+        bom = state.get("bom_json") or {}
 
         logger.info(f"[{idx}/{total}] Cache HIT ({best_match['similarity']:.2f}) for '{pid}'. Running Agent 2A.")
         sys_prompt = (
             "You are Agent 2A: Parametric CAD Modifier. You are given a verified CadQuery script from cache.\n"
             "CRITICAL RULES:\n"
-            "1. Update all numeric dimensions (length, width, height, thickness, radius) to match the Target Specification.\n"
-            "2. Check if the Target Specification requires any holes, bores, or cutouts (e.g., mounting holes in the base) "
-            "that are missing from the cached template, and add them cleanly.\n"
-            "3. Keep the final `result = ...` assignment intact on the last line.\n"
+            "1. Pre-loaded helper functions `radial(shape, n, r=0)`, `spur_gear(m, z, t, bore=0)`, and `bolt_circle(body, n, r, d, face='>Z')` "
+            "ARE already defined in the global namespace! Keep using them—do NOT rewrite or remove `radial(...)`!\n"
+            "2. Update ONLY the numeric parameter variables at the top of the script to match the Target Sub-Part dimensions "
+            "(for fins, set `body_radius` to the fuselage outer radius from the BOM so fins attach to the outer skin, never 0).\n"
+            "3. If the Target Specification requires mounting holes or cutouts missing from the template, add them cleanly.\n"
+            "4. Keep the final `result = ...` assignment intact on the last line.\n"
             "Output ONLY valid Python code inside a ```python ``` block."
         )
         context_spec = state["raw_prompt"] if total == 1 else f"{part.get('archetype_query')} | {part.get('dimensions')}"
         user_content = (
             f"User Request: {context_spec}\n"
-            f"Target Sub-Part BOM:\n{part}\n\n"
+            f"Target Sub-Part BOM:\n{part}\n"
+            f"Full Assembly BOM (for mating radii/dimensions):\n{bom.get('parts', [])}\n\n"
             f"Cached Template Code:\n```python\n{best_match['code']}\n```"
         )
 
@@ -345,10 +355,10 @@ class CadOrchestrator:
         return {
             "current_part_code": extracted,
             "current_part_cached": True,
-            "cached_hit": state.get("cached_hit", False) or True,
+            "cached_hit": True,
             "progress_log": f"adapted {pid} ({idx}/{total}) from pgvector cache"
         }
-        
+
     async def node_atomic_coder(self, state: CadGraphState) -> Dict[str, Any]:
         """Agent 2B: Generates origin-centered CadQuery code for `current_part`."""
         part = state.get("current_part") or {}
@@ -362,16 +372,18 @@ class CadOrchestrator:
 
         sys_prompt = (
             "You are Agent 2B: Expert OpenCASCADE and CadQuery Engineer. Output ONLY valid Python code inside a ```python ``` block.\n"
-            "COORDINATE CONVENTION: +X = Forward/Length, +Y = Left/Right Width (Axle Axis), +Z = Up/Height.\n"
+            "COORDINATE CONVENTION: +Z = Up/Vertical Axis (rockets, cylinders, cones stand along +Z from Z=0 to Z=height). "
+            "For ground vehicles, +X = Forward, +Y = Left/Right Axle Axis, +Z = Up.\n"
             "CRITICAL CAD MODELING RULES:\n"
             "1. Always `import cadquery as cq` and `import math`.\n"
             "2. Pre-loaded helpers available in global namespace (do NOT redefine or import them):\n"
             "   - `spur_gear(m, z, t, bore=0)` -> returns a cq.Workplane spur gear\n"
             "   - `radial(shape, n, r=0)` -> copies `shape` n times around Z axis and unions them\n"
             "   - `bolt_circle(body, n, r, d, face='>Z')` -> drills n through-holes of diameter d on radius r\n"
-            "3. BUILD ONLY THE REQUESTED COMPONENT AROUND LOCAL ORIGIN (0, 0, 0):\n"
+            "3. BUILD ONLY THE REQUESTED COMPONENT AROUND LOCAL ORIGIN (0, 0, 0) WITH BASE AT Z=0:\n"
             "   - Do NOT apply the assembly's world `position_mm` translation inside this script; the Master Assembler will translate it later.\n"
-            "   - Exception: if building a symmetric pair/array (like `wheel_set` or `fin_set`), place the wheels/fins at their relative offsets around (0,0,0) and union them into `result`.\n"
+            "   - For `ogive_cone` or `nose_cone`, build a solid cone/loft on `cq.Workplane('XY').circle(r_base).workplane(offset=height).circle(0.5).loft()` (do NOT use `.revolve()` with negative X center as OpenCASCADE self-intersects!).\n"
+            "   - For `radial_fin_set`, place the fin root at `X = body_radius` (outer radius of fuselage) and use `result = radial(single_fin, fin_count)`.\n"
             "4. NO BOXY BRICKS FOR VEHICLES/ASSEMBLIES:\n"
             "   - For car bodies, fuel tanks, seats, or fairings, sketch a 2D side silhouette on `cq.Workplane('XZ').polyline([...]).close().extrude(width/2, both=True)`.\n"
             "   - For frames, forks, handlebars, and struts, use cylinders/tubes (radius 12-25mm), NOT huge bounding boxes.\n"
@@ -392,7 +404,7 @@ class CadOrchestrator:
                 f"Build it centered at local origin (0, 0, 0) (do NOT apply world offset {part.get('position_mm')} yet).\n"
                 f"Sub-Part Archetype & Description: {part.get('archetype_query')}\n"
                 f"Target Dimensions (mm): {part.get('dimensions')}\n"
-                f"Full Assembly Context (for mating reference only): {state.get('expanded_prompt')}\n"
+                f"All Assembly Parts (for mating radius reference): {bom.get('parts', [])}\n"
             )
 
         if matches:
@@ -442,10 +454,12 @@ class CadOrchestrator:
         wd = f"{settings.out_dir}/{state['job_id']}" if total == 1 else f"{settings.out_dir}/{state['job_id']}/sub_{pid}"
         exec_result = await self.sandbox.run_code(code, wd)
 
-        if not exec_result.get("ok"):
+        # Also check that volume > 0 so degenerate self-intersecting revolves get repaired
+        vol_check = float(exec_result.get("volume") or 0.0)
+        if not exec_result.get("ok") or vol_check <= 1e-3:
             attempts = state.get("part_repair_attempts", 0) + 1
-            err_msg = exec_result.get("error", "Unknown runtime error")
-            short_err = err_msg.strip().splitlines()[-1][:90] if err_msg else "runtime error"
+            err_msg = exec_result.get("error") or "Generated solid had 0 volume (self-intersecting revolve or loft). Use simple lofted circles or extrusions."
+            short_err = err_msg.strip().splitlines()[-1][:90]
             return {
                 "error_traceback": err_msg,
                 "part_repair_attempts": attempts,
@@ -469,12 +483,13 @@ class CadOrchestrator:
             except Exception as e:
                 logger.warning(f"Sub-part cache save skipped for {pid}: {e}")
 
-        compiled = dict(state.get("compiled_parts") or {})
         mat_name = part.get("default_material") or state.get("material", "Al 6061")
         default_hex = PhysicsEngine.get_material(mat_name).get("color_hex", "#94a3b8")
+
+        compiled = dict(state.get("compiled_parts") or {})
         compiled[pid] = {
             "code": code,
-            "volume_mm3": float(exec_result.get("volume") or 0.0),
+            "volume_mm3": vol_check,
             "bbox": exec_result.get("bbox") or [0.0, 0.0, 0.0],
             "bbox_min": exec_result.get("bbox_min") or [0.0, 0.0, 0.0],
             "translate_mm": part.get("position_mm") or [0.0, 0.0, 0.0],
@@ -483,11 +498,21 @@ class CadOrchestrator:
             "archetype_tag": archetype_tag,
             "exec_result": exec_result,
         }
+        
+        # Stitch all parts compiled so far so the live UI preview shows the growing assembly!
+        preview_mesh = exec_result.get("mesh")
+        if len(compiled) > 1:
+            bom_parts = (state.get("bom_json") or {}).get("parts") or []
+            partial_master = CadAssembler.stitch_assembly(compiled, bom_parts)
+            partial_wd = f"{settings.out_dir}/{state['job_id']}/partial_{idx}"
+            partial_res = await self.sandbox.run_code(partial_master, partial_wd)
+            if partial_res.get("ok") and partial_res.get("mesh"):
+                preview_mesh = partial_res["mesh"]
 
         return {
             "error_traceback": None,
             "compiled_parts": compiled,
-            "latest_part_mesh": exec_result.get("mesh"),
+            "latest_part_mesh": preview_mesh,
             "progress_log": f"verified {pid} ({idx}/{total}) · cached [{archetype_tag}]"
         }
 
@@ -523,19 +548,16 @@ class CadOrchestrator:
                 largest_id = max(compiled_parts, key=lambda k: compiled_parts[k].get("volume_mm3", 0.0))
                 master_code = compiled_parts[largest_id]["code"]
                 res = compiled_parts[largest_id]["exec_result"]
-                
-        # Attach per-part color_hex and material metadata into physics_report so MeshViewer can color each part!
-        part_colors = {pid: pdata.get("color_hex", "#94a3b8") for pid, pdata in compiled_parts.items()}
-        part_materials = {pid: pdata.get("material", mat) for pid, pdata in compiled_parts.items()}
-        report["part_colors"] = part_colors
-        report["part_materials"] = part_materials
 
         vol_mm3 = float(res.get("volume") or 0.0)
+        if vol_mm3 <= 0 and compiled_parts:
+            vol_mm3 = sum(float(p.get("volume_mm3") or 0.0) for p in compiled_parts.values())
+
         bbox = res.get("bbox") or [100.0, 100.0, 100.0]
         n_solids = res.get("n_solids") or (res.get("counts") or {}).get("solids", 1)
         has_named_parts = bool((res.get("mesh") or {}).get("parts")) or len(compiled_parts) > 1
 
-        # Run First-Principles Physics & Crash/Wind/Buckling Audit
+        # 1. Create `report` FIRST via PhysicsEngine
         report = PhysicsEngine.run_full_audit(
             volume_mm3=vol_mm3,
             bbox=bbox,
@@ -545,6 +567,12 @@ class CadOrchestrator:
             valid=bool(res.get("valid", True)),
             compiled_parts=compiled_parts,
         )
+
+        # 2. Now attach per-part colors and materials onto `report`!
+        part_colors = {pid: pdata.get("color_hex", "#94a3b8") for pid, pdata in compiled_parts.items()}
+        part_materials = {pid: pdata.get("material", mat) for pid, pdata in compiled_parts.items()}
+        report["part_colors"] = part_colors
+        report["part_materials"] = part_materials
 
         canonical_query = bom.get("canonical_query") or state.get("expanded_prompt") or state["raw_prompt"]
 

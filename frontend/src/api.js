@@ -52,19 +52,30 @@ const sleep = (ms, signal) => new Promise((res, rej) => {
 export const cancelJob = job =>
   fetch(`${BASE}/api/jobs/${job}`, { method: "DELETE", headers: H }).catch(() => {});
 
+/**
+ * Polls `/api/jobs/{job}` until the backend finishes or errors.
+ * Never times out on the client side while the backend job is actively "running" or "queued".
+ */
 async function poll(job, onLog, signal, onPartialMesh) {
-  const t0 = Date.now();
-  while (Date.now() - t0 < 10 * 60 * 1000) {
-    await sleep(1000, signal);
-    const s = await j(await fetch(`${BASE}/api/jobs/${job}`, { signal }));
-    onLog && onLog(s.log || []);
-    if (s.partial_mesh && onPartialMesh) {
-      onPartialMesh(s.partial_mesh);
+  let consecutiveNetErrors = 0;
+  while (true) {
+    await sleep(1500, signal);
+    try {
+      const s = await j(await fetch(`${BASE}/api/jobs/${job}`, { signal }));
+      consecutiveNetErrors = 0;
+      onLog && onLog(s.log || []);
+      if (s.partial_mesh && s.partial_mesh.verts && s.partial_mesh.verts.length && onPartialMesh) {
+        onPartialMesh(s.partial_mesh);
+      }
+      if (s.status === "done") return s.result;
+      if (s.status === "error") throw new Error(s.error || "generation failed");
+    } catch (err) {
+      if (signal && signal.aborted) throw err;
+      if (err && err.message && !/fetch|network/i.test(err.message)) throw err;
+      consecutiveNetErrors += 1;
+      if (consecutiveNetErrors > 10) throw err;
     }
-    if (s.status === "done") return s.result;
-    if (s.status === "error") throw new Error(s.error || "generation failed");
   }
-  throw new Error("timed out");
 }
 
 /**

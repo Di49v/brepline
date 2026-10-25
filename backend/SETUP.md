@@ -21,7 +21,7 @@ Copy `.env.example` to `.env` and configure your credentials:
     ```
 
 
-*Ensure `SUPABASE_SERVICE_KEY` is populated for database write access.*
+*Ensure `SUPABASE_SECRET_KEY` is populated for database write access.*
 
 3. **Start Local LLM:**
 In a separate terminal, pull and run the required Ollama models:

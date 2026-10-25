@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import MeshViewer, { Thumb, meshStats, fm } from './MeshViewer.jsx'
-import { generate, vote as sendVote, fileUrl, health, cancelJob } from './api.js'
+import { generate, vote as sendVote, fileUrl, health, cancelJob, simulatePhysics } from './api.js'
 import ShapeEditor from './ShapeEditor.jsx'
 
 /* ---------- static data ---------- */
@@ -25,8 +25,8 @@ const CHIPS = [
   ['ENCLOSURE', 'Electronics enclosure 80 x 50 x 30 mm, 2 mm walls, open top, USB cutout on one side'],
   ['FLANGE', 'Pipe flange 100 mm diameter, 10 mm thick, 40 mm bore, 4 bolt holes of 6 mm on a 70 mm circle']
 ]
-// names must match the backend density table (cadpipe.DENSITY)
-const MATS = ['Al 6061', 'Steel', 'Titanium', 'Brass', 'Copper', 'PLA', 'ABS']
+// names must match the backend MATERIAL_LIBRARY table
+const MATS = ['Al 6061', 'Steel', 'Titanium', 'Carbon Fiber', 'Brass', 'Copper', 'Glass', 'Rubber', 'PLA', 'ABS']
 const FMTS = ['STEP', 'STL']
 const P = {
   copy: 'M9 9h11v11H9zM5 15V4h11',
@@ -56,7 +56,7 @@ function dl(job, ext) {
   a.remove()
 }
 
-const fmtMass = g => (g >= 1000 ? (g / 1000).toFixed(2) + ' kg' : g.toFixed(1) + ' g')
+const fmtMass = g => (g >= 1000 ? (g / 1000).toFixed(2) + ' kg' : Number(g || 0).toFixed(1) + ' g')
 const fmtSize = b => (b || []).map(x => Math.round(x * 10) / 10).join(' × ') + ' mm'
 
 // turn a backend result into one "version" of a chat answer
@@ -81,7 +81,8 @@ function toVersion(r, prompt, f, m) {
     bmin: r.bbox_min || null,
     density: r.density_g_cm3 || null,
     shape: (r.plan && r.plan.profile_spec) || null, // polygon / revolve designs can be re-opened in the shape editor
-    checkNote: r.check_detail || ''
+    checkNote: r.check_detail || '',
+    physics: r.physics || null,
   }
 }
 const plain = v =>
@@ -104,14 +105,14 @@ const writeLS = (k, v) => { try { localStorage.setItem(k, v) } catch { /* ignore
 const Ic = ({ n }) => <svg className="i"><use href={`#${n}`} /></svg>
 const PI = ({ k }) => <svg className="i" viewBox="0 0 24 24"><path d={P[k]} /></svg>
 const PartIcon = () => <svg viewBox="0 0 100 100"><use href="#part" /></svg>
-/* ---------- thinking trace: shows the engine's real log lines, no decoration ---------- */
-const STAGE_TITLE = ['Planning the design', 'Writing CAD candidates', 'Building and checking the solid', 'Refining the result']
+/* ---------- thinking trace: shows the engine's real log lines + live sub-part preview ---------- */
+const STAGE_TITLE = ['Planning the design', 'Decomposing & querying cache', 'Building sub-components', 'Assembling & auditing physics']
 
 function stageOf(logs) {
   const last = (logs && logs.length ? logs[logs.length - 1] : '') || ''
-  if (/repair|cache|done/i.test(last)) return 3
-  if (/best candidate/i.test(last)) return 2
-  if (/generating/i.test(last)) return 1
+  if (/done|safety factor/i.test(last)) return 3
+  if (/verified|building component|adapted|repairing/i.test(last)) return 2
+  if (/decomposed|generating/i.test(last)) return 1
   return 0
 }
 const dur = n => (n >= 60 ? `${Math.floor(n / 60)}m ${n % 60}s` : `${n}s`)
@@ -129,7 +130,7 @@ function useElapsed(active, t0) {
 }
 
 // state: 'busy' (live) | 'done' | 'stopped' | 'error'. Finished runs collapse to "Thought for 23s".
-function Thinking({ state, logs, t0, secs, onStop }) {
+function Thinking({ state, logs, t0, secs, onStop, partialMesh }) {
   const busy = state === 'busy'
   const [open, setOpen] = useState(busy)
   const live = useElapsed(busy, t0)
@@ -146,6 +147,9 @@ function Thinking({ state, logs, t0, secs, onStop }) {
     : state === 'done' ? `Thought for ${dur(secs || 0)}`
     : state === 'stopped' ? `Stopped after ${dur(secs || 0)}`
     : `Failed after ${dur(secs || 0)}`
+
+  const verifiedLine = [...lines].reverse().find(l => /^verified /i.test(l)) || 'Latest compiled sub-part'
+
   return (
     <div className={'think ' + state}>
       <div className="th-h">
@@ -163,7 +167,17 @@ function Thinking({ state, logs, t0, secs, onStop }) {
             : <li className="cur">Waiting for the engine…</li>}
         </ol>
       )}
-      {busy && open && live > 45 && <div className="th-n">Complex parts can take a minute or two.</div>}
+      {busy && open && partialMesh && partialMesh.verts && partialMesh.verts.length > 0 && (
+        <div style={{ marginTop: 10, borderRadius: 8, overflow: 'hidden', border: '1px solid var(--edge, #333)', maxWidth: 320, background: 'rgba(0,0,0,0.18)' }}>
+          <div style={{ fontSize: 11, padding: '5px 10px', opacity: 0.9, borderBottom: '1px solid var(--edge, #333)' }}>
+            ✓ {verifiedLine}
+          </div>
+          <div style={{ width: '100%', height: 180, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <Thumb mesh={partialMesh} alt="Sub-part preview" />
+          </div>
+        </div>
+      )}
+      {busy && open && live > 45 && <div className="th-n">Complex multi-part assemblies compile component by component.</div>}
     </div>
   )
 }
@@ -307,22 +321,27 @@ function EditBox({ init, onSave, onCancel }) {
 
 function Result({ v, onOpen3d, onRefine, onEditShape }) {
   const [showCode, setShowCode] = useState(false)
+  const partColors = v.physics && v.physics.part_colors ? v.physics.part_colors : null
+  const sf = v.physics && v.physics.overall_safety_factor ? v.physics.overall_safety_factor : null
   return (
     <>
       Generated <b>{v.title}</b> in <b>{v.m}</b>.
       {v.warning && <div style={{ margin: '6px 0', fontSize: 13, opacity: 0.8 }}>Note: {v.warning}</div>}
       <div className="cad">
         <div className="prev" onClick={() => onOpen3d(v)}>
-          {v.mesh ? <Thumb mesh={v.mesh} alt={v.title} /> : <PartIcon />}
+          {v.mesh ? <Thumb mesh={v.mesh} alt={v.title} partColors={partColors} /> : <PartIcon />}
         </div>
         <div className="meta">
           <div><small>Mass</small>{fmtMass(v.mass_g)}</div>
           <div><small>Size</small>{fmtSize(v.bbox)}</div>
-          <div title={v.checkNote || ''}><small>Check</small>{v.verified ? 'Verified' : 'Review'}</div>
+          <div title={v.checkNote || ''}>
+            <small>Check</small>
+            {v.verified ? (sf ? `Verified · SF ${sf}×` : 'Verified') : 'Review'}
+          </div>
         </div>
         <div className="acts">
           <button className="btn p" onClick={() => dl(v.job, v.f)}><Ic n="dl" />Download {v.f}</button>
-          <button className="btn" onClick={() => onOpen3d(v)}><Ic n="exp" />Enlarge 3D</button>
+          <button className="btn" onClick={() => onOpen3d(v)}><Ic n="exp" />Enlarge 3D & Crash Lab</button>
           <button className="btn" onClick={() => onRefine(v)}>Refine</button>
           {v.shape && <button className="btn" onClick={() => onEditShape(v)}>Edit shape</button>}
           <button className="btn" onClick={() => setShowCode(s => !s)}>{showCode ? 'Hide code' : 'View code'}</button>
@@ -334,7 +353,7 @@ function Result({ v, onOpen3d, onRefine, onEditShape }) {
           </div>
         )}
       </div>
-      <div style={{ fontSize: 12, opacity: 0.6, marginTop: 6 }}>Mass is geometry volume × material density. Verify dimensions before manufacturing.</div>
+      <div style={{ fontSize: 12, opacity: 0.6, marginTop: 6 }}>Mass is geometry volume × material density. Open 3D to run Crash & Wind-Shear stress tests.</div>
     </>
   )
 }
@@ -422,8 +441,8 @@ function InfoPanel({ v, mesh, pts, measureOn }) {
   )
 }
 
-// full-screen 3D view of the real mesh (uses the themed .modal styles, so it follows light/dark)
-function MeshModal({ s, onClose }) {
+// full-screen 3D view + Interactive 60 FPS Physics & Crash Lab
+function MeshModal({ s, onClose, onGoPricing }) {
   const [wire, setWire] = useState(false)
   const [auto, setAuto] = useState(true)
   const [rk, setRk] = useState(0)
@@ -432,8 +451,19 @@ function MeshModal({ s, onClose }) {
   const [grid, setGrid] = useState(false)
   const [measure, setMeasure] = useState(false)
   const [info, setInfo] = useState(false)
+  const [lab, setLab] = useState(false)
   const [pts, setPts] = useState([])
   const [ck, setCk] = useState(0)
+
+  // Crash & Multi-Physics Lab State
+  const [obstacle, setObstacle] = useState('concrete_wall')
+  const [speed, setSpeed] = useState(72)
+  const [wind, setWind] = useState(45)
+  const [simMat, setSimMat] = useState('Al 6061')
+  const [partMats, setPartMats] = useState({})
+  const [physData, setPhysData] = useState(null)
+  const [simAnim, setSimAnim] = useState({ active: false, running: false, progress: 0, crumpleRatio: 0.18, obstacle: 'concrete_wall' })
+
   useEffect(() => {
     if (!s.open) return
     setWire(false)
@@ -445,10 +475,60 @@ function MeshModal({ s, onClose }) {
     setMeasure(false)
     setPts([])
     setInfo(window.innerWidth >= 1100)
+    setLab(false)
+    const initPhys = s.info && s.info.physics ? s.info.physics : null
+    setPhysData(initPhys)
+    setSimMat((s.info && s.info.m) || 'Al 6061')
+    setPartMats((initPhys && initPhys.part_materials) || {})
+    setSimAnim({ active: false, running: false, progress: 0, crumpleRatio: 0.18, obstacle: 'concrete_wall' })
     const onKey = e => { if (e.key === 'Escape') onClose() }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [s.open, s.job, onClose])
+  }, [s.open, s.job, s.info, s.mesh, onClose])
+
+  // Run 60 FPS Crash / Wind-Tunnel Animation + Backend Physics Recalculation
+  const runCrashSim = async () => {
+    setAuto(false)
+    let cr = 0.22
+    try {
+      if (s.job) {
+        const res = await simulatePhysics(s.job, {
+          material: simMat,
+          speed_kmh: speed,
+          wind_m_s: wind,
+          obstacle,
+          part_materials: partMats
+        })
+        if (res && res.physics) {
+          setPhysData(res.physics)
+          cr = (res.physics.edge_cases?.crash_test?.crumple_ratio || 0.15) + (speed / 320) * 0.25
+        }
+      }
+    } catch {
+      cr = Math.min(0.55, 0.12 + (speed / 240) * 0.35)
+    }
+
+    const tStart = performance.now()
+    const duration = 1800 // 1.8s 60fps impact animation
+    setSimAnim({ active: true, running: true, progress: 0, crumpleRatio: cr, obstacle })
+
+    const step = now => {
+      const p = Math.min(1, (now - tStart) / duration)
+      setSimAnim({ active: true, running: p < 1, progress: p, crumpleRatio: cr, obstacle })
+      if (p < 1) requestAnimationFrame(step)
+    }
+    requestAnimationFrame(step)
+  }
+
+  const resetSim = () => {
+    setSimAnim({ active: false, running: false, progress: 0, crumpleRatio: 0.18, obstacle })
+  }
+
+  const partColors = (physData && physData.part_colors) || (s.info?.physics?.part_colors) || null
+  const crash = physData?.edge_cases?.crash_test
+  const windTest = physData?.edge_cases?.wind_shear
+  const buckTest = physData?.edge_cases?.axial_buckling
+
   const tgl = (on, set, label, extra) => (
     <button className={'btn' + (on ? ' on' : '')} onClick={() => set(x => !x)} aria-pressed={on} {...extra}>{label}</button>
   )
@@ -459,9 +539,12 @@ function MeshModal({ s, onClose }) {
           <b>{s.name}</b>
           <button className="btn mclose" onClick={onClose}>Close</button>
           <div className="g">
+            <button className={'btn' + (lab ? ' on' : '')} onClick={() => { setLab(l => !l); if (!lab) setInfo(false) }}>
+              ⚡ Physics & Crash Lab
+            </button>
             <button className={'btn' + (wire ? ' on' : '')} onClick={() => setWire(w => !w)}>{wire ? 'Wireframe' : 'Shaded'}</button>
             <button className={'btn' + (auto ? ' on' : '')} onClick={() => setAuto(a => !a)}>Auto-rotate</button>
-            <button className="btn" onClick={() => setRk(k => k + 1)}>Reset view</button>
+            <button className="btn" onClick={() => { resetSim(); setRk(k => k + 1) }}>Reset view</button>
             <button className="btn p gdl" onClick={() => dl(s.job, s.f)}><Ic n="dl" />Download {s.f}</button>
             <button className="btn gclose" onClick={onClose}>Close</button>
           </div>
@@ -469,7 +552,7 @@ function MeshModal({ s, onClose }) {
         <div className="mvw">
           {s.open && s.mesh
             ? <MeshViewer mesh={s.mesh} wire={wire} auto={auto} resetKey={rk} dims={dims} axes={axes} grid={grid}
-                measure={measure} clearKey={ck} onMeasure={setPts} />
+                measure={measure} clearKey={ck} onMeasure={setPts} partColors={partColors} simState={simAnim} />
             : <div className="mv nomesh">Preview not available</div>}
           <div className="vt">
             {tgl(dims, setDims, 'Dimensions')}
@@ -479,11 +562,116 @@ function MeshModal({ s, onClose }) {
               onClick={() => { setMeasure(m => !m); setAuto(false) }}>Measure</button>
             {measure && pts.length > 0 ? <button className="btn" onClick={() => setCk(k => k + 1)}>Clear</button> : null}
             {tgl(info, setInfo, 'Info')}
+            <button className={'btn' + (lab ? ' on' : '')} onClick={() => { setLab(l => !l); if (!lab) setInfo(false) }}>Crash Lab</button>
           </div>
-          {info && s.info ? <InfoPanel v={s.info} mesh={s.mesh} pts={pts} measureOn={measure} /> : null}
+          {info && !lab && s.info ? <InfoPanel v={s.info} mesh={s.mesh} pts={pts} measureOn={measure} /> : null}
+
+          {lab && (
+            <div className="ip" style={{ width: 320, maxHeight: '82%', overflowY: 'auto' }}>
+              <h4 className="ih">Obstacle & Test Regime</h4>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 10 }}>
+                {[
+                  ['concrete_wall', '🧱 Frontal Concrete Wall Impact'],
+                  ['bollard_pole', '💈 Center Bollard Pole Impact'],
+                  ['wind_and_thrust', '🌪️ Crosswind Shear & 6G Buckling']
+                ].map(([id, label]) => (
+                  <button
+                    key={id}
+                    className={'btn' + (obstacle === id ? ' on' : '')}
+                    style={{ justifyContent: 'flex-start', textAlign: 'left' }}
+                    onClick={() => setObstacle(id)}
+                  >
+                    {label}
+                  </button>
+                ))}
+                <button
+                  className="btn"
+                  style={{ justifyContent: 'flex-start', opacity: 0.75, borderStyle: 'dashed' }}
+                  onClick={() => { onClose(); onGoPricing && onGoPricing() }}
+                >
+                  🔒 Custom AI Obstacle Generator (Pro)
+                </button>
+              </div>
+
+              <h4 className="ih">Simulation Parameters</h4>
+              <div className="ir">
+                <span>Impact Speed</span>
+                <b>{speed} km/h</b>
+              </div>
+              <input type="range" min="15" max="220" value={speed} onChange={e => setSpeed(Number(e.target.value))} style={{ width: '100%' }} />
+
+              <div className="ir" style={{ marginTop: 6 }}>
+                <span>Crosswind Gust</span>
+                <b>{wind} m/s</b>
+              </div>
+              <input type="range" min="10" max="150" value={wind} onChange={e => setWind(Number(e.target.value))} style={{ width: '100%' }} />
+
+              <div className="ir" style={{ marginTop: 6 }}>
+                <span>Primary Material</span>
+                <select value={simMat} onChange={e => setSimMat(e.target.value)}>
+                  {MATS.map(m => <option key={m}>{m}</option>)}
+                </select>
+              </div>
+
+              {s.mesh?.parts?.length > 0 && (
+                <>
+                  <h4 className="ih">Per-Part Material & Color</h4>
+                  {s.mesh.parts.map(pname => (
+                    <div className="ir" key={pname} style={{ gap: 6 }}>
+                      <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <i style={{ width: 10, height: 10, borderRadius: 2, background: (partColors && partColors[pname]) || '#94a3b8', display: 'inline-block' }} />
+                        {pname}
+                      </span>
+                      <select
+                        value={partMats[pname] || simMat}
+                        onChange={e => setPartMats(p => ({ ...p, [pname]: e.target.value }))}
+                      >
+                        {MATS.map(m => <option key={m}>{m}</option>)}
+                      </select>
+                    </div>
+                  ))}
+                </>
+              )}
+
+              <div style={{ display: 'flex', gap: 6, marginTop: 10 }}>
+                <button className="btn p" style={{ flex: 1 }} onClick={runCrashSim}>
+                  ▶ Run Simulation
+                </button>
+                {simAnim.active && (
+                  <button className="btn" onClick={resetSim}>Reset</button>
+                )}
+              </div>
+
+              {crash && (
+                <>
+                  <h4 className="ih">Edge-Case Telemetry</h4>
+                  <div className="ir"><span>Status</span><b style={{ color: crash.survived ? '#2fb67c' : '#ef4444' }}>{crash.survived ? '✓ SURVIVED' : '⚠ PLASTIC FRACTURE'}</b></div>
+                  <div className="ir"><span>Safety Factor</span><b>{physData.overall_safety_factor}×</b></div>
+                  <div className="ir"><span>Peak Deceleration</span><b>{crash.peak_deceleration_g} G</b></div>
+                  <div className="ir"><span>Crumple Depth</span><b>{crash.crumple_depth_mm} mm ({(crash.crumple_ratio * 100).toFixed(1)}%)</b></div>
+                  <div className="ir"><span>Impact Energy</span><b>{crash.kinetic_energy_j} J</b></div>
+                  <div className="ir"><span>Peak Stress</span><b>{crash.impact_stress_mpa} MPa</b></div>
+                  {windTest && <div className="ir"><span>Wind Shear SF</span><b>{windTest.safety_factor}× ({windTest.bending_stress_mpa} MPa)</b></div>}
+                  {buckTest && <div className="ir"><span>6G Buckling SF</span><b>{buckTest.safety_factor}×</b></div>}
+                </>
+              )}
+
+              {physData?.part_breakdown?.length > 0 && (
+                <>
+                  <h4 className="ih">AI Material & Wastage Audit</h4>
+                  {physData.part_breakdown.map(pb => (
+                    <div key={pb.part_id} className="eq" style={{ marginBottom: 6 }}>
+                      <b>{pb.part_id}</b> ({pb.material} · {fmtMass(pb.mass_g)} · SF {pb.safety_factor}×)<br />
+                      <span>{pb.recommendation}</span>
+                    </div>
+                  ))}
+                </>
+              )}
+            </div>
+          )}
         </div>
         <div className="mf">
-          <span>{measure ? 'Click two points to measure · ' : ''}Drag to rotate · Scroll or pinch to zoom · Esc to close</span>
+          <span>{simAnim.active ? 'FE Stress Heatmap Active (Green = Elastic · Red = Plastic Yield) · ' : ''}{measure ? 'Click two points to measure · ' : ''}Drag to rotate · Scroll or pinch to zoom · Esc to close</span>
           <span>{s.bbox ? fmtSize(s.bbox) : ''}</span>
         </div>
       </div>
@@ -648,9 +836,12 @@ export default function App() {
   }))
   const addMsg = M => setChats(cs => cs.map(c => (c.id === cur.id ? { ...c, msgs: [...c.msgs, M] } : c)))
   useEffect(() => { if (!chats.some(c => c.id === activeId)) setActiveId(chats[chats.length - 1].id) }, [chats, activeId])
+
+  // FIXED: Only auto-scroll when a new message is added or chat tab changes, NEVER on 1s log poll ticks!
   useEffect(() => {
     msgsRef.current?.scrollTo({ top: 1e9, behavior: 'smooth' })
-  }, [msgs])
+  }, [msgs.length, activeId])
+
   const patch = (id, o) => setMsgs(p => p.map(x => (x.id === id ? { ...x, ...o } : x)))
   const busyList = allMsgs.filter(m => m.busy)
   const busyCount = busyList.length
@@ -658,26 +849,38 @@ export default function App() {
     document.title = busyCount ? 'Generating… · Brepline' : unread ? '✓ Ready · Brepline' : 'Brepline'
   }, [busyCount, unread])
 
-  // one real generation; appends a new version to message `id`. Can be stopped through aborts.current[id].
+  // one real generation; streams both logs and live partial sub-part 3D meshes
   const runGen = async (id, text, { m, f, parent = null, fresh = false }) => {
     const ac = new AbortController()
     aborts.current[id] = ac
     const t0 = Date.now()
     let lastLogs = []
-    patch(id, { busy: true, err: null, stopped: false, logs: [], t0 })
+    let lastVertCount = 0
+    patch(id, { busy: true, err: null, stopped: false, logs: [], partialMesh: null, t0 })
     try {
       const r = await generate(
         { prompt: text, material: m, parentJob: parent, fresh },
-        lines => { if (lines.length) { lastLogs = lines; patch(id, { logs: lines }) } },
+        lines => {
+          if (lines.length && (lines.length !== lastLogs.length || lines[lines.length - 1] !== lastLogs[lastLogs.length - 1])) {
+            lastLogs = lines
+            patch(id, { logs: lines })
+          }
+        },
         ac.signal,
-        job => { ac.job = job }
+        job => { ac.job = job },
+        partialMesh => {
+          if (partialMesh && partialMesh.verts && partialMesh.verts.length !== lastVertCount) {
+            lastVertCount = partialMesh.verts.length
+            patch(id, { partialMesh })
+          }
+        }
       )
       if (ac.signal.aborted) throw new DOMException('Aborted', 'AbortError')
       const secs = Math.round((Date.now() - t0) / 1000)
       const v = { ...toVersion(r, text, f, m), think: { logs: lastLogs, secs } }
       const fid = ++uid.current
       setMsgs(p => p.map(x => (x.id === id
-        ? { ...x, vers: [...x.vers, v], cur: x.vers.length, vote: 0, busy: false, err: null, stopped: false }
+        ? { ...x, vers: [...x.vers, v], cur: x.vers.length, vote: 0, busy: false, partialMesh: null, err: null, stopped: false }
         : x)))
       setFiles(fl => [{ fid, n: v.n, f, size: fmtSize(v.bbox), mass: fmtMass(v.mass_g), verified: v.verified, v }, ...fl])
       announce('ok', 'Model ready', `${v.title} · ${fmtSize(v.bbox)} · ${fmtMass(v.mass_g)}`, id)
@@ -703,7 +906,7 @@ export default function App() {
     const id = ++uid.current
     const parent = refine ? refine.job : null
     setRefine(null)
-    const M = { id, text: t, f: fmt, m: mat, parent, vers: [], cur: 0, vote: 0, busy: true, editing: false, err: null, stopped: false, trace: null, logs: [], t0: Date.now() }
+    const M = { id, text: t, f: fmt, m: mat, parent, vers: [], cur: 0, vote: 0, busy: true, editing: false, err: null, stopped: false, trace: null, logs: [], partialMesh: null, t0: Date.now() }
     addMsg(M)
     setHist(h => [{ id, t: t.slice(0, 42), d: 'Today', f: fmt }, ...h])
     runGen(id, t, { m: mat, f: fmt, parent })
@@ -713,7 +916,10 @@ export default function App() {
     const M = msgs.find(x => x.id === id)
     if (!M || busyCount) return
     window.speechSynthesis && window.speechSynthesis.cancel()
-    runGen(id, text ?? M.text, { m: M.m, f: M.f, parent: M.parent, fresh: true })
+    // Only bypass cache if a previous completed version exists and user explicitly wants a fresh variation;
+    // if retrying after a timeout/error (M.vers.length === 0), allow pgvector cache to reuse already-built sub-parts!
+    const forceFresh = Boolean(M.vers && M.vers.length > 0 && text === undefined)
+    runGen(id, text ?? M.text, { m: M.m, f: M.f, parent: M.parent, fresh: forceFresh })
   }
   const saveEdit = (id, v) => {
     if (!v) return
@@ -815,7 +1021,7 @@ export default function App() {
     const label = name || (spec.type === 'polygon' ? 'Custom polygon part' : 'Custom revolved part')
     const id = ++uid.current
     const v = toVersion(r, label, fmt, mat)
-    addMsg({ id, text: label, f: fmt, m: mat, parent: shapeEd.parent, vers: [v], cur: 0, vote: 0, busy: false, editing: false, err: null, logs: [], t0: Date.now() })
+    addMsg({ id, text: label, f: fmt, m: mat, parent: shapeEd.parent, vers: [v], cur: 0, vote: 0, busy: false, editing: false, err: null, logs: [], partialMesh: null, t0: Date.now() })
     setHist(h => [{ id, t: label.slice(0, 42), d: 'Today', f: fmt }, ...h])
     setFiles(fl => [{ fid: ++uid.current, n: v.n, f: fmt, size: fmtSize(v.bbox), mass: fmtMass(v.mass_g), verified: v.verified, v }, ...fl])
     setView('chat')
@@ -907,7 +1113,7 @@ export default function App() {
               {msgs.length === 0 && (
                 <div className="hero">
                   <h1>What shall we <span>build</span> today?</h1>
-                  <p>Describe a part. Receive 3D CAD you can download as STEP or STL.</p>
+                  <p>Describe a part or vehicle. Receive multi-part 3D CAD & live physics stress simulations.</p>
                   <div className="chips">
                     {CHIPS.map(([k, t]) => (
                       <button key={k} className="chip" onClick={() => send(t)}><b>{k}</b>{t}</button>
@@ -942,7 +1148,7 @@ export default function App() {
                       <div className="t">
                         <div className="body">
                           {loading ? (
-                            <Thinking state="busy" logs={M.logs} t0={M.t0} onStop={() => stopOne(M.id)} />
+                            <Thinking state="busy" logs={M.logs} t0={M.t0} partialMesh={M.partialMesh} onStop={() => stopOne(M.id)} />
                           ) : v ? (
                             <>
                               <Thinking state="done" logs={v.think && v.think.logs} secs={v.think && v.think.secs} />
@@ -1005,7 +1211,7 @@ export default function App() {
                 onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() } }}
               />
               <div className="bar">
-                <button className="btn" title="Draw your own polygon or profile" aria-label="Draw shape" onClick={drawShape}><Ic n="clip" /><span className="lbl">Draw shape</span></button>
+                <button className="btn" title="Draw your own polygon or profile" aria-label="Draw shape" onClick={drawShape}><Ic n="clip"/><span className="lbl">Draw shape</span></button>
                 {/* desktop / tablet: separate dropdowns */}
                 <div className="opts-d">
                   <select value={mat} onChange={e => setMat(e.target.value)}>{MATS.map(x => <option key={x}>{x}</option>)}</select>
@@ -1073,7 +1279,9 @@ export default function App() {
               {shownFiles.map(x => (
                 <div className="f" key={x.fid}>
                   <button className="fx" title="Delete" aria-label="Delete file" onClick={() => askRemoveFile(x)}><PI k="x" /></button>
-                  <div className="prev" onClick={() => open3d(x.v)}>{x.v.mesh ? <Thumb mesh={x.v.mesh} alt={x.n} /> : <PartIcon />}</div>
+                  <div className="prev" onClick={() => open3d(x.v)}>
+                    {x.v.mesh ? <Thumb mesh={x.v.mesh} alt={x.n} partColors={x.v.physics && x.v.physics.part_colors} /> : <PartIcon />}
+                  </div>
                   <div className="in">
                     <b>{x.n}.{x.f.toLowerCase()}</b>
                     <small>{x.size} / {x.mass}</small>
@@ -1160,7 +1368,7 @@ export default function App() {
         </section>
       </main>
 
-      <MeshModal s={v3} onClose={close3d} />
+      <MeshModal s={v3} onClose={close3d} onGoPricing={() => go('pricing')} />
       <ShapeEditor open={shapeEd.open} initial={shapeEd.initial} material={mat} parentJob={shapeEd.parent} onClose={closeShape} onResult={addShapeResult} />
       <Toasts list={toasts} onClose={id => setToasts(p => p.filter(x => x.id !== id))}
         onOpen={t => { setToasts(p => p.filter(x => x.id !== t.id)); openTurn(t.msgId) }} />
@@ -1188,7 +1396,7 @@ function PricingView({ active }) {
           <div className="plan hot">
             <h4>Pro <span className="tag">POPULAR</span></h4>
             <div className="pr"><span className="amt">{price(29, 23)}</span><small> /month</small></div><small>For engineers and makers</small>
-            <ul><li>Unlimited generations</li><li>Parameter editing</li><li>Priority queue</li></ul>
+            <ul><li>Unlimited generations</li><li>Custom AI obstacle simulation</li><li>Priority queue</li></ul>
             <button className="btn p">Upgrade to Pro</button>
           </div>
           <div className="plan">

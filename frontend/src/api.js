@@ -21,13 +21,21 @@ async function j(res) {
  *          warning, mesh:{verts:[x,y,z,...], tris:[i,j,k,...]}}
  * Throws Error(message) on failure. onLog(lines[]) is called while polling.
  */
-export async function generate({ prompt, material = "Al 6061", parentJob = null, fresh = false }, onLog, signal, onJob) {
+export async function generate(
+  { prompt, material = "Al 6061", parentJob = null, fresh = false },
+  onLog,
+  signal,
+  onJob,
+  onPartialMesh
+) {
   const { job } = await j(await fetch(`${BASE}/api/jobs`, {
-    method: "POST", headers: H, signal,
+    method: "POST",
+    headers: H,
+    signal,
     body: JSON.stringify({ prompt, material, parent_job: parentJob, fresh }),
   }));
   onJob && onJob(job); // lets the UI call cancelJob(job) when the user presses Stop
-  return poll(job, onLog, signal);
+  return poll(job, onLog, signal, onPartialMesh);
 }
 
 // sleep that wakes up immediately when the request is aborted (so Stop reacts at once)
@@ -44,16 +52,30 @@ const sleep = (ms, signal) => new Promise((res, rej) => {
 export const cancelJob = job =>
   fetch(`${BASE}/api/jobs/${job}`, { method: "DELETE", headers: H }).catch(() => {});
 
-async function poll(job, onLog, signal) {
-  const t0 = Date.now();
-  while (Date.now() - t0 < 10 * 60 * 1000) {
-    await sleep(1200, signal);
-    const s = await j(await fetch(`${BASE}/api/jobs/${job}`, { signal }));
-    onLog && onLog(s.log || []);
-    if (s.status === "done") return s.result;
-    if (s.status === "error") throw new Error(s.error || "generation failed");
+/**
+ * Polls `/api/jobs/{job}` until the backend finishes or errors.
+ * Never times out on the client side while the backend job is actively "running" or "queued".
+ */
+async function poll(job, onLog, signal, onPartialMesh) {
+  let consecutiveNetErrors = 0;
+  while (true) {
+    await sleep(1500, signal);
+    try {
+      const s = await j(await fetch(`${BASE}/api/jobs/${job}`, { signal }));
+      consecutiveNetErrors = 0;
+      onLog && onLog(s.log || []);
+      if (s.partial_mesh && s.partial_mesh.verts && s.partial_mesh.verts.length && onPartialMesh) {
+        onPartialMesh(s.partial_mesh);
+      }
+      if (s.status === "done") return s.result;
+      if (s.status === "error") throw new Error(s.error || "generation failed");
+    } catch (err) {
+      if (signal && signal.aborted) throw err;
+      if (err && err.message && !/fetch|network/i.test(err.message)) throw err;
+      consecutiveNetErrors += 1;
+      if (consecutiveNetErrors > 10) throw err;
+    }
   }
-  throw new Error("timed out");
 }
 
 /**
@@ -64,13 +86,26 @@ async function poll(job, onLog, signal) {
  */
 export async function buildShape({ spec, name = "", material = "Al 6061", parentJob = null }, onLog, signal) {
   const { job } = await j(await fetch(`${BASE}/api/shape`, {
-    method: "POST", headers: H, signal,
+    method: "POST",
+    headers: H,
+    signal,
     body: JSON.stringify({ spec, name, material, parent_job: parentJob }),
   }));
   return poll(job, onLog, signal);
 }
 
-/** Cheap server-side check while drawing -> {ok, error?, bbox?, volume_mm3?} */
+/**
+ * Interactive Physics & Crash Lab API: recalculates crash crumple depth, peak G,
+ * crosswind bending stress, and per-part material savings in <10ms.
+ */
+export async function simulatePhysics(job, { material = "Al 6061", speed_kmh = 64, wind_m_s = 45, obstacle = "concrete_wall", part_materials = null }) {
+  return j(await fetch(`${BASE}/api/jobs/${job}/simulate`, {
+    method: "POST",
+    headers: H,
+    body: JSON.stringify({ material, speed_kmh, wind_m_s, obstacle, part_materials }),
+  }));
+}
+
 export const validateShape = (spec, signal) =>
   fetch(`${BASE}/api/shape/validate`, { method: "POST", headers: H, signal, body: JSON.stringify({ spec }) })
     .then(r => r.json());

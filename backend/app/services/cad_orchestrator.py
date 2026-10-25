@@ -119,8 +119,9 @@ class CadOrchestrator:
     def route_coder_strategy(self, state: CadGraphState) -> str:
         """
         Dual-Gate Archetype Router:
-        Routes to `modifier` (Agent 2A) ONLY if similarity >= 0.86 AND the cached
-        item shares the target archetype_tag (preventing slow/bad cross-shape edits).
+        1. If the cached row has the SAME `archetype_tag` (e.g. 'ogive_cone', 'l_bracket', 'radial_fin_set'),
+           route to `modifier` at similarity >= 0.76!
+        2. Otherwise, require similarity >= 0.86.
         """
         if state.get("fresh") or state.get("error_traceback"):
             return "create"
@@ -135,15 +136,18 @@ class CadOrchestrator:
         target_tag = str(part.get("archetype_tag") or "").lower().strip()
         cached_tags = [str(t).lower().strip() for t in (best.get("tags") or [])]
 
-        # Gate 1: Exact whole-object match (>= 0.90) or matching archetype tag (>= 0.86)
-        tag_matches = (not target_tag) or (target_tag in cached_tags) or ("subpart" in cached_tags and sim >= 0.88)
-        if sim >= 0.86 and (tag_matches or sim >= 0.91):
-            logger.info(f"Dual-Gate Cache HIT ({sim:.2f}, tag={target_tag}). Routing to Agent 2A (modifier).")
+        # Gate 1: Exact whole-object match (>= 0.86) or matching archetype tag (>= 0.76)
+        same_archetype = bool(target_tag and target_tag in cached_tags)
+        if (same_archetype and sim >= 0.76) or sim >= 0.86:
+            logger.info(
+                f"Cache HIT (sim={sim:.2f}, archetype={target_tag}, tags={cached_tags}). "
+                f"Routing to Agent 2A (modifier)."
+            )
             return "modify"
 
-        logger.info(f"Cache MISS or sibling mismatch (sim={sim:.2f}, tag={target_tag}). Routing to Agent 2B (atomic_coder).")
+        logger.info(f"Cache MISS (sim={sim:.2f}, target_tag={target_tag}). Routing to Agent 2B (atomic_coder).")
         return "create"
-
+    
     def route_part_compiler_output(self, state: CadGraphState) -> str:
         """Routes sub-part compilation result: repair current part, pop next part, or assemble."""
         if state.get("error_traceback"):
@@ -193,11 +197,11 @@ class CadOrchestrator:
             "expanded_prompt": expanded.strip(),
             "progress_log": "planning geometry & physics constraints"
         }
-
+        
     async def node_specifier(self, state: CadGraphState) -> Dict[str, Any]:
         """
         Agent 1: Decomposes specification into 1 to 4 functional sub-assemblies
-        with universal topological archetypes for high-hit-rate vector caching.
+        with universal topological archetypes, realistic per-part materials, and hex colors.
         """
         sys_prompt = (
             "You are Agent 1: Chief Mechanical Decomposer. Convert the geometric specification into a strict JSON BOM.\n"
@@ -207,20 +211,22 @@ class CadOrchestrator:
             "2. For multi-component vehicles/machines (e.g., rocket, car, motorcycle, drone), set `is_assembly: true` "
             "and decompose into 2 to 4 major functional sub-assemblies (MAX 4 parts! Group symmetric arrays like 'all 4 wheels' or 'all 4 fins' into a SINGLE part entry!).\n"
             "3. Each part MUST include:\n"
-            "   - `id`: short snake_case name (e.g., 'nose_cone', 'fuselage_body', 'fin_set', 'wheel_set').\n"
+            "   - `id`: short snake_case name (e.g., 'chassis_body', 'cabin_glass', 'wheel_set', 'nose_cone', 'fuselage_body', 'fin_set').\n"
             "   - `archetype_tag`: choose ONE canonical shape family from: "
             "['cylindrical_tube', 'ogive_cone', 'conical_frustum', 'radial_fin_set', 'spur_gear', 'flanged_plate', 'l_bracket', 'enclosure_box', 'wheel_set', 'tubular_frame', 'contoured_body', 'custom_part'].\n"
-            "   - `archetype_query`: a material-agnostic, origin-centered geometric description of JUST this sub-part for vector lookup.\n"
-            "   - `dimensions`: dictionary of key numeric dimensions in mm.\n"
+            "   - `archetype_query`: MUST start with `<archetype_tag>: ` followed by a standardized, material-agnostic description of the shape and its key dimensions in mm.\n"
+            "   - `dimensions`: dictionary of ALL numeric dimensions AND hole/cutout features in mm.\n"
             "   - `position_mm`: [X, Y, Z] world translation offset where this sub-part's local (0,0,0) origin sits in the final assembly.\n"
-            "   - `default_material`: optimal material from ['Al 6061', 'Steel', 'Titanium', 'Brass', 'Copper', 'PLA', 'ABS'].\n"
+            "   - `default_material`: choose realistic material for this sub-part from ['Al 6061', 'Steel', 'Titanium', 'Carbon Fiber', 'Brass', 'Copper', 'Glass', 'Rubber', 'PLA', 'ABS'] "
+            "(e.g., 'Glass' for windows/windshields/canopies, 'Rubber' for tires/wheels, 'Steel' or 'Al 6061' for body/chassis, 'Titanium' for nose cones/nozzles).\n"
+            "   - `color_hex`: realistic hex color for 3D rendering (e.g., '#38bdf8' sky-blue for glass/windows, '#ef4444' crimson red for car body/fins, '#1e293b' dark charcoal for rubber tires, '#cbd5e1' silver for fuselage/metal).\n"
             "Output ONLY valid JSON matching:\n"
             "{\n"
             "  \"object\": \"short 2-4 word name\",\n"
             "  \"is_assembly\": true,\n"
             "  \"canonical_query\": \"full object description\",\n"
             "  \"parts\": [\n"
-            "    {\"id\": \"main_body\", \"archetype_tag\": \"contoured_body\", \"archetype_query\": \"...\", \"dimensions\": {}, \"position_mm\": [0, 0, 0], \"default_material\": \"Al 6061\"}\n"
+            "    {\"id\": \"main_body\", \"archetype_tag\": \"l_bracket\", \"archetype_query\": \"l_bracket: ...\", \"dimensions\": {}, \"position_mm\": [0, 0, 0], \"default_material\": \"Al 6061\", \"color_hex\": \"#94a3b8\"}\n"
             "  ],\n"
             "  \"shared_interfaces\": {}\n"
             "}"
@@ -245,7 +251,8 @@ class CadOrchestrator:
                 "archetype_query": bom.get("canonical_query") or state.get("expanded_prompt") or state["raw_prompt"],
                 "dimensions": {},
                 "position_mm": [0.0, 0.0, 0.0],
-                "default_material": state.get("material", "Al 6061")
+                "default_material": state.get("material", "Al 6061"),
+                "color_hex": "#94a3b8"
             }]
             bom["parts"] = parts_list
 
@@ -273,19 +280,22 @@ class CadOrchestrator:
         idx = state.get("current_part_index", 0) + 1
         total = state.get("total_parts", 1)
         pid = current_part.get("id", f"part_{idx}")
+        atag = current_part.get("archetype_tag", "custom_part")
 
         # Build search query: if single-part job, use full canonical_query; if sub-part, use archetype_query
         bom = state.get("bom_json") or {}
         if total == 1:
             query = bom.get("canonical_query") or current_part.get("archetype_query") or state.get("expanded_prompt") or state["raw_prompt"]
         else:
-            query = current_part.get("archetype_query") or f"{current_part.get('archetype_tag', '')} {pid} {current_part.get('dimensions', {})}"
+            raw_aq = current_part.get("archetype_query") or f"{pid} {current_part.get('dimensions', {})}"
+            query = raw_aq if raw_aq.startswith(atag) else f"{atag}: {raw_aq}"
+            current_part["archetype_query"] = query
 
         matches: List[Dict[str, Any]] = []
         if not state.get("fresh"):
             try:
                 embedding = await self.llm.get_embedding(query)
-                matches = self.repo.search_similar_cad(embedding, threshold=0.72, limit=2)
+                matches = self.repo.search_similar_cad(embedding, threshold=0.68, limit=3)
             except Exception as e:
                 logger.warning(f"Sub-part vector lookup skipped for {pid}: {e}")
 
@@ -296,7 +306,7 @@ class CadOrchestrator:
             "cache_matches": matches,
             "part_repair_attempts": 0,
             "error_traceback": None,
-            "progress_log": f"building component ({idx}/{total}): {pid}"
+            "progress_log": f"building component ({idx}/{total}): {pid} [{ current_part.get('default_material', state.get('material', 'Al 6061')) }]"
         }
 
     async def node_modifier(self, state: CadGraphState) -> Dict[str, Any]:
@@ -310,14 +320,18 @@ class CadOrchestrator:
 
         logger.info(f"[{idx}/{total}] Cache HIT ({best_match['similarity']:.2f}) for '{pid}'. Running Agent 2A.")
         sys_prompt = (
-            "You are Agent 2A: Parametric CAD Modifier. You are given a verified CadQuery script from cache. "
-            "If the Target Sub-Part dimensions match the template, return the template code UNCHANGED. "
-            "If any dimensions differ, update ONLY those numeric parameters. "
-            "Do NOT alter the structural logic or function signatures. "
-            "CRITICAL: Keep the final `result = ...` assignment intact. Output ONLY valid Python code."
+            "You are Agent 2A: Parametric CAD Modifier. You are given a verified CadQuery script from cache.\n"
+            "CRITICAL RULES:\n"
+            "1. Update all numeric dimensions (length, width, height, thickness, radius) to match the Target Specification.\n"
+            "2. Check if the Target Specification requires any holes, bores, or cutouts (e.g., mounting holes in the base) "
+            "that are missing from the cached template, and add them cleanly.\n"
+            "3. Keep the final `result = ...` assignment intact on the last line.\n"
+            "Output ONLY valid Python code inside a ```python ``` block."
         )
+        context_spec = state["raw_prompt"] if total == 1 else f"{part.get('archetype_query')} | {part.get('dimensions')}"
         user_content = (
-            f"Target Sub-Part Specification:\n{part}\n\n"
+            f"User Request: {context_spec}\n"
+            f"Target Sub-Part BOM:\n{part}\n\n"
             f"Cached Template Code:\n```python\n{best_match['code']}\n```"
         )
 
@@ -331,10 +345,10 @@ class CadOrchestrator:
         return {
             "current_part_code": extracted,
             "current_part_cached": True,
-            "cached_hit": state.get("cached_hit", False) or (total == 1),
+            "cached_hit": state.get("cached_hit", False) or True,
             "progress_log": f"adapted {pid} ({idx}/{total}) from pgvector cache"
         }
-
+        
     async def node_atomic_coder(self, state: CadGraphState) -> Dict[str, Any]:
         """Agent 2B: Generates origin-centered CadQuery code for `current_part`."""
         part = state.get("current_part") or {}
@@ -456,13 +470,16 @@ class CadOrchestrator:
                 logger.warning(f"Sub-part cache save skipped for {pid}: {e}")
 
         compiled = dict(state.get("compiled_parts") or {})
+        mat_name = part.get("default_material") or state.get("material", "Al 6061")
+        default_hex = PhysicsEngine.get_material(mat_name).get("color_hex", "#94a3b8")
         compiled[pid] = {
             "code": code,
             "volume_mm3": float(exec_result.get("volume") or 0.0),
             "bbox": exec_result.get("bbox") or [0.0, 0.0, 0.0],
             "bbox_min": exec_result.get("bbox_min") or [0.0, 0.0, 0.0],
             "translate_mm": part.get("position_mm") or [0.0, 0.0, 0.0],
-            "material": part.get("default_material") or state.get("material", "Al 6061"),
+            "material": mat_name,
+            "color_hex": part.get("color_hex") or default_hex,
             "archetype_tag": archetype_tag,
             "exec_result": exec_result,
         }
@@ -506,6 +523,12 @@ class CadOrchestrator:
                 largest_id = max(compiled_parts, key=lambda k: compiled_parts[k].get("volume_mm3", 0.0))
                 master_code = compiled_parts[largest_id]["code"]
                 res = compiled_parts[largest_id]["exec_result"]
+                
+        # Attach per-part color_hex and material metadata into physics_report so MeshViewer can color each part!
+        part_colors = {pid: pdata.get("color_hex", "#94a3b8") for pid, pdata in compiled_parts.items()}
+        part_materials = {pid: pdata.get("material", mat) for pid, pdata in compiled_parts.items()}
+        report["part_colors"] = part_colors
+        report["part_materials"] = part_materials
 
         vol_mm3 = float(res.get("volume") or 0.0)
         bbox = res.get("bbox") or [100.0, 100.0, 100.0]

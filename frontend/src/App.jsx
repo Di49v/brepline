@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import MeshViewer, { Thumb, meshStats, fm } from './MeshViewer.jsx'
-import { generate, vote as sendVote, fileUrl, health, cancelJob } from './api.js'
+import { generate, vote as sendVote, fileUrl, health, cancelJob, simulatePhysics } from './api.js'
 import ShapeEditor from './ShapeEditor.jsx'
 
 /* ---------- static data ---------- */
@@ -26,7 +26,7 @@ const CHIPS = [
   ['FLANGE', 'Pipe flange 100 mm diameter, 10 mm thick, 40 mm bore, 4 bolt holes of 6 mm on a 70 mm circle']
 ]
 // names must match the backend density table (cadpipe.DENSITY)
-const MATS = ['Al 6061', 'Steel', 'Titanium', 'Brass', 'Copper', 'PLA', 'ABS']
+const MATS = ['Al 6061', 'Steel', 'Titanium', 'Carbon Fiber', 'Brass', 'Copper', 'Glass', 'Rubber', 'PLA', 'ABS']
 const FMTS = ['STEP', 'STL']
 const P = {
   copy: 'M9 9h11v11H9zM5 15V4h11',
@@ -81,7 +81,8 @@ function toVersion(r, prompt, f, m) {
     bmin: r.bbox_min || null,
     density: r.density_g_cm3 || null,
     shape: (r.plan && r.plan.profile_spec) || null, // polygon / revolve designs can be re-opened in the shape editor
-    checkNote: r.check_detail || ''
+    checkNote: r.check_detail || '',
+    physics: r.physics || null,
   }
 }
 const plain = v =>
@@ -129,7 +130,7 @@ function useElapsed(active, t0) {
 }
 
 // state: 'busy' (live) | 'done' | 'stopped' | 'error'. Finished runs collapse to "Thought for 23s".
-function Thinking({ state, logs, t0, secs, onStop }) {
+function Thinking({ state, logs, t0, secs, onStop, partialMesh }) {
   const busy = state === 'busy'
   const [open, setOpen] = useState(busy)
   const live = useElapsed(busy, t0)
@@ -162,6 +163,14 @@ function Thinking({ state, logs, t0, secs, onStop }) {
             ? lines.map((l, i) => <li key={i} className={busy && i === lines.length - 1 ? 'cur' : ''}>{l}</li>)
             : <li className="cur">Waiting for the engine…</li>}
         </ol>
+      )}
+      {busy && open && partialMesh && (
+        <div style={{ marginTop: 10, borderRadius: 8, overflow: 'hidden', border: '1px solid var(--edge, #333)', maxWidth: 280 }}>
+          <div style={{ fontSize: 11, padding: '4px 8px', opacity: 0.8, background: 'rgba(0,0,0,0.2)' }}>
+            Live Sub-Part Compiler Preview
+          </div>
+          <Thumb mesh={partialMesh} alt="Sub-part preview" />
+        </div>
       )}
       {busy && open && live > 45 && <div className="th-n">Complex parts can take a minute or two.</div>}
     </div>

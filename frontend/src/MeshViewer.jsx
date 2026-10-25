@@ -1,11 +1,67 @@
 // src/MeshViewer.jsx
-// Dependency-free software renderer + CAD overlays for the real mesh.
+// Dependency-free software renderer + Multi-Color Sub-Parts + Real-Time 60 FPS Crash/Stress Lab + CAD overlays for the real mesh.
 //   <MeshViewer mesh wire auto resetKey grid axes dims measure clearKey onMeasure />   interactive viewer
 //   <Thumb mesh />                                                                      static preview image
 // CAD coordinates are Z-up, millimetres. mesh = { verts:[x,y,z,...], tris:[i,j,k,...] }.
 import { useEffect, useRef, useState } from 'react'
 
 const FIT = 0.92
+
+// Default engineering palette when a multi-part assembly has multiple named parts
+const DEFAULT_PART_HEX = [
+  '#94a3b8', // Metallic Silver (Fuselage / Chassis)
+  '#ef4444', // Racing Crimson (Bodywork / Nose Cone)
+  '#38bdf8', // Sky-Blue Glass (Windshield / Canopy)
+  '#1e293b', // Vulcanized Charcoal (Tires / Wheels / Fins)
+  '#eab308', // Machined Brass / Gold
+  '#2fb67c', // Emerald Polymer
+]
+
+/* ---------- hex to HSL conversion for 64-step Lambertian shading per part ---------- */
+function hexToHsl(hex) {
+  let c = String(hex || '#94a3b8').replace('#', '').trim()
+  if (c.length === 3) c = c[0] + c[0] + c[1] + c[1] + c[2] + c[2]
+  const num = parseInt(c, 16)
+  if (Number.isNaN(num)) return [214, 18, 55]
+  const r = ((num >> 16) & 255) / 255
+  const g = ((num >> 8) & 255) / 255
+  const b = (num & 255) / 255
+  const max = Math.max(r, g, b), min = Math.min(r, g, b)
+  let h = 0, s = 0, l = (max + min) / 2
+  if (max !== min) {
+    const d = max - min
+    s = l > 0.5 ? d / (2 - max - min) : d / (max + min)
+    switch (max) {
+      case r: h = (g - b) / d + (g < b ? 6 : 0); break
+      case g: h = (b - r) / d + 2; break
+      case b: h = (r - g) / d + 4; break
+    }
+    h /= 6
+  }
+  return [Math.round(h * 360), Math.round(s * 100), Math.round(l * 100)]
+}
+
+const PALETTE_CACHE = {}
+function shadePaletteForHex(hex, dark) {
+  const key = `${hex}_${dark ? 'd' : 'l'}`
+  if (!PALETTE_CACHE[key]) {
+    const [h, s, baseL] = hexToHsl(hex)
+    const minL = Math.max(8, Math.min(35, baseL * (dark ? 0.38 : 0.48)))
+    const spanL = Math.max(28, Math.min(62, baseL * 0.85))
+    PALETTE_CACHE[key] = Array.from({ length: 64 }, (_, i) => {
+      const f = i / 63
+      return `hsl(${h},${s}%,${(minL + f * spanL).toFixed(1)}%)`
+    })
+  }
+  return PALETTE_CACHE[key]
+}
+
+// FEA Stress Heatmap Palette (0 = Cool Blue/Green Safe -> 63 = Glowing Red Yield/Fracture)
+const HEATMAP_PALETTE = Array.from({ length: 64 }, (_, i) => {
+  const f = i / 63
+  const hue = Math.round((1 - f) * 145) // 145 (Green) -> 60 (Yellow) -> 0 (Red)
+  return `hsl(${hue}, 88%, ${(42 + f * 14).toFixed(1)}%)`
+})
 
 /* ---------- geometry cache ---------- */
 const prepCache = new WeakMap()
@@ -51,6 +107,7 @@ function prep(mesh) {
     P: new Float32Array(n * 3),
     D: new Float32Array(m),
     S: new Uint8Array(m),
+    Stress: new Uint8Array(m),
     order: Array.from({ length: m }, (_, i) => i)
   }
   prepCache.set(mesh, p)
@@ -105,22 +162,98 @@ function makeProj(p, w, h, view) {
     return [w / 2 + x1 * s, h / 2 - (y1 * sp + Z * cp) * s, y1 * cp - Z * sp]
   }
   f.s = s
-  f.dir = (vx, vy, vz) => [vx * cy - vy * sy, -((vx * sy + vy * cy) * sp + vz * cp)] // screen vector of a world vector
+  f.dir = (vx, vy, vz) => [vx * cy - vy * sy, -((vx * sy + vy * cy) * sp + vz * cp)]
   return f
 }
 
-/* ---------- model ---------- */
+/* ---------- model + multi-part coloring + real-time crash/stress deformation ---------- */
 export function drawMesh(ctx, w, h, mesh, o = {}) {
-  const { yaw = -0.7, pitch = 0.5, zoom = 1, wire = false, dark = false, acc = '#f26a1b' } = o
+  const {
+    yaw = -0.7, pitch = 0.5, zoom = 1, wire = false, dark = false, acc = '#f26a1b',
+    partColors = null, sim = null
+  } = o
   const p = prep(mesh)
-  const { V, T, n, m, c, diag, N, P, D, S, order } = p
+  const { V, T, n, m, c, diag, N, P, D, S, Stress, order } = p
   const cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch)
   const s = ((FIT * Math.min(w, h)) / diag) * zoom
   const ox = w / 2
   const oy = h / 2
 
+  // Determine primary longest horizontal axis (0 = X, 1 = Y) for crash motion & crumple
+  const spanX = p.mx[0] - p.mn[0]
+  const spanY = p.mx[1] - p.mn[1]
+  const spanZ = p.mx[2] - p.mn[2]
+  const crashAxis = spanX >= spanY ? 0 : 1
+  const frontMax = p.mx[crashAxis]
+  const frontSpan = Math.max(p.mx[crashAxis] - p.mn[crashAxis], 1)
+
+  // Real-time simulation parameters (progress 0.0 -> 1.0)
+  const simActive = sim && sim.active
+  const prog = simActive ? Math.min(1, Math.max(0, sim.progress || 0)) : 0
+  const crumpleRatio = simActive ? Math.min(0.65, Math.max(0.04, sim.crumpleRatio || 0.18)) : 0
+  const obstacle = simActive ? (sim.obstacle || 'concrete_wall') : null
+
+  // Approach phase (prog 0 -> 0.45): model moves toward wall; Impact phase (0.45 -> 1.0): plastic crush
+  const impactPhase = prog <= 0.45 ? 0 : (prog - 0.45) / 0.55
+  const approachOffset = simActive && obstacle !== 'wind_and_thrust'
+    ? (prog <= 0.45 ? -(1 - prog / 0.45) * (frontSpan * 0.35) : 0)
+    : 0
+  const wallCoord = frontMax - impactPhase * crumpleRatio * frontSpan
+
+  const vStress = simActive ? new Float32Array(n) : null
+
   for (let i = 0; i < n; i++) {
-    const x = V[i * 3] - c[0], y = V[i * 3 + 1] - c[1], z = V[i * 3 + 2] - c[2]
+    let vx = V[i * 3]
+    let vy = V[i * 3 + 1]
+    let vz = V[i * 3 + 2]
+    let localStress = 0
+
+    if (simActive) {
+      if (obstacle === 'wind_and_thrust') {
+        // High-altitude diagonal crosswind shear + cantilever deflection along top (+Z)
+        const zNorm = Math.max(0, (vz - p.mn[2]) / Math.max(spanZ, 1))
+        const flutter = Math.sin(prog * Math.PI * 4) * 0.25 + 0.75
+        const bendDeflect = (zNorm * zNorm) * (spanY * 0.08) * crumpleRatio * 3.0 * flutter
+        vy += bendDeflect
+        localStress = Math.min(1, zNorm * 1.15 * flutter)
+      } else {
+        // Concrete Wall or Bollard Pole Frontal Crash along crashAxis
+        const coord = (crashAxis === 0 ? vx : vy) + approachOffset
+        if (crashAxis === 0) vx = coord; else vy = coord
+
+        const latCoord = crashAxis === 0 ? (vy - c[1]) : (vx - c[0])
+        const latSpan = Math.max(crashAxis === 0 ? spanY : spanX, 1)
+        const inPoleZone = obstacle === 'bollard_pole' ? Math.abs(latCoord) < latSpan * 0.24 : true
+
+        if (impactPhase > 0 && coord > wallCoord) {
+          const pen = coord - wallCoord
+          if (inPoleZone) {
+            // Plastic crush against rigid barrier/pole + Poisson lateral bulge
+            const clamped = wallCoord + pen * 0.08
+            if (crashAxis === 0) {
+              vx = clamped
+              vy += (vy >= c[1] ? 1 : -1) * pen * 0.22
+            } else {
+              vy = clamped
+              vx += (vx >= c[0] ? 1 : -1) * pen * 0.22
+            }
+            vz += ((vz - p.mn[2]) / Math.max(spanZ, 1)) * pen * 0.18
+            localStress = Math.min(1, 0.55 + (pen / (crumpleRatio * frontSpan + 1e-3)) * 0.65)
+          } else {
+            // Wrap around bollard pole
+            localStress = Math.min(0.75, (pen / (crumpleRatio * frontSpan + 1e-3)) * 0.5)
+          }
+        } else if (impactPhase > 0) {
+          // Elastic stress wave propagation behind the crush zone
+          const distToWall = Math.max(0, wallCoord - coord)
+          const decay = Math.exp(-distToWall / (frontSpan * 0.28))
+          localStress = decay * impactPhase * 0.65
+        }
+      }
+      vStress[i] = localStress
+    }
+
+    const x = vx - c[0], y = vy - c[1], z = vz - c[2]
     const x1 = x * cy - y * sy
     const y1 = x * sy + y * cy
     P[i * 3] = ox + x1 * s
@@ -145,7 +278,17 @@ export function drawMesh(ctx, w, h, mesh, o = {}) {
   ctx.fill()
   ctx.restore()
 
-  const pal = shades(dark)
+  // Prepare per-part shade palettes if mesh has named sub-parts
+  const partNames = mesh.parts || []
+  const triPart = mesh.tri_part || null
+  const partPalettes = partNames.length > 0
+    ? partNames.map((pname, idx) => {
+        const hex = (partColors && partColors[pname]) || DEFAULT_PART_HEX[idx % DEFAULT_PART_HEX.length]
+        return shadePaletteForHex(hex, dark)
+      })
+    : null
+  const defaultPal = shades(dark)
+
   for (let t = 0; t < m; t++) {
     const a = T[t * 3], b = T[t * 3 + 1], d = T[t * 3 + 2]
     D[t] = (P[a * 3 + 2] + P[b * 3 + 2] + P[d * 3 + 2]) / 3
@@ -156,6 +299,12 @@ export function drawMesh(ctx, w, h, mesh, o = {}) {
     if (nd > 0) { nr = -nr; nd = -nd; nu = -nu }
     const diff = Math.max(0, nr * LIGHT[0] + nd * LIGHT[1] + nu * LIGHT[2])
     S[t] = Math.min(63, Math.round((0.18 + 0.82 * diff) * 63))
+    if (simActive && vStress) {
+      const avgSt = (vStress[a] + vStress[b] + vStress[d]) / 3
+      Stress[t] = Math.min(63, Math.round(avgSt * 63))
+    } else {
+      Stress[t] = 0
+    }
   }
   order.sort((i, j) => D[j] - D[i])
 
@@ -174,18 +323,89 @@ export function drawMesh(ctx, w, h, mesh, o = {}) {
     ctx.globalAlpha = 1
     return
   }
+
   const seam = m < 60000
   ctx.lineWidth = 0.7
-  let last = -1
+  let lastFill = ''
   for (let k = 0; k < m; k++) {
     const t = order[k]
     const a = T[t * 3] * 3, b = T[t * 3 + 1] * 3, d = T[t * 3 + 2] * 3
-    if (S[t] !== last) { last = S[t]; ctx.fillStyle = pal[last]; ctx.strokeStyle = pal[last] }
+    let col
+    if (simActive && Stress[t] > 6) {
+      col = HEATMAP_PALETTE[Stress[t]]
+    } else if (partPalettes && triPart && triPart[t] !== undefined) {
+      const pIdx = triPart[t] % partPalettes.length
+      col = partPalettes[pIdx][S[t]]
+    } else {
+      col = defaultPal[S[t]]
+    }
+    if (col !== lastFill) {
+      lastFill = col
+      ctx.fillStyle = col
+      ctx.strokeStyle = col
+    }
     ctx.beginPath()
     ctx.moveTo(P[a], P[a + 1]); ctx.lineTo(P[b], P[b + 1]); ctx.lineTo(P[d], P[d + 1])
     ctx.closePath()
     ctx.fill()
     if (seam) ctx.stroke()
+  }
+
+  // Draw 3D Obstacle Overlay (Concrete Wall / Bollard Pole / Wind Arrows) when simulation is active
+  if (simActive) {
+    const pr = makeProj(p, w, h, { yaw, pitch, zoom })
+    ctx.save()
+    if (obstacle === 'concrete_wall') {
+      const wX = crashAxis === 0 ? wallCoord : p.c[0]
+      const wY = crashAxis === 1 ? wallCoord : p.c[1]
+      const corners = crashAxis === 0
+        ? [
+            pr(wX, p.mn[1] - spanY * 0.2, p.mn[2]),
+            pr(wX, p.mx[1] + spanY * 0.2, p.mn[2]),
+            pr(wX, p.mx[1] + spanY * 0.2, p.mx[2] + spanZ * 0.2),
+            pr(wX, p.mn[1] - spanY * 0.2, p.mx[2] + spanZ * 0.2),
+          ]
+        : [
+            pr(p.mn[0] - spanX * 0.2, wY, p.mn[2]),
+            pr(p.mx[0] + spanX * 0.2, wY, p.mn[2]),
+            pr(p.mx[0] + spanX * 0.2, wY, p.mx[2] + spanZ * 0.2),
+            pr(p.mn[0] - spanX * 0.2, wY, p.mx[2] + spanZ * 0.2),
+          ]
+      ctx.fillStyle = 'rgba(239, 68, 68, 0.18)'
+      ctx.strokeStyle = '#ef4444'
+      ctx.lineWidth = 2
+      ctx.beginPath()
+      corners.forEach((pt, idx) => (idx ? ctx.lineTo(pt[0], pt[1]) : ctx.moveTo(pt[0], pt[1])))
+      ctx.closePath()
+      ctx.fill()
+      ctx.stroke()
+    } else if (obstacle === 'bollard_pole') {
+      const pX = crashAxis === 0 ? wallCoord : p.c[0]
+      const pY = crashAxis === 1 ? wallCoord : p.c[1]
+      const bot = pr(pX, pY, p.mn[2])
+      const top = pr(pX, pY, p.mx[2] + spanZ * 0.25)
+      ctx.strokeStyle = '#f59e0b'
+      ctx.lineWidth = Math.max(10, diag * 0.04 * s)
+      ctx.lineCap = 'round'
+      ctx.beginPath()
+      ctx.moveTo(bot[0], bot[1])
+      ctx.lineTo(top[0], top[1])
+      ctx.stroke()
+    } else if (obstacle === 'wind_and_thrust') {
+      ctx.strokeStyle = '#38bdf8'
+      ctx.fillStyle = '#38bdf8'
+      ctx.lineWidth = 2
+      for (let k = 0; k < 4; k++) {
+        const zLvl = p.mn[2] + ((k + 0.5) / 4) * spanZ
+        const start = pr(p.c[0], p.mn[1] - spanY * 0.45, zLvl)
+        const end = pr(p.c[0], p.mn[1] - spanY * 0.05, zLvl)
+        ctx.beginPath()
+        ctx.moveTo(start[0], start[1])
+        ctx.lineTo(end[0], end[1])
+        ctx.stroke()
+      }
+    }
+    ctx.restore()
   }
 }
 
@@ -301,7 +521,6 @@ export function drawOverlay(ctx, w, h, mesh, view, o = {}) {
   ctx.save()
   ctx.lineJoin = 'round'
 
-  /* bounding box + dimension lines */
   if (o.dims) {
     const C = []
     for (const x of [mn0, mx0]) for (const y of [mn1, mx1]) for (const z of [mn2, mx2]) C.push(pr(x, y, z))
@@ -490,24 +709,24 @@ export function thumbnail(mesh, w = 720, h = 440, o = {}) {
   return c.toDataURL('image/png')
 }
 
-export function Thumb({ mesh, alt = '3D preview' }) {
+export function Thumb({ mesh, alt = '3D preview', partColors = null }) {
   const dark = useDark()
   const [src, setSrc] = useState(null)
   useEffect(() => {
     if (!mesh || !mesh.verts || !mesh.verts.length) { setSrc(null); return }
-    const key = dark ? 'd' : 'l'
+    const key = `${dark ? 'd' : 'l'}_${partColors ? JSON.stringify(partColors) : ''}`
     let tc = thumbCache.get(mesh)
     if (!tc) { tc = {}; thumbCache.set(mesh, tc) }
     if (tc[key]) { setSrc(tc[key]); return }
     const id = setTimeout(() => {
       try {
-        const u = thumbnail(mesh, 720, 440, { dark })
+        const u = thumbnail(mesh, 720, 440, { dark, partColors })
         tc[key] = u
         setSrc(u)
       } catch { setSrc(null) }
     }, 0)
     return () => clearTimeout(id)
-  }, [mesh, dark])
+  }, [mesh, dark, partColors])
   return src ? <img src={src} alt={alt} draggable={false} /> : null
 }
 
@@ -516,12 +735,13 @@ const clamp = (v, a, b) => Math.max(a, Math.min(b, v))
 
 export default function MeshViewer({
   mesh, wire = false, auto = true, resetKey = 0,
-  grid = false, axes = false, dims = false, measure = false, clearKey = 0, onMeasure
+  grid = false, axes = false, dims = false, measure = false, clearKey = 0, onMeasure,
+  partColors = null, simState = null
 }) {
   const cv = useRef(null)
   const S = useRef({ yaw: -0.75, pitch: 0.5, zoom: 1, drag: false, dirty: true, hover: -1, pts: [] })
   const opt = useRef({})
-  opt.current = { wire, auto, grid, axes, dims, measure }
+  opt.current = { wire, auto, grid, axes, dims, measure, partColors, simState }
   const cb = useRef(onMeasure)
   cb.current = onMeasure
   const dark = useDark()
@@ -532,7 +752,7 @@ export default function MeshViewer({
   const down = useRef(null)
 
   useEffect(() => { Object.assign(S.current, { yaw: -0.75, pitch: 0.5, zoom: 1, dirty: true }) }, [resetKey])
-  useEffect(() => { S.current.dirty = true }, [wire, grid, axes, dims, measure, dark])
+  useEffect(() => { S.current.dirty = true }, [wire, grid, axes, dims, measure, dark, partColors, simState])
   useEffect(() => {
     S.current.pts = []
     S.current.hover = -1
@@ -549,7 +769,10 @@ export default function MeshViewer({
     const loop = () => {
       if (!alive) return
       const s = S.current
-      if (opt.current.auto && !s.drag) { s.yaw += 0.006; s.dirty = true }
+      if (opt.current.auto && !s.drag && !(opt.current.simState && opt.current.simState.running)) {
+        s.yaw += 0.006
+        s.dirty = true
+      }
       if (s.dirty) {
         s.dirty = false
         const r = window.devicePixelRatio || 1
@@ -566,7 +789,14 @@ export default function MeshViewer({
         const view = { yaw: s.yaw, pitch: s.pitch, zoom: s.zoom }
         const dk = darkRef.current
         if (o.grid) drawGrid(ctx, w, h, mesh, view, { dark: dk })
-        drawMesh(ctx, w, h, mesh, { ...view, wire: o.wire, dark: dk, acc })
+        drawMesh(ctx, w, h, mesh, {
+          ...view,
+          wire: o.wire,
+          dark: dk,
+          acc,
+          partColors: o.partColors,
+          sim: o.simState
+        })
         const V = mesh.verts
         const hv = s.hover >= 0 ? [V[s.hover * 3], V[s.hover * 3 + 1], V[s.hover * 3 + 2]] : null
         drawOverlay(ctx, w, h, mesh, view, { dark: dk, acc, grid: o.grid, axes: o.axes, dims: o.dims, measure: o.measure, hover: hv, pts: s.pts })

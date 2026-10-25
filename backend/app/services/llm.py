@@ -16,9 +16,9 @@ class LLMService:
     """
     Multi-Provider, Per-Model Key-Sharded LLM Orchestration Service.
     
-    Because cloud providers (Google Gemini, Groq) enforce RPM/TPM rate limits
-    per (API_Key, Model_Name) pair, this service maintains a pool of clients
-    for each provider and rotates keys independently per model name.
+    Enforces `max_retries=0` at the HTTP client level so rate-limited or congested
+    API keys rotate immediately to the next key shard or model without hidden
+    exponential backoff delays.
     """
 
     def __init__(self):
@@ -26,7 +26,8 @@ class LLMService:
         self.local_client = wrap_openai(AsyncOpenAI(
             base_url=settings.llm_base_url,
             api_key=settings.llm_api_key,
-            timeout=120.0
+            timeout=120.0,
+            max_retries=0
         ))
 
         # 2. Google Gemini Client Pool (Sharded across all keys in GEMINI_API_KEYS / GEMINI_API_KEY)
@@ -34,7 +35,8 @@ class LLMService:
             wrap_openai(AsyncOpenAI(
                 base_url=settings.gemini_base_url,
                 api_key=key,
-                timeout=180.0
+                timeout=180.0,
+                max_retries=0
             ))
             for key in settings.gemini_key_pool
         ]
@@ -44,7 +46,8 @@ class LLMService:
             wrap_openai(AsyncOpenAI(
                 base_url=settings.plan_base_url,
                 api_key=key,
-                timeout=120.0
+                timeout=120.0,
+                max_retries=0
             ))
             for key in settings.plan_key_pool
         ]
@@ -53,7 +56,8 @@ class LLMService:
         self.coder_client = wrap_openai(AsyncOpenAI(
             base_url=settings.coder_base_url,
             api_key=settings.coder_api_key,
-            timeout=180.0
+            timeout=180.0,
+            max_retries=0
         ))
 
         # Per-model round-robin cursor: maps model_name -> next key index
@@ -74,8 +78,8 @@ class LLMService:
     def _get_candidate_chain(self, role: AgentRole) -> List[tuple[Any, str]]:
         """
         Builds an ordered list of (client, model_name) pairs.
-        If multiple API keys exist for a provider, rotates through all keys for a model
-        before failing over to the next model architecture.
+        Prioritizes Gemini 3.8 Flash for CAD coding quality, rotating across all
+        configured Gemini keys before falling back to Gemma 4 and Groq.
         """
         chain: List[tuple[Any, str]] = []
 
@@ -94,20 +98,22 @@ class LLMService:
             add_pool(self.gemini_clients, settings.intent_model)
 
         elif role == "modifier":
-            add_pool(self.gemini_clients, settings.modifier_model)
-            add_pool(self.planner_clients, settings.plan_model)
+            # 1. Gemini 3.8 Flash & Gemma 4 31B for accurate parametric code edits
             add_pool(self.gemini_clients, settings.coder_fallback_model)
+            add_pool(self.gemini_clients, settings.modifier_model)
+            # 2. Groq gpt-oss-120b fallback
+            add_pool(self.planner_clients, settings.plan_model)
 
         elif role == "coder":
             # 1. Teammate's fine-tuned cluster (skip if pointing to unstarted localhost)
             if "localhost" not in settings.coder_base_url:
                 chain.append((self.coder_client, settings.coder_model))
-            # 2. Gemini 3.8 Flash (all keys)
+            # 2. Primary Cloud Coder: Gemini 3.8 Flash (all sharded keys)
             add_pool(self.gemini_clients, settings.coder_fallback_model)
-            # 3. Groq gpt-oss-120b (ultra-fast ~5s coder, all keys)
-            add_pool(self.planner_clients, settings.plan_model)
-            # 4. Gemma 4 31B IT (all keys)
+            # 3. Secondary Gemini Coder: Gemma 4 31B IT (all sharded keys)
             add_pool(self.gemini_clients, settings.modifier_model)
+            # 4. Fast LPU Failover: Groq gpt-oss-120b (all sharded keys)
+            add_pool(self.planner_clients, settings.plan_model)
 
         chain.append((self.local_client, settings.llm_model))
         return chain
@@ -123,8 +129,7 @@ class LLMService:
         candidates = self._get_candidate_chain(role)
         last_err = None
 
-        # Full 16K headroom so gemma-4-31b-it / gemini-3.8-flash never truncate 9K-12K first-pass builds
-        role_min_tokens = 16384 if role == "coder" else (8192 if role == "planner" else 4096)
+        role_min_tokens = 16384 if role == "coder" else (8192 if role in ("planner", "modifier") else 4096)
         effective_max_tokens = max(max_tokens, role_min_tokens)
 
         for idx, (client, model) in enumerate(candidates):
@@ -171,7 +176,7 @@ class LLMService:
         # Remove closed <thought>...</thought> and <think>...</think> blocks
         text = re.sub(r"<(?:thought|think)>.*?</(?:thought|think)>", "", text, flags=re.S | re.I)
         # If the model got truncated inside an unclosed <thought> tag, strip from <thought> to end
-        text = re.sub(r"<(?:thought|think)>.*\$", "", text, flags=re.S | re.I)
+        text = re.sub(r"<(?:thought|think)>.*$", "", text, flags=re.S | re.I)
         return text.strip()
 
     async def get_embedding(self, text: str) -> list[float]:
@@ -200,7 +205,7 @@ class LLMService:
         if not cleaned:
             return ""
 
-        m = re.search(r"```(?:python|py)?\s*\n(.*?)(?:```|\$)", cleaned, re.S)
+        m = re.search(r"```(?:python|py)?\s*\n(.*?)(?:```|$)", cleaned, re.S)
         if m:
             raw_code = m.group(1).strip()
         elif "import cadquery" in cleaned or "result" in cleaned or "parts" in cleaned:
@@ -220,7 +225,7 @@ class LLMService:
                 valid_lines.append(f"# {s}")
                 continue
             # 3. Convert any line containing LaTeX math ($) into a safe Python comment
-            if "$" in s and not s.startswith("#"):
+            if "\$" in s and not s.startswith("#"):
                 valid_lines.append(f"# {s}")
                 continue
             valid_lines.append(line)

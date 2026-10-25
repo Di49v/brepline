@@ -25,7 +25,7 @@ const CHIPS = [
   ['ENCLOSURE', 'Electronics enclosure 80 x 50 x 30 mm, 2 mm walls, open top, USB cutout on one side'],
   ['FLANGE', 'Pipe flange 100 mm diameter, 10 mm thick, 40 mm bore, 4 bolt holes of 6 mm on a 70 mm circle']
 ]
-// names must match the backend density table (cadpipe.DENSITY)
+// names must match the backend MATERIAL_LIBRARY table
 const MATS = ['Al 6061', 'Steel', 'Titanium', 'Carbon Fiber', 'Brass', 'Copper', 'Glass', 'Rubber', 'PLA', 'ABS']
 const FMTS = ['STEP', 'STL']
 const P = {
@@ -56,7 +56,7 @@ function dl(job, ext) {
   a.remove()
 }
 
-const fmtMass = g => (g >= 1000 ? (g / 1000).toFixed(2) + ' kg' : g.toFixed(1) + ' g')
+const fmtMass = g => (g >= 1000 ? (g / 1000).toFixed(2) + ' kg' : Number(g || 0).toFixed(1) + ' g')
 const fmtSize = b => (b || []).map(x => Math.round(x * 10) / 10).join(' × ') + ' mm'
 
 // turn a backend result into one "version" of a chat answer
@@ -105,14 +105,14 @@ const writeLS = (k, v) => { try { localStorage.setItem(k, v) } catch { /* ignore
 const Ic = ({ n }) => <svg className="i"><use href={`#${n}`} /></svg>
 const PI = ({ k }) => <svg className="i" viewBox="0 0 24 24"><path d={P[k]} /></svg>
 const PartIcon = () => <svg viewBox="0 0 100 100"><use href="#part" /></svg>
-/* ---------- thinking trace: shows the engine's real log lines, no decoration ---------- */
-const STAGE_TITLE = ['Planning the design', 'Writing CAD candidates', 'Building and checking the solid', 'Refining the result']
+/* ---------- thinking trace: shows the engine's real log lines + live sub-part preview ---------- */
+const STAGE_TITLE = ['Planning the design', 'Decomposing & querying cache', 'Building sub-components', 'Assembling & auditing physics']
 
 function stageOf(logs) {
   const last = (logs && logs.length ? logs[logs.length - 1] : '') || ''
-  if (/repair|cache|done/i.test(last)) return 3
-  if (/best candidate/i.test(last)) return 2
-  if (/generating/i.test(last)) return 1
+  if (/done|safety factor/i.test(last)) return 3
+  if (/verified|building component|adapted|repairing/i.test(last)) return 2
+  if (/decomposed|generating/i.test(last)) return 1
   return 0
 }
 const dur = n => (n >= 60 ? `${Math.floor(n / 60)}m ${n % 60}s` : `${n}s`)
@@ -155,7 +155,7 @@ function Thinking({ state, logs, t0, secs, onStop, partialMesh }) {
           <span>{head}</span>
           {busy && <span className="th-s">{dur(live)}</span>}
         </button>
-        {busy && onStop && <button className="btn th-x" onClick={onStop}><PI k="stop" />Stop</button>}
+        {busy && onStop && <button className="btn th-x" onClick={onStop}><PI k="stop"/>Stop</button>}
       </div>
       {open && (
         <ol className="th-l" ref={listRef}>
@@ -166,13 +166,13 @@ function Thinking({ state, logs, t0, secs, onStop, partialMesh }) {
       )}
       {busy && open && partialMesh && (
         <div style={{ marginTop: 10, borderRadius: 8, overflow: 'hidden', border: '1px solid var(--edge, #333)', maxWidth: 280 }}>
-          <div style={{ fontSize: 11, padding: '4px 8px', opacity: 0.8, background: 'rgba(0,0,0,0.2)' }}>
+          <div style={{ fontSize: 11, padding: '4px 8px', opacity: 0.85, background: 'rgba(0,0,0,0.2)' }}>
             Live Sub-Part Compiler Preview
           </div>
           <Thumb mesh={partialMesh} alt="Sub-part preview" />
         </div>
       )}
-      {busy && open && live > 45 && <div className="th-n">Complex parts can take a minute or two.</div>}
+      {busy && open && live > 45 && <div className="th-n">Complex multi-part assemblies compile component by component.</div>}
     </div>
   )
 }
@@ -188,7 +188,7 @@ function SidebarGen({ items, onStop, onOpen }) {
       <div className="sgh"><i className="sgd" />Generating{items.length > 1 ? ` · ${items.length}` : ''}</div>
       <button className="sgt" onClick={() => onOpen(it.id)} title={it.text}>{it.text}</button>
       <div className="sgm">{has ? STAGE_TITLE[stageOf(it.logs)] : 'Starting'} · {dur(sec)}</div>
-      <button className="btn sgs" onClick={onStop}><PI k="stop" />Stop</button>
+      <button className="btn sgs" onClick={onStop}><PI k="stop"/>Stop</button>
     </div>
   )
 }
@@ -201,7 +201,7 @@ function Toasts({ list, onClose, onOpen }) {
       {list.map(t => (
         <div key={t.id} className={'toast ' + t.kind}>
           <button className="to-b" onClick={() => onOpen(t)}><b>{t.title}</b><span>{t.body}</span></button>
-          <button className="to-x" aria-label="Dismiss" onClick={() => onClose(t.id)}><PI k="x" /></button>
+          <button className="to-x" aria-label="Dismiss" onClick={() => onClose(t.id)}><PI k="x"/></button>
         </div>
       ))}
     </div>
@@ -316,22 +316,27 @@ function EditBox({ init, onSave, onCancel }) {
 
 function Result({ v, onOpen3d, onRefine, onEditShape }) {
   const [showCode, setShowCode] = useState(false)
+  const partColors = v.physics && v.physics.part_colors ? v.physics.part_colors : null
+  const sf = v.physics && v.physics.overall_safety_factor ? v.physics.overall_safety_factor : null
   return (
     <>
       Generated <b>{v.title}</b> in <b>{v.m}</b>.
       {v.warning && <div style={{ margin: '6px 0', fontSize: 13, opacity: 0.8 }}>Note: {v.warning}</div>}
       <div className="cad">
         <div className="prev" onClick={() => onOpen3d(v)}>
-          {v.mesh ? <Thumb mesh={v.mesh} alt={v.title} /> : <PartIcon />}
+          {v.mesh ? <Thumb alt={v.title} mesh={v.mesh} partColors={partColors}/> : <PartIcon/>}
         </div>
         <div className="meta">
           <div><small>Mass</small>{fmtMass(v.mass_g)}</div>
           <div><small>Size</small>{fmtSize(v.bbox)}</div>
-          <div title={v.checkNote || ''}><small>Check</small>{v.verified ? 'Verified' : 'Review'}</div>
+          <div title={v.checkNote || ''}>
+            <small>Check</small>
+            {v.verified ? (sf ? `Verified · SF ${sf}×` : 'Verified') : 'Review'}
+          </div>
         </div>
         <div className="acts">
-          <button className="btn p" onClick={() => dl(v.job, v.f)}><Ic n="dl" />Download {v.f}</button>
-          <button className="btn" onClick={() => onOpen3d(v)}><Ic n="exp" />Enlarge 3D</button>
+          <button className="btn p" onClick={() => dl(v.job, v.f)}><Ic n="dl"/>Download {v.f}</button>
+          <button className="btn" onClick={() => onOpen3d(v)}><Ic n="exp"/>Enlarge 3D & Crash Lab</button>
           <button className="btn" onClick={() => onRefine(v)}>Refine</button>
           {v.shape && <button className="btn" onClick={() => onEditShape(v)}>Edit shape</button>}
           <button className="btn" onClick={() => setShowCode(s => !s)}>{showCode ? 'Hide code' : 'View code'}</button>
@@ -343,7 +348,7 @@ function Result({ v, onOpen3d, onRefine, onEditShape }) {
           </div>
         )}
       </div>
-      <div style={{ fontSize: 12, opacity: 0.6, marginTop: 6 }}>Mass is geometry volume × material density. Verify dimensions before manufacturing.</div>
+      <div style={{ fontSize: 12, opacity: 0.6, marginTop: 6 }}>Mass is geometry volume × material density. Open 3D to run Crash & Wind-Shear stress tests.</div>
     </>
   )
 }
@@ -431,8 +436,8 @@ function InfoPanel({ v, mesh, pts, measureOn }) {
   )
 }
 
-// full-screen 3D view of the real mesh (uses the themed .modal styles, so it follows light/dark)
-function MeshModal({ s, onClose }) {
+// full-screen 3D view + Interactive 60 FPS Physics & Crash Lab
+function MeshModal({ s, onClose, onGoPricing }) {
   const [wire, setWire] = useState(false)
   const [auto, setAuto] = useState(true)
   const [rk, setRk] = useState(0)
@@ -441,8 +446,19 @@ function MeshModal({ s, onClose }) {
   const [grid, setGrid] = useState(false)
   const [measure, setMeasure] = useState(false)
   const [info, setInfo] = useState(false)
+  const [lab, setLab] = useState(false)
   const [pts, setPts] = useState([])
   const [ck, setCk] = useState(0)
+
+  // Crash & Multi-Physics Lab State
+  const [obstacle, setObstacle] = useState('concrete_wall')
+  const [speed, setSpeed] = useState(72)
+  const [wind, setWind] = useState(45)
+  const [simMat, setSimMat] = useState('Al 6061')
+  const [partMats, setPartMats] = useState({})
+  const [physData, setPhysData] = useState(null)
+  const [simAnim, setSimAnim] = useState({ active: false, running: false, progress: 0, crumpleRatio: 0.18, obstacle: 'concrete_wall' })
+
   useEffect(() => {
     if (!s.open) return
     setWire(false)
@@ -454,10 +470,59 @@ function MeshModal({ s, onClose }) {
     setMeasure(false)
     setPts([])
     setInfo(window.innerWidth >= 1100)
+    setLab(false)
+    const initPhys = s.info && s.info.physics ? s.info.physics : null
+    setPhysData(initPhys)
+    setSimMat((s.info && s.info.m) || 'Al 6061')
+    setPartMats((initPhys && initPhys.part_materials) || {})
+    setSimAnim({ active: false, running: false, progress: 0, crumpleRatio: 0.18, obstacle: 'concrete_wall' })
     const onKey = e => { if (e.key === 'Escape') onClose() }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [s.open, s.job, onClose])
+  }, [s.open, s.job, s.info, s.mesh, onClose])
+
+  const runCrashSim = async () => {
+    setAuto(false)
+    let cr = 0.22
+    try {
+      if (s.job) {
+        const res = await simulatePhysics(s.job, {
+          material: simMat,
+          speed_kmh: speed,
+          wind_m_s: wind,
+          obstacle,
+          part_materials: partMats
+        })
+        if (res && res.physics) {
+          setPhysData(res.physics)
+          cr = (res.physics.edge_cases?.crash_test?.crumple_ratio || 0.15) + (speed / 320) * 0.25
+        }
+      }
+    } catch {
+      cr = Math.min(0.55, 0.12 + (speed / 240) * 0.35)
+    }
+
+    const tStart = performance.now()
+    const duration = 1800
+    setSimAnim({ active: true, running: true, progress: 0, crumpleRatio: cr, obstacle })
+
+    const step = now => {
+      const p = Math.min(1, (now - tStart) / duration)
+      setSimAnim({ active: true, running: p < 1, progress: p, crumpleRatio: cr, obstacle })
+      if (p < 1) requestAnimationFrame(step)
+    }
+    requestAnimationFrame(step)
+  }
+
+  const resetSim = () => {
+    setSimAnim({ active: false, running: false, progress: 0, crumpleRatio: 0.18, obstacle })
+  }
+
+  const partColors = (physData && physData.part_colors) || (s.info?.physics?.part_colors) || null
+  const crash = physData?.edge_cases?.crash_test
+  const windTest = physData?.edge_cases?.wind_shear
+  const buckTest = physData?.edge_cases?.axial_buckling
+
   const tgl = (on, set, label, extra) => (
     <button className={'btn' + (on ? ' on' : '')} onClick={() => set(x => !x)} aria-pressed={on} {...extra}>{label}</button>
   )
@@ -468,17 +533,19 @@ function MeshModal({ s, onClose }) {
           <b>{s.name}</b>
           <button className="btn mclose" onClick={onClose}>Close</button>
           <div className="g">
+            <button className={'btn' + (lab ? ' on' : '')} onClick={() => { setLab(l => !l); if (!lab) setInfo(false) }}>
+              ⚡ Physics & Crash Lab
+            </button>
             <button className={'btn' + (wire ? ' on' : '')} onClick={() => setWire(w => !w)}>{wire ? 'Wireframe' : 'Shaded'}</button>
             <button className={'btn' + (auto ? ' on' : '')} onClick={() => setAuto(a => !a)}>Auto-rotate</button>
-            <button className="btn" onClick={() => setRk(k => k + 1)}>Reset view</button>
-            <button className="btn p gdl" onClick={() => dl(s.job, s.f)}><Ic n="dl" />Download {s.f}</button>
+            <button className="btn" onClick={() => { resetSim(); setRk(k => k + 1) }}>Reset view</button>
+            <button className="btn p gdl" onClick={() => dl(s.job, s.f)}><Ic n="dl"/>Download {s.f}</button>
             <button className="btn gclose" onClick={onClose}>Close</button>
           </div>
         </div>
         <div className="mvw">
           {s.open && s.mesh
-            ? <MeshViewer mesh={s.mesh} wire={wire} auto={auto} resetKey={rk} dims={dims} axes={axes} grid={grid}
-                measure={measure} clearKey={ck} onMeasure={setPts} />
+            ? <MeshViewer auto={auto} axes={axes} clearKey={ck} dims={dims} grid={grid} measure={measure} mesh={s.mesh} onMeasure={setPts} partColors={partColors} resetKey={rk} simState={simAnim} wire={wire}/>
             : <div className="mv nomesh">Preview not available</div>}
           <div className="vt">
             {tgl(dims, setDims, 'Dimensions')}
@@ -488,11 +555,116 @@ function MeshModal({ s, onClose }) {
               onClick={() => { setMeasure(m => !m); setAuto(false) }}>Measure</button>
             {measure && pts.length > 0 ? <button className="btn" onClick={() => setCk(k => k + 1)}>Clear</button> : null}
             {tgl(info, setInfo, 'Info')}
+            <button className={'btn' + (lab ? ' on' : '')} onClick={() => { setLab(l => !l); if (!lab) setInfo(false) }}>Crash Lab</button>
           </div>
-          {info && s.info ? <InfoPanel v={s.info} mesh={s.mesh} pts={pts} measureOn={measure} /> : null}
+          {info && !lab && s.info ? <InfoPanel measureOn={measure} mesh={s.mesh} pts={pts} v={s.info}/> : null}
+
+          {lab && (
+            <div className="ip" style={{ width: 320, maxHeight: '82%', overflowY: 'auto' }}>
+              <h4 className="ih">Obstacle & Test Regime</h4>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 10 }}>
+                {[
+                  ['concrete_wall', '🧱 Frontal Concrete Wall Impact'],
+                  ['bollard_pole', '💈 Center Bollard Pole Impact'],
+                  ['wind_and_thrust', '🌪️ Crosswind Shear & 6G Buckling']
+                ].map(([id, label]) => (
+                  <button
+                    key={id}
+                    className={'btn' + (obstacle === id ? ' on' : '')}
+                    style={{ justifyContent: 'flex-start', textAlign: 'left' }}
+                    onClick={() => setObstacle(id)}
+                  >
+                    {label}
+                  </button>
+                ))}
+                <button
+                  className="btn"
+                  style={{ justifyContent: 'flex-start', opacity: 0.75, borderStyle: 'dashed' }}
+                  onClick={() => { onClose(); onGoPricing && onGoPricing() }}
+                >
+                  🔒 Custom AI Obstacle Generator (Pro)
+                </button>
+              </div>
+
+              <h4 className="ih">Simulation Parameters</h4>
+              <div className="ir">
+                <span>Impact Speed</span>
+                <b>{speed} km/h</b>
+              </div>
+              <input type="range" min="15" max="220" value={speed} onChange={e => setSpeed(Number(e.target.value))} style={{ width: '100%' }} />
+
+              <div className="ir" style={{ marginTop: 6 }}>
+                <span>Crosswind Gust</span>
+                <b>{wind} m/s</b>
+              </div>
+              <input type="range" min="10" max="150" value={wind} onChange={e => setWind(Number(e.target.value))} style={{ width: '100%' }} />
+
+              <div className="ir" style={{ marginTop: 6 }}>
+                <span>Primary Material</span>
+                <select value={simMat} onChange={e => setSimMat(e.target.value)}>
+                  {MATS.map(m => <option key={m}>{m}</option>)}
+                </select>
+              </div>
+
+              {s.mesh?.parts?.length > 0 && (
+                <>
+                  <h4 className="ih">Per-Part Material & Color</h4>
+                  {s.mesh.parts.map(pname => (
+                    <div className="ir" key={pname} style={{ gap: 6 }}>
+                      <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <i style={{ width: 10, height: 10, borderRadius: 2, background: (partColors && partColors[pname]) || '#94a3b8', display: 'inline-block' }} />
+                        {pname}
+                      </span>
+                      <select
+                        value={partMats[pname] || simMat}
+                        onChange={e => setPartMats(p => ({ ...p, [pname]: e.target.value }))}
+                      >
+                        {MATS.map(m => <option key={m}>{m}</option>)}
+                      </select>
+                    </div>
+                  ))}
+                </>
+              )}
+
+              <div style={{ display: 'flex', gap: 6, marginTop: 10 }}>
+                <button className="btn p" style={{ flex: 1 }} onClick={runCrashSim}>
+                  ▶ Run Simulation
+                </button>
+                {simAnim.active && (
+                  <button className="btn" onClick={resetSim}>Reset</button>
+                )}
+              </div>
+
+              {crash && (
+                <>
+                  <h4 className="ih">Edge-Case Telemetry</h4>
+                  <div className="ir"><span>Status</span><b style={{ color: crash.survived ? '#2fb67c' : '#ef4444' }}>{crash.survived ? '✓ SURVIVED' : '⚠ PLASTIC FRACTURE'}</b></div>
+                  <div className="ir"><span>Safety Factor</span><b>{physData.overall_safety_factor}×</b></div>
+                  <div className="ir"><span>Peak Deceleration</span><b>{crash.peak_deceleration_g} G</b></div>
+                  <div className="ir"><span>Crumple Depth</span><b>{crash.crumple_depth_mm} mm ({(crash.crumple_ratio * 100).toFixed(1)}%)</b></div>
+                  <div className="ir"><span>Impact Energy</span><b>{crash.kinetic_energy_j} J</b></div>
+                  <div className="ir"><span>Peak Stress</span><b>{crash.impact_stress_mpa} MPa</b></div>
+                  {windTest && <div className="ir"><span>Wind Shear SF</span><b>{windTest.safety_factor}× ({windTest.bending_stress_mpa} MPa)</b></div>}
+                  {buckTest && <div className="ir"><span>6G Buckling SF</span><b>{buckTest.safety_factor}×</b></div>}
+                </>
+              )}
+
+              {physData?.part_breakdown?.length > 0 && (
+                <>
+                  <h4 className="ih">AI Material & Wastage Audit</h4>
+                  {physData.part_breakdown.map(pb => (
+                    <div key={pb.part_id} className="eq" style={{ marginBottom: 6 }}>
+                      <b>{pb.part_id}</b> ({pb.material} · {fmtMass(pb.mass_g)} · SF {pb.safety_factor}×)<br />
+                      <span>{pb.recommendation}</span>
+                    </div>
+                  ))}
+                </>
+              )}
+            </div>
+          )}
         </div>
         <div className="mf">
-          <span>{measure ? 'Click two points to measure · ' : ''}Drag to rotate · Scroll or pinch to zoom · Esc to close</span>
+          <span>{simAnim.active ? 'FE Stress Heatmap Active (Green = Elastic · Red = Plastic Yield) · ' : ''}{measure ? 'Click two points to measure · ' : ''}Drag to rotate · Scroll or pinch to zoom · Esc to close</span>
           <span>{s.bbox ? fmtSize(s.bbox) : ''}</span>
         </div>
       </div>
@@ -667,26 +839,27 @@ export default function App() {
     document.title = busyCount ? 'Generating… · Brepline' : unread ? '✓ Ready · Brepline' : 'Brepline'
   }, [busyCount, unread])
 
-  // one real generation; appends a new version to message `id`. Can be stopped through aborts.current[id].
+  // one real generation; streams both logs and live partial sub-part 3D meshes
   const runGen = async (id, text, { m, f, parent = null, fresh = false }) => {
     const ac = new AbortController()
     aborts.current[id] = ac
     const t0 = Date.now()
     let lastLogs = []
-    patch(id, { busy: true, err: null, stopped: false, logs: [], t0 })
+    patch(id, { busy: true, err: null, stopped: false, logs: [], partialMesh: null, t0 })
     try {
       const r = await generate(
         { prompt: text, material: m, parentJob: parent, fresh },
         lines => { if (lines.length) { lastLogs = lines; patch(id, { logs: lines }) } },
         ac.signal,
-        job => { ac.job = job }
+        job => { ac.job = job },
+        partialMesh => { if (partialMesh && partialMesh.verts) patch(id, { partialMesh }) }
       )
       if (ac.signal.aborted) throw new DOMException('Aborted', 'AbortError')
       const secs = Math.round((Date.now() - t0) / 1000)
       const v = { ...toVersion(r, text, f, m), think: { logs: lastLogs, secs } }
       const fid = ++uid.current
       setMsgs(p => p.map(x => (x.id === id
-        ? { ...x, vers: [...x.vers, v], cur: x.vers.length, vote: 0, busy: false, err: null, stopped: false }
+        ? { ...x, vers: [...x.vers, v], cur: x.vers.length, vote: 0, busy: false, partialMesh: null, err: null, stopped: false }
         : x)))
       setFiles(fl => [{ fid, n: v.n, f, size: fmtSize(v.bbox), mass: fmtMass(v.mass_g), verified: v.verified, v }, ...fl])
       announce('ok', 'Model ready', `${v.title} · ${fmtSize(v.bbox)} · ${fmtMass(v.mass_g)}`, id)
@@ -712,7 +885,7 @@ export default function App() {
     const id = ++uid.current
     const parent = refine ? refine.job : null
     setRefine(null)
-    const M = { id, text: t, f: fmt, m: mat, parent, vers: [], cur: 0, vote: 0, busy: true, editing: false, err: null, stopped: false, trace: null, logs: [], t0: Date.now() }
+    const M = { id, text: t, f: fmt, m: mat, parent, vers: [], cur: 0, vote: 0, busy: true, editing: false, err: null, stopped: false, trace: null, logs: [], partialMesh: null, t0: Date.now() }
     addMsg(M)
     setHist(h => [{ id, t: t.slice(0, 42), d: 'Today', f: fmt }, ...h])
     runGen(id, t, { m: mat, f: fmt, parent })
@@ -722,7 +895,10 @@ export default function App() {
     const M = msgs.find(x => x.id === id)
     if (!M || busyCount) return
     window.speechSynthesis && window.speechSynthesis.cancel()
-    runGen(id, text ?? M.text, { m: M.m, f: M.f, parent: M.parent, fresh: true })
+    // Only bypass cache if a previous completed version exists and user explicitly wants a fresh variation;
+    // if retrying after a timeout/error (M.vers.length === 0), allow pgvector cache to reuse already-built sub-parts!
+    const forceFresh = Boolean(M.vers && M.vers.length > 0 && text === undefined)
+    runGen(id, text ?? M.text, { m: M.m, f: M.f, parent: M.parent, fresh: forceFresh })
   }
   const saveEdit = (id, v) => {
     if (!v) return
@@ -824,7 +1000,7 @@ export default function App() {
     const label = name || (spec.type === 'polygon' ? 'Custom polygon part' : 'Custom revolved part')
     const id = ++uid.current
     const v = toVersion(r, label, fmt, mat)
-    addMsg({ id, text: label, f: fmt, m: mat, parent: shapeEd.parent, vers: [v], cur: 0, vote: 0, busy: false, editing: false, err: null, logs: [], t0: Date.now() })
+    addMsg({ id, text: label, f: fmt, m: mat, parent: shapeEd.parent, vers: [v], cur: 0, vote: 0, busy: false, editing: false, err: null, logs: [], partialMesh: null, t0: Date.now() })
     setHist(h => [{ id, t: label.slice(0, 42), d: 'Today', f: fmt }, ...h])
     setFiles(fl => [{ fid: ++uid.current, n: v.n, f: fmt, size: fmtSize(v.bbox), mass: fmtMass(v.mass_g), verified: v.verified, v }, ...fl])
     setView('chat')
@@ -852,17 +1028,17 @@ export default function App() {
         <button className="new" onClick={newDesign}><Ic n="plus" />New design</button>
         <nav>
           {NAV.map(([v, label, icon]) => (
-            <button key={v} className={view === v ? 'on' : ''} onClick={() => go(v)}><Ic n={icon} />{label}{v === 'chat' && busyCount > 0 && <span className="nb" title="Generating">{busyCount}</span>}</button>
+            <button key={v} className={view === v ? 'on' : ''} onClick={() => go(v)}><Ic n={icon}/>{label}{v === 'chat' && busyCount > 0 && <span className="nb" title="Generating">{busyCount}</span>}</button>
           ))}
         </nav>
-        <SidebarGen items={busyList} onStop={stopAll} onOpen={openTurn} />
+        <SidebarGen items={busyList} onOpen={openTurn} onStop={stopAll}/>
         <div className="cap">Recent</div>
         <div className="rlist">
           {chats.filter(c => c.msgs.length).slice().reverse().slice(0, 10).map(c => (
             <div key={c.id} className={'ri' + (c.id === cur.id && view === 'chat' ? ' on' : '')} onClick={() => openChat(c.id)} title={c.msgs[0].text}>
               {c.msgs.some(m => m.busy) && <i className="sgd" title="Generating" />}
               <span className="rt">{c.msgs[0].text.slice(0, 42)}</span>
-              <button className="rx" title="Delete chat" aria-label="Delete chat" onClick={e => { e.stopPropagation(); askRemoveChat(c) }}><PI k="x" /></button>
+              <button className="rx" title="Delete chat" aria-label="Delete chat" onClick={e => { e.stopPropagation(); askRemoveChat(c) }}><PI k="x"/></button>
             </div>
           ))}
         </div>
@@ -892,7 +1068,7 @@ export default function App() {
       <main>
         <header>
           <div className="hl">
-            <button className="btn sbt" title="Toggle sidebar (Ctrl+B)" aria-label="Toggle sidebar" onClick={toggleSb}><Ic n="side" /></button>
+            <button className="btn sbt" title="Toggle sidebar (Ctrl+B)" aria-label="Toggle sidebar" onClick={toggleSb}><Ic n="side"/></button>
             <select id="model" value={model} onChange={e => setModel(e.target.value)}>
               <option>Brepline-1</option>
             </select>
@@ -916,7 +1092,7 @@ export default function App() {
               {msgs.length === 0 && (
                 <div className="hero">
                   <h1>What shall we <span>build</span> today?</h1>
-                  <p>Describe a part. Receive 3D CAD you can download as STEP or STL.</p>
+                  <p>Describe a part or vehicle. Receive multi-part 3D CAD & live physics stress simulations.</p>
                   <div className="chips">
                     {CHIPS.map(([k, t]) => (
                       <button key={k} className="chip" onClick={() => send(t)}><b>{k}</b>{t}</button>
@@ -939,8 +1115,8 @@ export default function App() {
                             <div className="ut">{M.text}</div>
                             <div className="tb">
                               <CopyBtn text={M.text} />
-                              <button title="Edit" onClick={() => patch(M.id, { editing: true })}><PI k="pen" /></button>
-                              <button title="Delete" aria-label="Delete" onClick={() => askRemoveTurn(M.id, M.text.slice(0, 42))}><PI k="x" /></button>
+                              <button title="Edit" onClick={() => patch(M.id, { editing: true })}><PI k="pen"/></button>
+                              <button title="Delete" aria-label="Delete" onClick={() => askRemoveTurn(M.id, M.text.slice(0, 42))}><PI k="x"/></button>
                             </div>
                           </>
                         )}
@@ -951,7 +1127,7 @@ export default function App() {
                       <div className="t">
                         <div className="body">
                           {loading ? (
-                            <Thinking state="busy" logs={M.logs} t0={M.t0} onStop={() => stopOne(M.id)} />
+                            <Thinking logs={M.logs} partialMesh={M.partialMesh} state="busy" t0={M.t0} onStop={() => stopOne(M.id)} />
                           ) : v ? (
                             <>
                               <Thinking state="done" logs={v.think && v.think.logs} secs={v.think && v.think.secs} />
@@ -975,9 +1151,9 @@ export default function App() {
                             <div className="tb">
                               {M.vers.length > 1 && (
                                 <span className="pg">
-                                  <button disabled={!M.cur} onClick={() => nav(M.id, -1)}><PI k="l" /></button>
+                                  <button disabled={!M.cur} onClick={() => nav(M.id, -1)}><PI k="l"/></button>
                                   {M.cur + 1} / {M.vers.length}
-                                  <button disabled={M.cur >= M.vers.length - 1} onClick={() => nav(M.id, 1)}><PI k="r" /></button>
+                                  <button disabled={M.cur >= M.vers.length - 1} onClick={() => nav(M.id, 1)}><PI k="r"/></button>
                                 </span>
                               )}
                               {v && <CopyBtn text={plain(v)} />}
@@ -1014,7 +1190,7 @@ export default function App() {
                 onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() } }}
               />
               <div className="bar">
-                <button className="btn" title="Draw your own polygon or profile" aria-label="Draw shape" onClick={drawShape}><Ic n="clip" /><span className="lbl">Draw shape</span></button>
+                <button className="btn" title="Draw your own polygon or profile" aria-label="Draw shape" onClick={drawShape}><Ic n="clip"/><span className="lbl">Draw shape</span></button>
                 {/* desktop / tablet: separate dropdowns */}
                 <div className="opts-d">
                   <select value={mat} onChange={e => setMat(e.target.value)}>{MATS.map(x => <option key={x}>{x}</option>)}</select>
@@ -1040,8 +1216,8 @@ export default function App() {
                 </div>
                 <span className="sp" />
                 {busyCount
-                  ? <button className="send stop" aria-label="Stop generating" title="Stop generating" onClick={stopAll}><PI k="stop" /></button>
-                  : <button className="send" aria-label="Send" onClick={() => send()}><Ic n="up" /></button>}
+                  ? <button className="send stop" aria-label="Stop generating" title="Stop generating" onClick={stopAll}><PI k="stop"/></button>
+                  : <button className="send" aria-label="Send" onClick={() => send()}><Ic n="up"/></button>}
               </div>
             </div>
             <div className="foot">Brepline can make mistakes. Verify dimensions before manufacturing.</div>
@@ -1058,7 +1234,7 @@ export default function App() {
                 <div key={h.id} className="hrow" onClick={() => openTurn(h.id)}>
                   <div><b>{h.t}</b><small>{busyList.some(m => m.id === h.id) ? 'Generating…' : h.d}</small></div>
                   <span className="tag">{h.f}</span>
-                  <button className="hx" title="Delete" aria-label="Delete" onClick={e => { e.stopPropagation(); askRemoveTurn(h.id, h.t) }}><PI k="x" /></button>
+                  <button className="hx" title="Delete" aria-label="Delete" onClick={e => { e.stopPropagation(); askRemoveTurn(h.id, h.t) }}><PI k="x"/></button>
                 </div>
               )) : <p style={{ color: 'var(--mute)' }}>No conversations yet.</p>}
             </div>
@@ -1081,16 +1257,18 @@ export default function App() {
             <div className="grid">
               {shownFiles.map(x => (
                 <div className="f" key={x.fid}>
-                  <button className="fx" title="Delete" aria-label="Delete file" onClick={() => askRemoveFile(x)}><PI k="x" /></button>
-                  <div className="prev" onClick={() => open3d(x.v)}>{x.v.mesh ? <Thumb mesh={x.v.mesh} alt={x.n} /> : <PartIcon />}</div>
+                  <button className="fx" title="Delete" aria-label="Delete file" onClick={() => askRemoveFile(x)}><PI k="x"/></button>
+                  <div className="prev" onClick={() => open3d(x.v)}>
+                    {x.v.mesh ? <Thumb alt={x.n} mesh={x.v.mesh} partColors={x.v.physics?.part_colors} /> : <PartIcon/>}
+                  </div>
                   <div className="in">
                     <b>{x.n}.{x.f.toLowerCase()}</b>
                     <small>{x.size} / {x.mass}</small>
                     <div className="row">
                       <span className="tag">{x.f}</span>
                       <span style={{ display: 'flex', gap: 6 }}>
-                        <button className="btn" title="View in 3D" onClick={() => open3d(x.v)}><Ic n="exp" />3D</button>
-                        <button className="btn" title="Download" onClick={() => dl(x.v.job, x.f)}><Ic n="dl" /></button>
+                        <button className="btn" title="View in 3D" onClick={() => open3d(x.v)}><Ic n="exp"/>3D</button>
+                        <button className="btn" title="Download" onClick={() => dl(x.v.job, x.f)}><Ic n="dl"/></button>
                       </span>
                     </div>
                   </div>
@@ -1112,8 +1290,8 @@ export default function App() {
                 <h3>General</h3><p>Basic workspace preferences.</p>
                 <div className="srow"><div><b>Language</b><small>Interface language</small></div>
                   <select><option>English</option><option>Hindi</option><option>Punjabi</option></select></div>
-                <div className="srow"><div><b>Send with Enter</b><small>Use Shift+Enter for a new line</small></div><Sw def /></div>
-                <div className="srow"><div><b>Show example prompts</b><small>Display suggestions on the start screen</small></div><Sw def /></div>
+                <div className="srow"><div><b>Send with Enter</b><small>Use Shift+Enter for a new line</small></div><Sw def/></div>
+                <div className="srow"><div><b>Show example prompts</b><small>Display suggestions on the start screen</small></div><Sw def/></div>
               </div>
 
               <div className={'panel' + (panel === 'appearance' ? ' on' : '')}>
@@ -1130,7 +1308,7 @@ export default function App() {
                       <button key={c} aria-label={c} className={accent === c ? 'on' : ''} style={{ background: c }} onClick={() => setAccent(c)} />
                     ))}
                   </div></div>
-                <div className="srow"><div><b>Reduce motion</b><small>Turn off animations</small></div><Sw onChange={setReduce} /></div>
+                <div className="srow"><div><b>Reduce motion</b><small>Turn off animations</small></div><Sw onChange="{setReduce}"/></div>
               </div>
 
               <div className={'panel' + (panel === 'model' ? ' on' : '')}>
@@ -1169,8 +1347,8 @@ export default function App() {
         </section>
       </main>
 
-      <MeshModal s={v3} onClose={close3d} />
-      <ShapeEditor open={shapeEd.open} initial={shapeEd.initial} material={mat} parentJob={shapeEd.parent} onClose={closeShape} onResult={addShapeResult} />
+      <MeshModal onClose={close3d} s={v3} onGoPricing={() => go('pricing')} />
+      <ShapeEditor initial={shapeEd.initial} material={mat} onClose={closeShape} onResult={addShapeResult} open={shapeEd.open} parentJob={shapeEd.parent}/>
       <Toasts list={toasts} onClose={id => setToasts(p => p.filter(x => x.id !== id))}
         onOpen={t => { setToasts(p => p.filter(x => x.id !== t.id)); openTurn(t.msgId) }} />
       <Confirm cf={cf} onClose={closeCf} />
@@ -1197,7 +1375,7 @@ function PricingView({ active }) {
           <div className="plan hot">
             <h4>Pro <span className="tag">POPULAR</span></h4>
             <div className="pr"><span className="amt">{price(29, 23)}</span><small> /month</small></div><small>For engineers and makers</small>
-            <ul><li>Unlimited generations</li><li>Parameter editing</li><li>Priority queue</li></ul>
+            <ul><li>Unlimited generations</li><li>Custom AI obstacle simulation</li><li>Priority queue</li></ul>
             <button className="btn p">Upgrade to Pro</button>
           </div>
           <div className="plan">

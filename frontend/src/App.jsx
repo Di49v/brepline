@@ -490,6 +490,8 @@ function MeshModal({ s, onClose, onGoPricing }) {
   const runCrashSim = async () => {
     setAuto(false)
     let cr = 0.22
+    let fMode = 'ductile_crumple'
+    let impAxis = null
     try {
       if (s.job) {
         const res = await simulatePhysics(s.job, {
@@ -501,7 +503,10 @@ function MeshModal({ s, onClose, onGoPricing }) {
         })
         if (res && res.physics) {
           setPhysData(res.physics)
-          cr = (res.physics.edge_cases?.crash_test?.crumple_ratio || 0.15) + (speed / 320) * 0.25
+          const ct = res.physics.edge_cases?.crash_test || {}
+          cr = ct.crumple_ratio || 0.22
+          fMode = ct.failure_mode || 'ductile_crumple'
+          impAxis = ct.impact_axis || res.physics.impact_axis || null
         }
       }
     } catch {
@@ -510,11 +515,11 @@ function MeshModal({ s, onClose, onGoPricing }) {
 
     const tStart = performance.now()
     const duration = 1800 // 1.8s 60fps impact animation
-    setSimAnim({ active: true, running: true, progress: 0, crumpleRatio: cr, obstacle })
+    setSimAnim({ active: true, running: true, progress: 0, crumpleRatio: cr, obstacle, failureMode: fMode, impactAxis: impAxis })
 
     const step = now => {
       const p = Math.min(1, (now - tStart) / duration)
-      setSimAnim({ active: true, running: p < 1, progress: p, crumpleRatio: cr, obstacle })
+      setSimAnim({ active: true, running: p < 1, progress: p, crumpleRatio: cr, obstacle, failureMode: fMode, impactAxis: impAxis })
       if (p < 1) requestAnimationFrame(step)
     }
     requestAnimationFrame(step)
@@ -1148,7 +1153,50 @@ export default function App() {
                       <div className="t">
                         <div className="body">
                           {loading ? (
-                            <Thinking state="busy" logs={M.logs} t0={M.t0} partialMesh={M.partialMesh} onStop={() => stopOne(M.id)} />
+                            <>
+                              <Thinking state="busy" logs={M.logs} t0={M.t0} partialMesh={null} onStop={() => stopOne(M.id)} />
+                              {M.partialMesh && M.partialMesh.verts && M.partialMesh.verts.length > 0 && (
+                                <div className="cad" style={{ marginTop: 10, borderStyle: 'dashed' }}>
+                                  <div
+                                    className="prev"
+                                    onClick={() => open3d({
+                                      job: M.id,
+                                      title: `${M.text.slice(0, 32)} (Building live…)`,
+                                      n: fname(M.text),
+                                      f: M.f,
+                                      m: M.m,
+                                      mesh: M.partialMesh,
+                                      bbox: [0, 0, 0],
+                                      mass_g: 0
+                                    })}
+                                  >
+                                    <Thumb mesh={M.partialMesh} alt="Live assembly progress" />
+                                  </div>
+                                  <div className="meta">
+                                    <div><small>Status</small>Compiling sub-parts…</div>
+                                    <div><small>Components</small>{(M.partialMesh.parts && M.partialMesh.parts.length) || 1} built</div>
+                                    <div><small>Preview</small>Interactive 3D Ready</div>
+                                  </div>
+                                  <div className="acts">
+                                    <button
+                                      className="btn p"
+                                      onClick={() => open3d({
+                                        job: M.id,
+                                        title: `${M.text.slice(0, 32)} (Building live…)`,
+                                        n: fname(M.text),
+                                        f: M.f,
+                                        m: M.m,
+                                        mesh: M.partialMesh,
+                                        bbox: [0, 0, 0],
+                                        mass_g: 0
+                                      })}
+                                    >
+                                      <Ic n="exp" />Open Live 3D Playground
+                                    </button>
+                                  </div>
+                                </div>
+                              )}
+                            </>
                           ) : v ? (
                             <>
                               <Thinking state="done" logs={v.think && v.think.logs} secs={v.think && v.think.secs} />

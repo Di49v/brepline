@@ -5,7 +5,7 @@
 // CAD coordinates are Z-up, millimetres. mesh = { verts:[x,y,z,...], tris:[i,j,k,...] }.
 import { useEffect, useRef, useState } from 'react'
 
-const FIT = 0.92
+const FIT = 0.68
 
 // Default engineering palette when a multi-part assembly has multiple named parts
 const DEFAULT_PART_HEX = [
@@ -183,20 +183,24 @@ export function drawMesh(ctx, w, h, mesh, o = {}) {
   const spanX = p.mx[0] - p.mn[0]
   const spanY = p.mx[1] - p.mn[1]
   const spanZ = p.mx[2] - p.mn[2]
-  const crashAxis = spanX >= spanY ? 0 : 1
+
+  // Axis detection: Vertical rockets/towers crash nose-first along +Z (axis 2); Cars/vehicles crash along +X (axis 0)
+  const crashAxis = (sim && sim.impactAxis === 'Z') || (spanZ > spanX * 1.35 && spanZ > spanY * 1.35)
+    ? 2
+    : (spanX >= spanY ? 0 : 1)
   const frontMax = p.mx[crashAxis]
   const frontSpan = Math.max(p.mx[crashAxis] - p.mn[crashAxis], 1)
 
   // Real-time simulation parameters (progress 0.0 -> 1.0)
   const simActive = sim && sim.active
   const prog = simActive ? Math.min(1, Math.max(0, sim.progress || 0)) : 0
-  const crumpleRatio = simActive ? Math.min(0.65, Math.max(0.04, sim.crumpleRatio || 0.18)) : 0
+  const crumpleRatio = simActive ? Math.min(0.70, Math.max(0.03, sim.crumpleRatio || 0.18)) : 0
   const obstacle = simActive ? (sim.obstacle || 'concrete_wall') : null
+  const failureMode = simActive ? (sim.failureMode || 'ductile_crumple') : 'ductile_crumple'
 
-  // Approach phase (prog 0 -> 0.45): model moves toward wall; Impact phase (0.45 -> 1.0): plastic crush
-  const impactPhase = prog <= 0.45 ? 0 : (prog - 0.45) / 0.55
+  const impactPhase = prog <= 0.42 ? 0 : (prog - 0.42) / 0.58
   const approachOffset = simActive && obstacle !== 'wind_and_thrust'
-    ? (prog <= 0.45 ? -(1 - prog / 0.45) * (frontSpan * 0.35) : 0)
+    ? (prog <= 0.42 ? -(1 - prog / 0.42) * (frontSpan * 0.30) : 0)
     : 0
   const wallCoord = frontMax - impactPhase * crumpleRatio * frontSpan
 
@@ -212,42 +216,71 @@ export function drawMesh(ctx, w, h, mesh, o = {}) {
       if (obstacle === 'wind_and_thrust') {
         // High-altitude diagonal crosswind shear + cantilever deflection along top (+Z)
         const zNorm = Math.max(0, (vz - p.mn[2]) / Math.max(spanZ, 1))
-        const flutter = Math.sin(prog * Math.PI * 4) * 0.25 + 0.75
-        const bendDeflect = (zNorm * zNorm) * (spanY * 0.08) * crumpleRatio * 3.0 * flutter
+        const flutter = Math.sin(prog * Math.PI * 5) * 0.28 + 0.72
+        const bendDeflect = (zNorm * zNorm) * (Math.max(spanX, spanY) * 0.10) * Math.max(crumpleRatio, 0.15) * 2.8 * flutter
         vy += bendDeflect
-        localStress = Math.min(1, zNorm * 1.15 * flutter)
+        localStress = Math.min(1, zNorm * 1.2 * flutter)
       } else {
-        // Concrete Wall or Bollard Pole Frontal Crash along crashAxis
-        const coord = (crashAxis === 0 ? vx : vy) + approachOffset
-        if (crashAxis === 0) vx = coord; else vy = coord
+        // Move vehicle/rocket along its primary travel axis toward the obstacle
+        let primary = (crashAxis === 2 ? vz : (crashAxis === 0 ? vx : vy)) + approachOffset
+        if (crashAxis === 2) vz = primary
+        else if (crashAxis === 0) vx = primary
+        else vy = primary
 
         const latCoord = crashAxis === 0 ? (vy - c[1]) : (vx - c[0])
         const latSpan = Math.max(crashAxis === 0 ? spanY : spanX, 1)
-        const inPoleZone = obstacle === 'bollard_pole' ? Math.abs(latCoord) < latSpan * 0.24 : true
+        const poleRadius = latSpan * 0.18
+        const distFromPoleCenter = Math.abs(latCoord)
+        const inContact = obstacle === 'bollard_pole' ? distFromPoleCenter < poleRadius : true
 
-        if (impactPhase > 0 && coord > wallCoord) {
-          const pen = coord - wallCoord
-          if (inPoleZone) {
-            // Plastic crush against rigid barrier/pole + Poisson lateral bulge
-            const clamped = wallCoord + pen * 0.08
-            if (crashAxis === 0) {
-              vx = clamped
-              vy += (vy >= c[1] ? 1 : -1) * pen * 0.22
+        if (impactPhase > 0 && primary > wallCoord) {
+          const pen = primary - wallCoord
+          if (inContact) {
+            if (failureMode === 'brittle_shatter') {
+              // Brittle shatter (Glass / PLA): fragments scatter outward and downward!
+              const hash = Math.sin(i * 12.9898) * 43758.5453
+              const frac = hash - Math.floor(hash)
+              const clamped = wallCoord - frac * pen * 0.35
+              if (crashAxis === 2) vz = clamped
+              else if (crashAxis === 0) vx = clamped
+              else vy = clamped
+              vy += (vy >= c[1] ? 1 : -1) * pen * (0.45 + frac * 0.8)
+              vz -= pen * 0.35 * frac
             } else {
-              vy = clamped
-              vx += (vx >= c[0] ? 1 : -1) * pen * 0.22
+              // Ductile accordion crumple (Al 6061 / Steel / Titanium) with harmonic folding ripples
+              const foldWave = Math.sin((pen / Math.max(frontSpan * 0.05, 1)) * Math.PI * 2) * 0.08
+              const clamped = wallCoord + pen * 0.06
+              if (crashAxis === 2) {
+                vz = clamped
+                vx += (vx - c[0]) * (0.28 + foldWave) * (pen / frontSpan)
+                vy += (vy - c[1]) * (0.28 + foldWave) * (pen / frontSpan)
+              } else if (crashAxis === 0) {
+                vx = clamped
+                vy += (vy >= c[1] ? 1 : -1) * pen * (0.24 + foldWave)
+                vz += ((vz - p.mn[2]) / Math.max(spanZ, 1)) * pen * 0.22
+              } else {
+                vy = clamped
+                vx += (vx >= c[0] ? 1 : -1) * pen * (0.24 + foldWave)
+              }
             }
-            vz += ((vz - p.mn[2]) / Math.max(spanZ, 1)) * pen * 0.18
-            localStress = Math.min(1, 0.55 + (pen / (crumpleRatio * frontSpan + 1e-3)) * 0.65)
-          } else {
-            // Wrap around bollard pole
-            localStress = Math.min(0.75, (pen / (crumpleRatio * frontSpan + 1e-3)) * 0.5)
+            localStress = Math.min(1, 0.62 + (pen / (crumpleRatio * frontSpan + 1e-3)) * 0.55)
+          } else if (obstacle === 'bollard_pole') {
+            // Outer fenders wrap forward around the central bollard pole!
+            const wrapFactor = Math.exp(-(distFromPoleCenter - poleRadius) / (latSpan * 0.25))
+            const wrapShift = pen * wrapFactor * 0.65
+            if (crashAxis === 2) vz -= wrapShift
+            else if (crashAxis === 0) {
+              vx -= wrapShift
+              vy -= Math.sign(latCoord) * wrapShift * 0.25
+            } else {
+              vy -= wrapShift
+            }
+            localStress = Math.min(0.88, wrapFactor * 0.85)
           }
         } else if (impactPhase > 0) {
-          // Elastic stress wave propagation behind the crush zone
-          const distToWall = Math.max(0, wallCoord - coord)
-          const decay = Math.exp(-distToWall / (frontSpan * 0.28))
-          localStress = decay * impactPhase * 0.65
+          const distToWall = Math.max(0, wallCoord - primary)
+          const decay = Math.exp(-distToWall / (frontSpan * 0.26))
+          localStress = decay * impactPhase * 0.68
         }
       }
       vStress[i] = localStress
@@ -327,17 +360,28 @@ export function drawMesh(ctx, w, h, mesh, o = {}) {
   const seam = m < 60000
   ctx.lineWidth = 0.7
   let lastFill = ''
+  let lastAlpha = 1.0
   for (let k = 0; k < m; k++) {
     const t = order[k]
     const a = T[t * 3] * 3, b = T[t * 3 + 1] * 3, d = T[t * 3 + 2] * 3
     let col
+    let alpha = 1.0
     if (simActive && Stress[t] > 6) {
       col = HEATMAP_PALETTE[Stress[t]]
     } else if (partPalettes && triPart && triPart[t] !== undefined) {
       const pIdx = triPart[t] % partPalettes.length
+      const pname = (partNames[pIdx] || '').toLowerCase()
+      const pHex = ((partColors && partColors[partNames[pIdx]]) || '').toLowerCase()
+      if (pname.includes('glass') || pname.includes('window') || pname.includes('windshield') || pname.includes('canopy') || pHex === '#38bdf8') {
+        alpha = 0.52
+      }
       col = partPalettes[pIdx][S[t]]
     } else {
       col = defaultPal[S[t]]
+    }
+    if (alpha !== lastAlpha) {
+      lastAlpha = alpha
+      ctx.globalAlpha = alpha
     }
     if (col !== lastFill) {
       lastFill = col
@@ -348,30 +392,40 @@ export function drawMesh(ctx, w, h, mesh, o = {}) {
     ctx.moveTo(P[a], P[a + 1]); ctx.lineTo(P[b], P[b + 1]); ctx.lineTo(P[d], P[d + 1])
     ctx.closePath()
     ctx.fill()
-    if (seam) ctx.stroke()
+    if (seam && alpha === 1.0) ctx.stroke()
   }
+  ctx.globalAlpha = 1.0
 
-  // Draw 3D Obstacle Overlay (Concrete Wall / Bollard Pole / Wind Arrows) when simulation is active
+  // Draw 3D Obstacle Overlay aligned with crashAxis (Z-top for rockets, X-front for vehicles)
   if (simActive) {
     const pr = makeProj(p, w, h, { yaw, pitch, zoom })
     ctx.save()
     if (obstacle === 'concrete_wall') {
-      const wX = crashAxis === 0 ? wallCoord : p.c[0]
-      const wY = crashAxis === 1 ? wallCoord : p.c[1]
-      const corners = crashAxis === 0
-        ? [
-            pr(wX, p.mn[1] - spanY * 0.2, p.mn[2]),
-            pr(wX, p.mx[1] + spanY * 0.2, p.mn[2]),
-            pr(wX, p.mx[1] + spanY * 0.2, p.mx[2] + spanZ * 0.2),
-            pr(wX, p.mn[1] - spanY * 0.2, p.mx[2] + spanZ * 0.2),
-          ]
-        : [
-            pr(p.mn[0] - spanX * 0.2, wY, p.mn[2]),
-            pr(p.mx[0] + spanX * 0.2, wY, p.mn[2]),
-            pr(p.mx[0] + spanX * 0.2, wY, p.mx[2] + spanZ * 0.2),
-            pr(p.mn[0] - spanX * 0.2, wY, p.mx[2] + spanZ * 0.2),
-          ]
-      ctx.fillStyle = 'rgba(239, 68, 68, 0.18)'
+      let corners
+      if (crashAxis === 2) {
+        // Horizontal ceiling barrier above rocket nose cone (+Z)
+        corners = [
+          pr(p.mn[0] - spanX * 0.35, p.mn[1] - spanY * 0.35, wallCoord),
+          pr(p.mx[0] + spanX * 0.35, p.mn[1] - spanY * 0.35, wallCoord),
+          pr(p.mx[0] + spanX * 0.35, p.mx[1] + spanY * 0.35, wallCoord),
+          pr(p.mn[0] - spanX * 0.35, p.mx[1] + spanY * 0.35, wallCoord),
+        ]
+      } else if (crashAxis === 0) {
+        corners = [
+          pr(wallCoord, p.mn[1] - spanY * 0.25, p.mn[2]),
+          pr(wallCoord, p.mx[1] + spanY * 0.25, p.mn[2]),
+          pr(wallCoord, p.mx[1] + spanY * 0.25, p.mx[2] + spanZ * 0.25),
+          pr(wallCoord, p.mn[1] - spanY * 0.25, p.mx[2] + spanZ * 0.25),
+        ]
+      } else {
+        corners = [
+          pr(p.mn[0] - spanX * 0.25, wallCoord, p.mn[2]),
+          pr(p.mx[0] + spanX * 0.25, wallCoord, p.mn[2]),
+          pr(p.mx[0] + spanX * 0.25, wallCoord, p.mx[2] + spanZ * 0.25),
+          pr(p.mn[0] - spanX * 0.25, wallCoord, p.mx[2] + spanZ * 0.25),
+        ]
+      }
+      ctx.fillStyle = 'rgba(239, 68, 68, 0.22)'
       ctx.strokeStyle = '#ef4444'
       ctx.lineWidth = 2
       ctx.beginPath()
@@ -382,10 +436,10 @@ export function drawMesh(ctx, w, h, mesh, o = {}) {
     } else if (obstacle === 'bollard_pole') {
       const pX = crashAxis === 0 ? wallCoord : p.c[0]
       const pY = crashAxis === 1 ? wallCoord : p.c[1]
-      const bot = pr(pX, pY, p.mn[2])
-      const top = pr(pX, pY, p.mx[2] + spanZ * 0.25)
+      const bot = crashAxis === 2 ? pr(p.mn[0] - spanX * 0.3, p.c[1], wallCoord) : pr(pX, pY, p.mn[2])
+      const top = crashAxis === 2 ? pr(p.mx[0] + spanX * 0.3, p.c[1], wallCoord) : pr(pX, pY, p.mx[2] + spanZ * 0.25)
       ctx.strokeStyle = '#f59e0b'
-      ctx.lineWidth = Math.max(10, diag * 0.04 * s)
+      ctx.lineWidth = Math.max(12, diag * 0.045 * s)
       ctx.lineCap = 'round'
       ctx.beginPath()
       ctx.moveTo(bot[0], bot[1])
@@ -395,14 +449,15 @@ export function drawMesh(ctx, w, h, mesh, o = {}) {
       ctx.strokeStyle = '#38bdf8'
       ctx.fillStyle = '#38bdf8'
       ctx.lineWidth = 2
-      for (let k = 0; k < 4; k++) {
-        const zLvl = p.mn[2] + ((k + 0.5) / 4) * spanZ
-        const start = pr(p.c[0], p.mn[1] - spanY * 0.45, zLvl)
+      for (let k = 0; k < 5; k++) {
+        const zLvl = p.mn[2] + ((k + 0.5) / 5) * spanZ
+        const start = pr(p.c[0], p.mn[1] - spanY * 0.55, zLvl)
         const end = pr(p.c[0], p.mn[1] - spanY * 0.05, zLvl)
         ctx.beginPath()
         ctx.moveTo(start[0], start[1])
         ctx.lineTo(end[0], end[1])
         ctx.stroke()
+        head(ctx, end, start)
       }
     }
     ctx.restore()
@@ -705,7 +760,7 @@ export function thumbnail(mesh, w = 720, h = 440, o = {}) {
   const c = document.createElement('canvas')
   c.width = w
   c.height = h
-  drawMesh(c.getContext('2d'), w, h, mesh, { yaw: -0.75, pitch: 0.5, ...o })
+  drawMesh(c.getContext('2d'), w, h, mesh, { yaw: -0.75, pitch: 0.5, zoom: 0.88, ...o })
   return c.toDataURL('image/png')
 }
 

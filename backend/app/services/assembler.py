@@ -95,10 +95,20 @@ class CadAssembler:
         lines.append("parts = {}")
         for pid in part_order:
             fn_name = func_map[pid]
+            pdata = compiled_parts[pid]
             pos = pos_map.get(pid) or [0.0, 0.0, 0.0]
+            bmin = pdata.get("bbox_min") or [0.0, 0.0, 0.0]
             tx = float(pos[0]) if len(pos) > 0 else 0.0
             ty = float(pos[1]) if len(pos) > 1 else 0.0
             tz = float(pos[2]) if len(pos) > 2 else 0.0
+
+            # Anti-Double-Translation Guard: if the sub-part script already placed its base at `tz` (e.g. bmin[2] >= tz * 0.8),
+            # do not add `tz` a second time!
+            if tz > 10.0 and len(bmin) > 2 and float(bmin[2]) >= tz * 0.75:
+                tz = 0.0
+            if abs(tx) > 10.0 and len(bmin) > 0 and abs(float(bmin[0]) - tx) < abs(tx) * 0.35:
+                tx = 0.0
+
             if abs(tx) > 1e-6 or abs(ty) > 1e-6 or abs(tz) > 1e-6:
                 lines.append(f"parts[{pid!r}] = {fn_name}().translate(({tx}, {ty}, {tz}))")
             else:

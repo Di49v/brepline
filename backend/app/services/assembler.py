@@ -1,13 +1,16 @@
 """
-Parametric Multi-Part B-Rep Assembler.
+Parametric Multi-Part B-Rep Assembler with Native XCAF Color Support.
 
 Encapsulates individual verified sub-part CadQuery scripts into isolated
 Python functions, applies spatial (X, Y, Z) translations, and produces a
-single self-contained master CadQuery script that defines both `parts`
-(for multi-part 3D viewer coloring/inspection) and `result` (for STEP/STL export).
+single self-contained master CadQuery script that defines:
+- `parts`: Dict[str, cq.Workplane] for multi-part 3D viewer mesh segmentation
+- `part_colors`: Dict[str, str] mapping part_id -> hex color
+- `cad_assembly`: cq.Assembly with embedded `cq.Color(r, g, b, a)` for colored STEP export
+- `result`: cq.Compound for STL export and B-Rep volume/mass calculation
 """
 import re
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 
 
 class CadAssembler:
@@ -20,6 +23,21 @@ class CadAssembler:
             clean = f"part_{clean}"
         return clean
 
+    @staticmethod
+    def hex_to_rgba(hex_str: str, is_glass: bool = False) -> Tuple[float, float, float, float]:
+        """Converts a '#RRGGBB' hex string into normalized (r, g, b, a) floats in [0.0, 1.0]."""
+        h = str(hex_str or "#94a3b8").lstrip("#").strip()
+        if len(h) == 3:
+            h = "".join(c * 2 for c in h)
+        try:
+            r = int(h[0:2], 16) / 255.0
+            g = int(h[2:4], 16) / 255.0
+            b = int(h[4:6], 16) / 255.0
+        except ValueError:
+            r, g, b = 0.58, 0.64, 0.72
+        alpha = 0.45 if is_glass else 1.0
+        return (round(r, 3), round(g, 3), round(b, 3), alpha)
+
     @classmethod
     def stitch_assembly(
         cls,
@@ -28,7 +46,8 @@ class CadAssembler:
     ) -> str:
         """
         Wraps each sub-part's code inside `def _build_<id>():` and combines
-        them into `parts = {...}` and `result = ...`.
+        them into `parts = {...}`, `part_colors = {...}`, `cad_assembly = cq.Assembly()`,
+        and `result = ...`.
         """
         if not compiled_parts:
             return ""
@@ -46,25 +65,27 @@ class CadAssembler:
             "import cadquery as cq",
             "",
             "# ======================================================================",
-            "# BREPLINE MODULAR MULTI-PART ASSEMBLY",
-            "# Each sub-component is encapsulated in its own namespace and cached.",
+            "# BREPLINE MODULAR MULTI-PART ASSEMBLY (WITH XCAF STEP COLORS)",
             "# ======================================================================",
             ""
         ]
 
         part_order: List[str] = []
         pos_map: Dict[str, List[float]] = {}
+        color_map: Dict[str, str] = {}
 
         for bp in bom_parts:
             pid = bp.get("id") or bp.get("part_id")
             if pid and pid in compiled_parts:
                 part_order.append(pid)
                 pos_map[pid] = bp.get("position_mm") or bp.get("translate_mm") or [0.0, 0.0, 0.0]
+                color_map[pid] = bp.get("color_hex") or compiled_parts[pid].get("color_hex") or "#94a3b8"
 
         for pid in compiled_parts:
             if pid not in part_order:
                 part_order.append(pid)
                 pos_map[pid] = compiled_parts[pid].get("translate_mm") or [0.0, 0.0, 0.0]
+                color_map[pid] = compiled_parts[pid].get("color_hex") or "#94a3b8"
 
         func_map: Dict[str, str] = {}
 
@@ -93,6 +114,9 @@ class CadAssembler:
 
         lines.append("# --- Assemble & Translate Sub-Parts into World Coordinates ---")
         lines.append("parts = {}")
+        lines.append("part_colors = {}")
+        lines.append("cad_assembly = cq.Assembly()")
+
         for pid in part_order:
             fn_name = func_map[pid]
             pdata = compiled_parts[pid]
@@ -113,6 +137,12 @@ class CadAssembler:
                 lines.append(f"parts[{pid!r}] = {fn_name}().translate(({tx}, {ty}, {tz}))")
             else:
                 lines.append(f"parts[{pid!r}] = {fn_name}()")
+
+            hex_col = color_map.get(pid, "#94a3b8")
+            is_glass = any(w in pid.lower() for w in ("glass", "window", "windshield", "canopy")) or hex_col.lower() == "#38bdf8"
+            r, g, b, a = cls.hex_to_rgba(hex_col, is_glass=is_glass)
+            lines.append(f"part_colors[{pid!r}] = {hex_col!r}")
+            lines.append(f"cad_assembly.add(parts[{pid!r}], name={pid!r}, color=cq.Color({r}, {g}, {b}, {a}))")
 
         lines.append("")
         lines.append("# --- Combine into Master Solid / Compound for Export ---")

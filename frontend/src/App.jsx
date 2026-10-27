@@ -20,6 +20,8 @@ const SUB = [
 ]
 const ACCENTS = ['#f26a1b', '#e0a100', '#2f7de1', '#2fb67c']
 const CHIPS = [
+  ['SPORTS CAR', 'Build a GT sports car with a sculpted aerodynamic body shell, translucent glass windshield canopy, 4 rubber wheels with alloy rims, and a rear spoiler'],
+  ['ROCKET', 'Build a multi-stage sounding rocket with nose cone, fuselage, boat-tail nozzle, and 4 swept fins'],
   ['BRACKET', 'L-bracket 60 mm wide, 40 mm base, 40 mm tall, 5 mm thick, two 6 mm mounting holes in the base'],
   ['GEAR', 'Create a 24-tooth spur gear, module 2, 10 mm bore, 8 mm thick'],
   ['ENCLOSURE', 'Electronics enclosure 80 x 50 x 30 mm, 2 mm walls, open top, USB cutout on one side'],
@@ -578,6 +580,7 @@ function MeshModal({ s, onClose, onGoPricing }) {
                 {[
                   ['concrete_wall', '🧱 Frontal Concrete Wall Impact'],
                   ['bollard_pole', '💈 Center Bollard Pole Impact'],
+                  ['spike_strip', '📌 Road Spike Strip (Tire Blowout)'],
                   ['wind_and_thrust', '🌪️ Crosswind Shear & 6G Buckling']
                 ].map(([id, label]) => (
                   <button

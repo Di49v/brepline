@@ -460,6 +460,26 @@ export function drawMesh(ctx, w, h, mesh, o = {}) {
         head(ctx, end, start)
       }
     }
+    else if (obstacle === 'spike_strip') {
+     // Vehicle drives forward along X over road spikes at Z = p.mn[2] -> lower tires puncture & deflate!
+     const travel = (prog - 0.5) * (spanX * 0.45)
+     vx += travel
+     const zFromGround = vz - p.mn[2]
+     const tireZoneHeight = spanZ * 0.32
+     if (prog > 0.35 && zFromGround < tireZoneHeight) {
+       const deflateProg = (prog - 0.35) / 0.65
+       // Bottom of tires flatten/compress upward into rim + rubber shreds outward
+       const crushUp = (tireZoneHeight - zFromGround) * 0.55 * deflateProg
+       vz += crushUp
+       vy += (vy >= c[1] ? 1 : -1) * crushUp * 0.45 * Math.sin(i * 7.13)
+       localStress = Math.min(1, 0.75 + (1 - zFromGround / tireZoneHeight) * 0.4)
+     } else if (prog > 0.35) {
+       // Entire chassis drops lower as tires lose air pressure!
+       const drop = tireZoneHeight * 0.28 * ((prog - 0.35) / 0.65)
+       vz -= drop
+       localStress = 0.25
+     }
+   }
     ctx.restore()
   }
 }

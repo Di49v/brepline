@@ -1,147 +1,178 @@
 """
-First-Principles Analytical B-Rep Physics & Constitutive Failure Engine.
+Object-Oriented Multi-Physics, Material Constitutive & Obstacle Simulation Engine.
 
-Supports:
-1. Material Constitutive Failure Modes:
-   - `ductile_crumple` (Al 6061, Steel, Titanium, Brass, Copper)
-   - `brittle_shatter` (Glass, PLA)
-   - `anisotropic_delamination` (Carbon Fiber, ABS)
-   - `hyperelastic_rebound` (Rubber)
-2. Domain-Aware Operating Regimes (`aerospace_rocket`, `ground_vehicle`, `structural_part`)
-   with realistic speed thresholds, impact axes, and human/structural G-load limits.
-3. Role-Aware Sub-Part Material Optimizer (never suggests opaque metal for glass windows
-   or rigid metal for rubber tires).
-4. Exact Multi-Material Weighted Mass Calculation across all sub-parts.
+Architecture:
+- `AnimationBehavior`: Encapsulates visual 60 FPS vertex deformation parameters
+  (deform_mode, shatter_threshold_mpa, fold_frequency, puncture_vulnerable, rebound_elasticity).
+- `MaterialProfile`: Encapsulates mechanical & economic properties alongside its `AnimationBehavior`.
+- `ObstaclePreset`: Encapsulates test-rig geometry, contact zone, sharpness (for tire/hull puncture),
+  and stress concentration factors.
+- `PhysicsEngine`: Executes deterministic structural, aerodynamic, buckling, puncture, and crash
+  audits across single solids and multi-material assemblies.
 """
 import math
+from dataclasses import dataclass, asdict
 from typing import Dict, Any, List, Optional
 
-# Comprehensive Material Engineering Database
-# matches frontend MATS = ['Al 6061', 'Steel', 'Titanium', 'Brass', 'Copper', 'PLA', 'ABS']
-MATERIAL_LIBRARY: Dict[str, Dict[str, Any]] = {
-    "Al 6061": {
-        "density_g_cm3": 2.70,
-        "yield_mpa": 276.0,
-        "ultimate_mpa": 310.0,
-        "youngs_gpa": 68.9,
-        "sea_kj_kg": 28.0,   # Specific Energy Absorption in progressive crush
-        "cost_usd_kg": 3.20,
-        "color_hex": "#94a3b8",
-        "failure_mode": "ductile_crumple",
-        "ductility": 0.85
-    },
-    "Steel": {
-        "density_g_cm3": 7.85,
-        "yield_mpa": 350.0,
-        "ultimate_mpa": 480.0,
-        "youngs_gpa": 200.0,
-        "sea_kj_kg": 22.0,
-        "cost_usd_kg": 1.10,
-        "color_hex": "#ef4444",
-        "failure_mode": "ductile_crumple",
-        "ductility": 0.90
-    },
-    "Titanium": {
-        "density_g_cm3": 4.43,
-        "yield_mpa": 880.0,
-        "ultimate_mpa": 950.0,
-        "youngs_gpa": 113.8,
-        "sea_kj_kg": 42.0,
-        "cost_usd_kg": 28.00,
-        "color_hex": "#cbd5e1",
-        "failure_mode": "ductile_crumple",
-        "ductility": 0.70
-    },
-    "Carbon Fiber": {
-        "density_g_cm3": 1.60,
-        "yield_mpa": 600.0,
-        "ultimate_mpa": 750.0,
-        "youngs_gpa": 135.0,
-        "sea_kj_kg": 55.0,
-        "cost_usd_kg": 42.00,
-        "color_hex": "#334155",
-        "failure_mode": "anisotropic_delamination",
-        "ductility": 0.25
-    },
-    "Brass": {
-        "density_g_cm3": 8.50,
-        "yield_mpa": 200.0,
-        "ultimate_mpa": 340.0,
-        "youngs_gpa": 105.0,
-        "sea_kj_kg": 14.0,
-        "cost_usd_kg": 6.50,
-        "color_hex": "#eab308",
-        "failure_mode": "ductile_crumple",
-        "ductility": 0.80
-    },
-    "Copper": {
-        "density_g_cm3": 8.96,
-        "yield_mpa": 70.0,
-        "ultimate_mpa": 220.0,
-        "youngs_gpa": 117.0,
-        "sea_kj_kg": 11.0,
-        "cost_usd_kg": 9.40,
-        "color_hex": "#f97316",
-        "failure_mode": "ductile_crumple",
-        "ductility": 0.95
-    },
-    "Glass": {
-        "density_g_cm3": 2.50,
-        "yield_mpa": 45.0,
-        "ultimate_mpa": 50.0,
-        "youngs_gpa": 70.0,
-        "sea_kj_kg": 2.5,
-        "cost_usd_kg": 2.40,
-        "color_hex": "#38bdf8",
-        "failure_mode": "brittle_shatter",
-        "ductility": 0.02
-    },
-    "Rubber": {
-        "density_g_cm3": 1.15,
-        "yield_mpa": 18.0,
-        "ultimate_mpa": 25.0,
-        "youngs_gpa": 0.05,
-        "sea_kj_kg": 12.0,
-        "cost_usd_kg": 2.80,
-        "color_hex": "#1e293b",
-        "failure_mode": "hyperelastic_rebound",
-        "ductility": 1.00
-    },
-    "PLA": {
-        "density_g_cm3": 1.24,
-        "yield_mpa": 50.0,
-        "ultimate_mpa": 60.0,
-        "youngs_gpa": 3.5,
-        "sea_kj_kg": 6.5,
-        "cost_usd_kg": 18.00,
-        "color_hex": "#2fb67c",
-        "failure_mode": "brittle_shatter",
-        "ductility": 0.12
-    },
-    "ABS": {
-        "density_g_cm3": 1.04,
-        "yield_mpa": 42.0,
-        "ultimate_mpa": 48.0,
-        "youngs_gpa": 2.3,
-        "sea_kj_kg": 10.5,
-        "cost_usd_kg": 16.00,
-        "color_hex": "#a855f7",
-        "failure_mode": "anisotropic_delamination",
-        "ductility": 0.45
-    },
+
+@dataclass(frozen=True)
+class AnimationBehavior:
+    """Defines how a material visually deforms or fractures in the 60 FPS 3D viewer."""
+    deform_mode: str          # 'ductile_crumple' | 'brittle_shatter' | 'anisotropic_delamination' | 'hyperelastic_rebound'
+    ductility: float          # 0.0 (glass) -> 1.0 (rubber)
+    shatter_stress_mpa: float # Stress above which triangles fragment/scatter outward
+    fold_wavelength_mm: float # Accordion ripple wavelength during plastic compression
+    puncture_vulnerable: bool # True if sharp obstacles (spike strip) cause deflation/blowout
+    opacity: float = 1.0      # 0.52 for translucent glazing, 1.0 for opaque solids
+
+
+@dataclass(frozen=True)
+class MaterialProfile:
+    """OOP Material definition combining engineering constants with visual animation behavior."""
+    name: str
+    density_g_cm3: float
+    yield_mpa: float
+    ultimate_mpa: float
+    youngs_gpa: float
+    sea_kj_kg: float
+    cost_usd_kg: float
+    color_hex: str
+    animation: AnimationBehavior
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        d["failure_mode"] = self.animation.deform_mode
+        d["ductility"] = self.animation.ductility
+        return d
+
+
+@dataclass(frozen=True)
+class ObstaclePreset:
+    """OOP Obstacle definition for virtual proving-ground simulations."""
+    id: str
+    name: str
+    contact_zone: str             # 'frontal_full' | 'frontal_concentrated' | 'undercarriage_tires' | 'aerodynamic_lateral'
+    stress_concentration: float   # Multiplier on local contact stress
+    sharpness_factor: float       # 0.0 (blunt wall) -> 1.0 (razor spike strip)
+    description: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+# --- Registry of OOP Material Profiles ---
+MATERIAL_OBJECTS: Dict[str, MaterialProfile] = {
+    "Al 6061": MaterialProfile(
+        name="Al 6061", density_g_cm3=2.70, yield_mpa=276.0, ultimate_mpa=310.0,
+        youngs_gpa=68.9, sea_kj_kg=28.0, cost_usd_kg=3.20, color_hex="#94a3b8",
+        animation=AnimationBehavior("ductile_crumple", 0.85, 310.0, 120.0, False, 1.0)
+    ),
+    "Steel": MaterialProfile(
+        name="Steel", density_g_cm3=7.85, yield_mpa=350.0, ultimate_mpa=480.0,
+        youngs_gpa=200.0, sea_kj_kg=22.0, cost_usd_kg=1.10, color_hex="#ef4444",
+        animation=AnimationBehavior("ductile_crumple", 0.90, 480.0, 95.0, False, 1.0)
+    ),
+    "Titanium": MaterialProfile(
+        name="Titanium", density_g_cm3=4.43, yield_mpa=880.0, ultimate_mpa=950.0,
+        youngs_gpa=113.8, sea_kj_kg=42.0, cost_usd_kg=28.00, color_hex="#cbd5e1",
+        animation=AnimationBehavior("ductile_crumple", 0.70, 950.0, 80.0, False, 1.0)
+    ),
+    "Carbon Fiber": MaterialProfile(
+        name="Carbon Fiber", density_g_cm3=1.60, yield_mpa=600.0, ultimate_mpa=750.0,
+        youngs_gpa=135.0, sea_kj_kg=55.0, cost_usd_kg=42.00, color_hex="#334155",
+        animation=AnimationBehavior("anisotropic_delamination", 0.22, 650.0, 60.0, False, 1.0)
+    ),
+    "Brass": MaterialProfile(
+        name="Brass", density_g_cm3=8.50, yield_mpa=200.0, ultimate_mpa=340.0,
+        youngs_gpa=105.0, sea_kj_kg=14.0, cost_usd_kg=6.50, color_hex="#eab308",
+        animation=AnimationBehavior("ductile_crumple", 0.80, 340.0, 110.0, False, 1.0)
+    ),
+    "Copper": MaterialProfile(
+        name="Copper", density_g_cm3=8.96, yield_mpa=70.0, ultimate_mpa=220.0,
+        youngs_gpa=117.0, sea_kj_kg=11.0, cost_usd_kg=9.40, color_hex="#f97316",
+        animation=AnimationBehavior("ductile_crumple", 0.95, 220.0, 140.0, False, 1.0)
+    ),
+    "Glass": MaterialProfile(
+        name="Glass", density_g_cm3=2.50, yield_mpa=45.0, ultimate_mpa=50.0,
+        youngs_gpa=70.0, sea_kj_kg=2.5, cost_usd_kg=2.40, color_hex="#38bdf8",
+        animation=AnimationBehavior("brittle_shatter", 0.02, 45.0, 20.0, True, 0.52)
+    ),
+    "Rubber": MaterialProfile(
+        name="Rubber", density_g_cm3=1.15, yield_mpa=18.0, ultimate_mpa=25.0,
+        youngs_gpa=0.05, sea_kj_kg=12.0, cost_usd_kg=2.80, color_hex="#1e293b",
+        animation=AnimationBehavior("hyperelastic_rebound", 1.00, 90.0, 180.0, True, 1.0)
+    ),
+    "PLA": MaterialProfile(
+        name="PLA", density_g_cm3=1.24, yield_mpa=50.0, ultimate_mpa=60.0,
+        youngs_gpa=3.5, sea_kj_kg=6.5, cost_usd_kg=18.00, color_hex="#2fb67c",
+        animation=AnimationBehavior("brittle_shatter", 0.12, 55.0, 40.0, True, 1.0)
+    ),
+    "ABS": MaterialProfile(
+        name="ABS", density_g_cm3=1.04, yield_mpa=42.0, ultimate_mpa=48.0,
+        youngs_gpa=2.3, sea_kj_kg=10.5, cost_usd_kg=16.00, color_hex="#a855f7",
+        animation=AnimationBehavior("anisotropic_delamination", 0.45, 48.0, 75.0, False, 1.0)
+    ),
 }
 
+# Backward-compatible dictionary exports
+MATERIAL_LIBRARY: Dict[str, Dict[str, Any]] = {
+    k: v.to_dict() for k, v in MATERIAL_OBJECTS.items()
+}
 MATERIAL_DENSITIES_G_CM3: Dict[str, float] = {
-    k: v["density_g_cm3"] for k, v in MATERIAL_LIBRARY.items()
+    k: v.density_g_cm3 for k, v in MATERIAL_OBJECTS.items()
+}
+
+# --- Registry of OOP Obstacle Presets ---
+OBSTACLE_PRESETS: Dict[str, ObstaclePreset] = {
+    "concrete_wall": ObstaclePreset(
+        id="concrete_wall",
+        name="Frontal Concrete Barrier Wall",
+        contact_zone="frontal_full",
+        stress_concentration=1.0,
+        sharpness_factor=0.0,
+        description="Full-width rigid concrete barrier testing progressive crumple-zone absorption."
+    ),
+    "bollard_pole": ObstaclePreset(
+        id="bollard_pole",
+        name="Center Steel Bollard Pole",
+        contact_zone="frontal_concentrated",
+        stress_concentration=2.1,
+        sharpness_factor=0.35,
+        description="Concentrated central cylindrical pole testing frame rail intrusion and fender wrap."
+    ),
+    "spike_strip": ObstaclePreset(
+        id="spike_strip",
+        name="Road Spike Strip / Sharp Debris",
+        contact_zone="undercarriage_tires",
+        stress_concentration=3.5,
+        sharpness_factor=1.0,
+        description="High-penetration road spikes testing tire blowout/deflation and undercarriage armor."
+    ),
+    "wind_and_thrust": ObstaclePreset(
+        id="wind_and_thrust",
+        name="Crosswind Shear & 6G Buckling",
+        contact_zone="aerodynamic_lateral",
+        stress_concentration=1.0,
+        sharpness_factor=0.0,
+        description="High-altitude diagonal gust shear and 6G axial compression buckling."
+    ),
 }
 
 
 class PhysicsEngine:
-    """Domain-aware structural, aerodynamic, and crash failure-mode analyzer."""
+    """Domain-aware OOP structural, aerodynamic, puncture, and crash failure-mode analyzer."""
 
     @staticmethod
     def get_material(name: str) -> Dict[str, Any]:
         return MATERIAL_LIBRARY.get(name, MATERIAL_LIBRARY["Al 6061"])
+
+    @staticmethod
+    def get_material_obj(name: str) -> MaterialProfile:
+        return MATERIAL_OBJECTS.get(name, MATERIAL_OBJECTS["Al 6061"])
+
+    @staticmethod
+    def get_obstacle_obj(obstacle_id: str) -> ObstaclePreset:
+        return OBSTACLE_PRESETS.get(obstacle_id, OBSTACLE_PRESETS["concrete_wall"])
 
     @staticmethod
     def detect_domain(prompt: str, bbox: List[float]) -> Dict[str, Any]:
@@ -204,18 +235,12 @@ class PhysicsEngine:
         obstacle: str = "concrete_wall",
         prompt: str = ""
     ) -> Dict[str, Any]:
-        """
-        Runs a comprehensive multi-physics edge-case evaluation:
-        1. Mass, Volume, and Fill Factor (Structural Packing Fraction)
-        2. Crash / Impact Simulation (Concrete Wall vs. Cylindrical Bollard Pole)
-        3. Aerodynamic Crosswind Bending & Axial Euler Buckling
-        4. Per-Subpart Safety Factor & Material Wastage / Lightweighting Optimizer
-        """
-        mat_props = cls.get_material(material)
-        rho = mat_props["density_g_cm3"]
-        sigma_y = mat_props["yield_mpa"]  # N/mm^2
-        youngs_mpa = mat_props["youngs_gpa"] * 1000.0  # N/mm^2
-        failure_mode = mat_props.get("failure_mode", "ductile_crumple")
+        mat_obj = cls.get_material_obj(material)
+        obs_obj = cls.get_obstacle_obj(obstacle)
+        rho = mat_obj.density_g_cm3
+        sigma_y = mat_obj.yield_mpa
+        youngs_mpa = mat_obj.youngs_gpa * 1000.0
+        failure_mode = mat_obj.animation.deform_mode
 
         vol_mm3 = max(float(volume_mm3 or 1.0), 1.0)
         lx = max(float(bbox[0] if len(bbox) > 0 else 100.0), 1.0)
@@ -237,8 +262,8 @@ class PhysicsEngine:
             for pid, pdata in compiled_parts.items():
                 p_vol = float(pdata.get("volume_mm3") or (vol_mm3 / max(len(compiled_parts), 1)))
                 p_mat = pdata.get("material") or material
-                p_props = cls.get_material(p_mat)
-                p_mass_g = round(p_vol * (p_props["density_g_cm3"] / 1000.0), 2)
+                p_obj = cls.get_material_obj(p_mat)
+                p_mass_g = round(p_vol * (p_obj.density_g_cm3 / 1000.0), 2)
                 weighted_mass_g += p_mass_g
         else:
             weighted_mass_g = round(vol_mm3 * (rho / 1000.0), 2)
@@ -246,25 +271,21 @@ class PhysicsEngine:
         mass_g = round(weighted_mass_g, 2)
         mass_kg = max(mass_g / 1000.0, 0.001)
 
-        # --- 1. Realistic Structural Shell Crush & Material-Sensitive Deformation ---
+        # --- 1. Obstacle & Constitutive Fracture Simulation ---
         v_m_s = max(speed_kmh / 3.6, 0.1)
         ke_joules = 0.5 * mass_kg * (v_m_s ** 2)
 
-        # Real vehicles/rockets are hollow shells (effective load-bearing frame area is ~3.5% of outer cross-section)
-        contact_factor = 0.35 if obstacle == "bollard_pole" else 1.0
+        contact_factor = 0.35 if obstacle == "bollard_pole" else (0.15 if obstacle == "spike_strip" else 1.0)
         effective_frame_area_mm2 = max(cross_a_mm * cross_b_mm * 0.035 * contact_factor, 8.0)
 
-        # Specific Energy Absorption (SEA) & Yield Strength directly govern crumple depth!
-        sea_j_g = mat_props.get("sea_kj_kg", 20.0)  # Joules per gram of crushed structure
-        # Dynamic stress increases with impact velocity and decreases with material yield strength
         dynamic_load_n = max(mass_kg * (v_m_s ** 2) / max(primary_len_mm / 1000.0 * 0.22, 0.01), 10.0)
-        impact_stress_mpa = round((dynamic_load_n / effective_frame_area_mm2) * (1.8 if obstacle == "bollard_pole" else 1.0), 1)
+        impact_stress_mpa = round((dynamic_load_n / effective_frame_area_mm2) * obs_obj.stress_concentration, 1)
         crash_safety_factor = round(sigma_y / max(impact_stress_mpa, 0.5), 2)
 
         # Calculate material-dependent crumple ratio (weak/brittle materials deform/shatter much more than Titanium/Steel!)
         strength_ratio = 276.0 / max(sigma_y, 15.0)  # Normalized against Al 6061 (276 MPa)
         speed_norm = speed_kmh / 90.0
-        raw_crumple_ratio = 0.14 * (speed_norm ** 1.35) * (strength_ratio ** 0.55) * (1.45 if obstacle == "bollard_pole" else 1.0)
+        raw_crumple_ratio = 0.14 * (speed_norm ** 1.35) * (strength_ratio ** 0.55) * obs_obj.stress_concentration * 0.75
         crumple_ratio = round(min(max(raw_crumple_ratio, 0.02), 0.72), 3)
         crumple_depth_mm = round(crumple_ratio * primary_len_mm, 1)
 
@@ -274,17 +295,24 @@ class PhysicsEngine:
         peak_g = round(min((v_m_s ** 2) / (2.0 * crush_dist_m * 9.81) * 1.4, 250.0), 1)
         mean_crush_force_n = ke_joules / crush_dist_m
 
-        # Realistic Survival Verdict (Checks Structural Yield + Crumple Intrusion + Brittle Shatter + G-Limit)
+        # Check Tire Puncture / Blowout if Obstacle is `spike_strip`
+        tire_punctured = obstacle == "spike_strip" and (
+            mat_obj.animation.puncture_vulnerable
+            or any(cls.classify_part_role(pid) == "elastomer_traction" for pid in (compiled_parts or {}))
+        )
         is_shattered = failure_mode == "brittle_shatter" and crash_safety_factor < 1.15
         survived_crash = (
             not is_shattered
+            and not tire_punctured
             and crumple_ratio <= domain_info["max_crumple_ratio"]
             and crash_safety_factor >= 0.85
             and peak_g <= domain_info["max_survivable_g"] * 1.8
         )
 
-        if is_shattered:
-            failure_desc = f"Brittle Shatter ({material} fractured at {impact_stress_mpa} MPa > {sigma_y} MPa)"
+        if tire_punctured:
+            failure_desc = f"Tire Blowout & Undercarriage Puncture on Spike Strip at {speed_kmh:.0f} km/h!"
+        elif is_shattered:
+            failure_desc = f"Brittle Shatter ({material} fractured into shards at {impact_stress_mpa} MPa > {sigma_y} MPa)"
         elif not survived_crash and crumple_ratio > domain_info["max_crumple_ratio"]:
             failure_desc = f"Severe Cabin/Core Intrusion ({crumple_ratio*100:.0f}% crushed at {speed_kmh:.0f} km/h)"
         elif not survived_crash:
@@ -310,48 +338,53 @@ class PhysicsEngine:
         buckling_safety_factor = round(min(euler_critical_load_n / max(axial_load_6g_n, 0.1), 99.0), 2)
 
         # --- 4. Role-Aware Per-Part Breakdown & Intelligent Material Recommendations ---
+        part_animations: Dict[str, Dict[str, Any]] = {}
         if compiled_parts:
             for pid, pdata in compiled_parts.items():
                 p_vol = float(pdata.get("volume_mm3") or (vol_mm3 / max(len(compiled_parts), 1)))
                 p_mat = pdata.get("material") or material
-                p_props = cls.get_material(p_mat)
-                p_mass_g = round(p_vol * (p_props["density_g_cm3"] / 1000.0), 2)
+                p_obj = cls.get_material_obj(p_mat)
+                p_mass_g = round(p_vol * (p_obj.density_g_cm3 / 1000.0), 2)
                 role = cls.classify_part_role(pid)
+                part_animations[pid] = asdict(p_obj.animation)
 
                 # Estimate local part safety factor based on slenderness and material yield
-                local_stress = max(impact_stress_mpa * (0.35 if role == "transparent_glazing" else 0.75), wind_bending_stress_mpa)
-                p_sf = round(min(p_props["yield_mpa"] / max(local_stress, 1.0), 25.0), 2)
+                local_stress = max(impact_stress_mpa * (0.45 if role == "transparent_glazing" else 0.8), wind_bending_stress_mpa)
+                p_sf = round(min(p_obj.yield_mpa / max(local_stress, 1.0), 25.0), 2)
 
                 status = "optimal"
-                recommendation = f"Optimal {p_mat} for {role.replace('_', ' ')}."
+                recommendation = f"Optimal {p_mat} ({p_obj.animation.deform_mode.replace('_', ' ')}) for {role.replace('_', ' ')}."
 
                 if role == "transparent_glazing":
                     if p_mat not in ("Glass", "PLA", "ABS"):
                         status = "warning"
-                        recommendation = f"`{pid}` is a window/glazing part; use Glass (or polycarbonate) for optical visibility instead of opaque {p_mat}."
+                        recommendation = f"`{pid}` is glazing; use Glass for optical visibility instead of opaque {p_mat}."
                     elif p_sf < 1.1:
                         status = "critical"
-                        recommendation = f"Glass shattered at {speed_kmh:.0f} km/h ({local_stress:.0f} MPa). Use laminated polycarbonate/thickened glazing."
+                        recommendation = f"Glass shattered at {speed_kmh:.0f} km/h ({local_stress:.0f} MPa). Upgrade `{pid}` to laminated polycarbonate."
                 elif role == "elastomer_traction":
-                    if p_mat != "Rubber":
+                    if obstacle == "spike_strip":
+                        status = "critical"
+                        recommendation = f"`{pid}` punctured by road spikes! Switch to run-flat honeycomb airless rubber."
+                    elif p_mat != "Rubber":
                         status = "warning"
-                        recommendation = f"`{pid}` requires high-friction elastomer grip; use Rubber tires with Al 6061 rims."
+                        recommendation = f"`{pid}` requires high-friction elastomer grip; use Rubber tires."
                 elif role == "aerodynamic_surface":
                     if p_sf < 1.2:
                         status = "critical"
-                        recommendation = f"Fin/wing root stress high ({local_stress:.0f} MPa). Switch `{pid}` to Carbon Fiber or Titanium."
-                    elif p_props["density_g_cm3"] > 3.0:
+                        recommendation = f"High aerodynamic root stress ({local_stress:.0f} MPa). Reinforce `{pid}` with Carbon Fiber or Titanium."
+                    elif p_obj.density_g_cm3 > 3.0:
                         alt_mass = round(p_vol * (1.60 / 1000.0), 1)
                         saved = max(p_mass_g - alt_mass, 0.0)
                         potential_savings_g += saved
                         status = "over_engineered"
-                        recommendation = f"Switch `{pid}` from {p_mat} to Carbon Fiber to save {saved:.1f}g and boost aero stiffness."
+                        recommendation = f"Switch `{pid}` from {p_mat} to Carbon Fiber to save {saved:.1f}g."
                 else:
                     # primary_structure or thermal_propulsion
                     if p_sf < 1.15:
                         status = "critical"
                         recommendation = f"Structural yield risk ({p_sf}x SF). Reinforce `{pid}` with Titanium or Carbon Fiber."
-                    elif p_sf > 3.5 and p_props["density_g_cm3"] > 2.70:
+                    elif p_sf > 3.5 and p_obj.density_g_cm3 > 2.70:
                         alt_mass = round(p_vol * (2.70 / 1000.0), 1)
                         saved = max(p_mass_g - alt_mass, 0.0)
                         potential_savings_g += saved
@@ -362,7 +395,7 @@ class PhysicsEngine:
                     "part_id": pid,
                     "role": role,
                     "material": p_mat,
-                    "failure_mode": p_props["failure_mode"],
+                    "failure_mode": p_obj.animation.deform_mode,
                     "mass_g": p_mass_g,
                     "volume_mm3": round(p_vol, 1),
                     "safety_factor": p_sf,
@@ -372,16 +405,16 @@ class PhysicsEngine:
 
         # Compare all materials for the Playground Material Matrix
         material_comparison = []
-        for m_name, m_info in MATERIAL_LIBRARY.items():
-            m_mass_g = round(vol_mm3 * (m_info["density_g_cm3"] / 1000.0), 1)
-            m_sf = round((m_info["yield_mpa"] / max(impact_stress_mpa, 1.0)), 2)
+        for m_name, m_obj in MATERIAL_OBJECTS.items():
+            m_mass_g = round(vol_mm3 * (m_obj.density_g_cm3 / 1000.0), 1)
+            m_sf = round((m_obj.yield_mpa / max(impact_stress_mpa, 1.0)), 2)
             material_comparison.append({
                 "material": m_name,
                 "mass_g": m_mass_g,
-                "yield_mpa": m_info["yield_mpa"],
-                "failure_mode": m_info["failure_mode"],
+                "yield_mpa": m_obj.yield_mpa,
+                "failure_mode": m_obj.animation.deform_mode,
                 "safety_factor": m_sf,
-                "cost_est_usd": round((m_mass_g / 1000.0) * m_info["cost_usd_kg"], 2)
+                "cost_est_usd": round((m_mass_g / 1000.0) * m_obj.cost_usd_kg, 2)
             })
 
         warning = None
@@ -400,11 +433,13 @@ class PhysicsEngine:
             "impact_axis": impact_axis,
             "overall_safety_factor": overall_sf,
             "potential_mass_savings_g": round(potential_savings_g, 1),
+            "part_animations": part_animations,
             "edge_cases": {
                 "crash_test": {
                     "obstacle": obstacle,
+                    "obstacle_name": obs_obj.name,
                     "impact_axis": impact_axis,
-                    "failure_mode": failure_mode,
+                    "failure_mode": "tire_blowout" if tire_punctured else failure_mode,
                     "failure_description": failure_desc,
                     "speed_kmh": speed_kmh,
                     "kinetic_energy_j": round(ke_joules, 1),

@@ -35,7 +35,7 @@ class LLMService:
             wrap_openai(AsyncOpenAI(
                 base_url=settings.gemini_base_url,
                 api_key=key,
-                timeout=240.0,
+                timeout=300.0,
                 max_retries=0
             ))
             for key in settings.gemini_key_pool

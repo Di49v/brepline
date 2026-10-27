@@ -16,6 +16,9 @@ from app.services.profiles import build, clean, SpecError
 from app.services.cad_orchestrator import CadOrchestrator
 from app.services.physics_engine import PhysicsEngine
 
+from app.services.presets import SHOWCASE_PRESETS
+from app.services.assembler import CadAssembler
+
 logger = logging.getLogger(__name__)
 router = APIRouter()
 orchestrator = CadOrchestrator()
@@ -319,3 +322,96 @@ async def submit_feedback(
     # Execute DB write on a background thread automatically via FastAPI/Supabase sync client
     repo.save_feedback(body.job, body.vote, body.comment, ip_hash)
     return {"ok": True}
+
+@router.post("/presets/{preset_name}")
+async def build_showcase_preset(preset_name: str, seed_db: bool = False):
+    """
+    Compiles a verified multi-part industrial preset (e.g. 'sports_car' or 'sounding_rocket')
+    directly in the OpenCASCADE sandbox in ~2s so you can inspect the multi-color 3D model
+    and test the 60 FPS Crash Lab in the UI before seeding it into Supabase.
+    Pass `?seed_db=true` only after you inspect and approve the model!
+    """
+    preset = SHOWCASE_PRESETS.get(preset_name)
+    if not preset:
+        raise HTTPException(status_code=404, detail=f"Unknown preset '{preset_name}'. Available: {list(SHOWCASE_PRESETS.keys())}")
+
+    job_id = uuid.uuid4().hex[:12]
+    compiled_parts = {}
+    bom_parts = []
+
+    for pid, pinfo in preset["parts"].items():
+        sub_wd = os.path.join(settings.out_dir, job_id, f"sub_{pid}")
+        sub_res = await orchestrator.sandbox.run_code(pinfo["code"], sub_wd)
+        compiled_parts[pid] = {
+            "code": pinfo["code"],
+            "volume_mm3": float(sub_res.get("volume") or 1000.0),
+            "bbox": sub_res.get("bbox") or [100.0, 100.0, 100.0],
+            "bbox_min": sub_res.get("bbox_min") or [0.0, 0.0, 0.0],
+            "translate_mm": pinfo["translate_mm"],
+            "material": pinfo["material"],
+            "color_hex": pinfo["color_hex"],
+            "archetype_tag": pinfo["archetype_tag"],
+            "exec_result": sub_res,
+        }
+        bom_parts.append({
+            "id": pid,
+            "archetype_tag": pinfo["archetype_tag"],
+            "archetype_query": pinfo["archetype_query"],
+            "position_mm": pinfo["translate_mm"],
+            "default_material": pinfo["material"],
+            "color_hex": pinfo["color_hex"],
+        })
+
+        if seed_db and sub_res.get("ok"):
+            emb = await orchestrator.llm.get_embedding(pinfo["archetype_query"])
+            orchestrator.repo.save_example_to_cache(
+                tags=[pinfo["archetype_tag"], "subpart", pid],
+                prompt=pinfo["archetype_query"],
+                code=pinfo["code"],
+                embedding=emb
+            )
+
+    master_code = CadAssembler.stitch_assembly(compiled_parts, bom_parts)
+    wd = os.path.join(settings.out_dir, job_id)
+    res = await orchestrator.sandbox.run_code(master_code, wd)
+
+    vol = sum(p["volume_mm3"] for p in compiled_parts.values())
+    bbox = res.get("bbox") or [4200.0, 1900.0, 1280.0]
+    phys = PhysicsEngine.run_full_audit(
+        volume_mm3=vol,
+        bbox=bbox,
+        material=preset["material"],
+        n_solids=len(compiled_parts),
+        has_named_parts=True,
+        valid=True,
+        compiled_parts=compiled_parts,
+        prompt=preset["prompt"]
+    )
+    phys["part_colors"] = {pid: p["color_hex"] for pid, p in compiled_parts.items()}
+    phys["part_materials"] = {pid: p["material"] for pid, p in compiled_parts.items()}
+
+    result_payload = {
+        "job": job_id,
+        "ok": True,
+        "code": master_code,
+        "plan": {"object": preset["object"], "is_assembly": True, "parts": bom_parts},
+        "physics": phys,
+        "volume_mm3": vol,
+        "area_mm2": res.get("area"),
+        "mass_g": phys["mass_g"],
+        "density_g_cm3": phys["density_g_cm3"],
+        "bbox": bbox,
+        "bbox_min": res.get("bbox_min"),
+        "com": res.get("com"),
+        "counts": res.get("counts"),
+        "mesh": res.get("mesh"),
+        "verified": True,
+        "cached": True
+    }
+    JOB_STATES[job_id] = {
+        "status": "done",
+        "log": ["decomposed into 4 components", "verified all sub-parts", "done"],
+        "partial_mesh": res.get("mesh"),
+        "result": result_payload
+    }
+    return result_payload

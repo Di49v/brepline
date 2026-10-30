@@ -758,8 +758,22 @@ export default function App() {
   }, [])
 
   /* data (real: filled as you generate) */
-  const [hist, setHist] = useState([])
-  const [files, setFiles] = useState([])
+  const [userName, setUserName] = useState(() => readLS('bp-user', 'Gurtej'))
+  useEffect(() => { writeLS('bp-user', userName) }, [userName])
+
+  const [hist, setHist] = useState(() => {
+    try { return JSON.parse(readLS('bp-hist', '[]')) || [] } catch { return [] }
+  })
+  const [files, setFiles] = useState(() => {
+    try { return JSON.parse(readLS('bp-files', '[]')) || [] } catch { return [] }
+  })
+  useEffect(() => {
+    try { writeLS('bp-hist', JSON.stringify(hist.slice(0, 15))) } catch { /* quota */ }
+  }, [hist])
+  useEffect(() => {
+    // Store lightweight file metadata + mesh (up to 8 recent models) so page reload keeps your 3D models!
+    try { writeLS('bp-files', JSON.stringify(files.slice(0, 8))) } catch { /* quota */ }
+  }, [files])
   const [hs, setHs] = useState('')
   const [fs, setFs] = useState('')
   const [ff, setFf] = useState('All')
@@ -1089,7 +1103,7 @@ export default function App() {
         </div>
         <div className="user" onClick={() => go('settings')}>
           <div className="av">T</div>
-          <div>Tegkirat<small>Free plan</small></div>
+          <div>{userName}<small>Free plan</small></div>
         </div>
       </aside>
       <div className="scrim" onClick={() => setSbOff(true)} />
@@ -1409,7 +1423,7 @@ export default function App() {
 
               <div className={'panel' + (panel === 'account' ? ' on' : '')}>
                 <h3>Account</h3><p>Your profile and plan.</p>
-                <div className="srow"><div><b>Name</b><small>Shown in the sidebar</small></div><input type="text" defaultValue="Tegkirat" /></div>
+                <div className="srow"><div><b>Name</b><small>Shown in the sidebar</small></div><input type="text"value={userName} onChange={e => setUserName(e.target.value)} /></div>
                 <div className="srow"><div><b>Plan</b><small>Free plan</small></div>
                   <button className="btn p" onClick={() => go('pricing')}>Upgrade</button></div>
                 <div className="srow"><div><b>Sign out</b><small>End this session</small></div><button className="btn">Sign out</button></div>

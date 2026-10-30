@@ -199,7 +199,7 @@ export function drawMesh(ctx, w, h, mesh, o = {}) {
   const failureMode = simActive ? (sim.failureMode || 'ductile_crumple') : 'ductile_crumple'
 
   const impactPhase = prog <= 0.42 ? 0 : (prog - 0.42) / 0.58
-  const approachOffset = simActive && obstacle !== 'wind_and_thrust'
+  const approachOffset = simActive && obstacle !== 'wind_and_thrust' && obstacle !== 'spike_strip'
     ? (prog <= 0.42 ? -(1 - prog / 0.42) * (frontSpan * 0.30) : 0)
     : 0
   const wallCoord = frontMax - impactPhase * crumpleRatio * frontSpan
@@ -220,6 +220,23 @@ export function drawMesh(ctx, w, h, mesh, o = {}) {
         const bendDeflect = (zNorm * zNorm) * (Math.max(spanX, spanY) * 0.10) * Math.max(crumpleRatio, 0.15) * 2.8 * flutter
         vy += bendDeflect
         localStress = Math.min(1, zNorm * 1.2 * flutter)
+      } else if (obstacle === 'spike_strip') {
+        // Vehicle drives forward over road spikes at Z = p.mn[2] -> lower tires puncture, shred & deflate!
+        const travel = (prog - 0.35) * (spanX * 0.42)
+        vx += travel
+        const zFromGround = vz - p.mn[2]
+        const tireZoneHeight = spanZ * 0.32
+        if (prog > 0.32 && zFromGround < tireZoneHeight) {
+          const deflateProg = (prog - 0.32) / 0.68
+          const crushUp = (tireZoneHeight - zFromGround) * 0.58 * deflateProg
+          vz += crushUp
+          vy += (vy >= c[1] ? 1 : -1) * crushUp * 0.42 * Math.sin(i * 7.13)
+          localStress = Math.min(1, 0.72 + (1 - zFromGround / tireZoneHeight) * 0.38)
+        } else if (prog > 0.32) {
+          const drop = tireZoneHeight * 0.26 * ((prog - 0.32) / 0.68)
+          vz -= drop
+          localStress = 0.22
+        }
       } else {
         // Move vehicle/rocket along its primary travel axis toward the obstacle
         let primary = (crashAxis === 2 ? vz : (crashAxis === 0 ? vx : vy)) + approachOffset
@@ -373,7 +390,7 @@ export function drawMesh(ctx, w, h, mesh, o = {}) {
       const pname = (partNames[pIdx] || '').toLowerCase()
       const pHex = ((partColors && partColors[partNames[pIdx]]) || '').toLowerCase()
       if (pname.includes('glass') || pname.includes('window') || pname.includes('windshield') || pname.includes('canopy') || pHex === '#38bdf8') {
-        alpha = 0.52
+        alpha = 0.55
       }
       col = partPalettes[pIdx][S[t]]
     } else {
@@ -445,6 +462,26 @@ export function drawMesh(ctx, w, h, mesh, o = {}) {
       ctx.moveTo(bot[0], bot[1])
       ctx.lineTo(top[0], top[1])
       ctx.stroke()
+    } else if (obstacle === 'spike_strip') {
+      // Draw 3D metallic road spikes across the ground plane at X = c[0]
+      ctx.strokeStyle = '#ef4444'
+      ctx.fillStyle = '#f59e0b'
+      ctx.lineWidth = 2
+      const nSpikes = 9
+      const spikeH = spanZ * 0.12
+      for (let k = 0; k < nSpikes; k++) {
+        const sy = p.mn[1] + (k / (nSpikes - 1)) * spanY
+        const b1 = pr(p.c[0] - spanX * 0.03, sy, p.mn[2])
+        const b2 = pr(p.c[0] + spanX * 0.03, sy, p.mn[2])
+        const tip = pr(p.c[0], sy, p.mn[2] + spikeH)
+        ctx.beginPath()
+        ctx.moveTo(b1[0], b1[1])
+        ctx.lineTo(tip[0], tip[1])
+        ctx.lineTo(b2[0], b2[1])
+        ctx.closePath()
+        ctx.fill()
+        ctx.stroke()
+      }
     } else if (obstacle === 'wind_and_thrust') {
       ctx.strokeStyle = '#38bdf8'
       ctx.fillStyle = '#38bdf8'
@@ -460,26 +497,6 @@ export function drawMesh(ctx, w, h, mesh, o = {}) {
         head(ctx, end, start)
       }
     }
-    else if (obstacle === 'spike_strip') {
-     // Vehicle drives forward along X over road spikes at Z = p.mn[2] -> lower tires puncture & deflate!
-     const travel = (prog - 0.5) * (spanX * 0.45)
-     vx += travel
-     const zFromGround = vz - p.mn[2]
-     const tireZoneHeight = spanZ * 0.32
-     if (prog > 0.35 && zFromGround < tireZoneHeight) {
-       const deflateProg = (prog - 0.35) / 0.65
-       // Bottom of tires flatten/compress upward into rim + rubber shreds outward
-       const crushUp = (tireZoneHeight - zFromGround) * 0.55 * deflateProg
-       vz += crushUp
-       vy += (vy >= c[1] ? 1 : -1) * crushUp * 0.45 * Math.sin(i * 7.13)
-       localStress = Math.min(1, 0.75 + (1 - zFromGround / tireZoneHeight) * 0.4)
-     } else if (prog > 0.35) {
-       // Entire chassis drops lower as tires lose air pressure!
-       const drop = tireZoneHeight * 0.28 * ((prog - 0.35) / 0.65)
-       vz -= drop
-       localStress = 0.25
-     }
-   }
     ctx.restore()
   }
 }
@@ -913,7 +930,7 @@ export default function MeshViewer({
   const onMove = e => {
     const p = ptrs.current.get(e.pointerId)
     const s = S.current
-    if (!p) { // plain hover: snap to the nearest vertex while measuring
+    if (!p) {
       if (opt.current.measure && mesh) {
         const [x, y] = pos(e)
         const i = snap(mesh, x, y)

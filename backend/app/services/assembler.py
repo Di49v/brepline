@@ -1,13 +1,6 @@
 """
-Parametric Multi-Part B-Rep Assembler with Native XCAF Color Support.
-
-Encapsulates individual verified sub-part CadQuery scripts into isolated
-Python functions, applies spatial (X, Y, Z) translations, and produces a
-single self-contained master CadQuery script that defines:
-- `parts`: Dict[str, cq.Workplane] for multi-part 3D viewer mesh segmentation
-- `part_colors`: Dict[str, str] mapping part_id -> hex color
-- `cad_assembly`: cq.Assembly with embedded `cq.Color(r, g, b, a)` for colored STEP export
-- `result`: cq.Compound for STL export and B-Rep volume/mass calculation
+Parametric Multi-Part B-Rep Assembler with Automatic Boolean Window Carving,
+Coordinate Center-Locking, and Native XCAF Color Support.
 """
 import re
 from typing import Dict, Any, List, Tuple
@@ -65,7 +58,7 @@ class CadAssembler:
             "import cadquery as cq",
             "",
             "# ======================================================================",
-            "# BREPLINE MODULAR MULTI-PART ASSEMBLY (WITH XCAF STEP COLORS)",
+            "# BREPLINE MODULAR MULTI-PART ASSEMBLY (WITH BOOLEAN MATING & XCAF COLOR)",
             "# ======================================================================",
             ""
         ]
@@ -115,23 +108,34 @@ class CadAssembler:
         lines.append("# --- Assemble & Translate Sub-Parts into World Coordinates ---")
         lines.append("parts = {}")
         lines.append("part_colors = {}")
-        lines.append("cad_assembly = cq.Assembly()")
+
+        body_ids: List[str] = []
+        glass_ids: List[str] = []
 
         for pid in part_order:
             fn_name = func_map[pid]
             pdata = compiled_parts[pid]
             pos = pos_map.get(pid) or [0.0, 0.0, 0.0]
             bmin = pdata.get("bbox_min") or [0.0, 0.0, 0.0]
+            bbox = pdata.get("bbox") or [0.0, 0.0, 0.0]
             tx = float(pos[0]) if len(pos) > 0 else 0.0
             ty = float(pos[1]) if len(pos) > 1 else 0.0
             tz = float(pos[2]) if len(pos) > 2 else 0.0
 
-            # Anti-Double-Translation Guard: if the sub-part script already placed its base at `tz` (e.g. bmin[2] >= tz * 0.8),
-            # do not add `tz` a second time!
+            # 1. Anti-Double-Translation Guard along Z and X
             if tz > 10.0 and len(bmin) > 2 and float(bmin[2]) >= tz * 0.75:
                 tz = 0.0
             if abs(tx) > 10.0 and len(bmin) > 0 and abs(float(bmin[0]) - tx) < abs(tx) * 0.35:
                 tx = 0.0
+
+            # 2. Auto-Center Uncentered [0..L] Wheel Sets / Symmetric Arrays:
+            # If a wheel_set has tx == 0 (intended to be centered at X=0), but its compiled
+            # X-bounds [bmin[0], bmin[0]+bbox[0]] are entirely positive (e.g. X=450..3150, center=+1800),
+            # shift it by -cx so front and rear wheels sit symmetrically at ±wheelbase/2!
+            if abs(tx) < 1.0 and len(bmin) >= 2 and len(bbox) >= 2:
+                if "wheel" in pid.lower() and float(bmin[0]) > 100.0 and float(bbox[0]) > 1000.0:
+                    cx = float(bmin[0]) + float(bbox[0]) / 2.0
+                    tx = -round(cx, 1)
 
             if abs(tx) > 1e-6 or abs(ty) > 1e-6 or abs(tz) > 1e-6:
                 lines.append(f"parts[{pid!r}] = {fn_name}().translate(({tx}, {ty}, {tz}))")
@@ -139,9 +143,32 @@ class CadAssembler:
                 lines.append(f"parts[{pid!r}] = {fn_name}()")
 
             hex_col = color_map.get(pid, "#94a3b8")
-            is_glass = any(w in pid.lower() for w in ("glass", "window", "windshield", "canopy")) or hex_col.lower() == "#38bdf8"
-            r, g, b, a = cls.hex_to_rgba(hex_col, is_glass=is_glass)
             lines.append(f"part_colors[{pid!r}] = {hex_col!r}")
+
+            pid_low = pid.lower()
+            if any(w in pid_low for w in ("glass", "window", "windshield", "canopy")) or hex_col.lower() == "#38bdf8":
+                glass_ids.append(pid)
+            elif any(w in pid_low for w in ("body", "shell", "chassis", "cab", "fuselage", "hull")):
+                body_ids.append(pid)
+
+        # 3. Automatic Boolean Window Carving: subtract glazing solids from main body shell
+        # so translucent windows are never occluded/buried inside solid opaque bodywork!
+        if body_ids and glass_ids:
+            lines.append("")
+            lines.append("# --- Carve Window / Glazing Cutouts from Main Body Shell ---")
+            for bid in body_ids:
+                for gid in glass_ids:
+                    lines.append("try:")
+                    lines.append(f"    parts[{bid!r}] = parts[{bid!r}].cut(parts[{gid!r}])")
+                    lines.append("except Exception:")
+                    lines.append("    pass")
+
+        lines.append("")
+        lines.append("cad_assembly = cq.Assembly()")
+        for pid in part_order:
+            hex_col = color_map.get(pid, "#94a3b8")
+            is_glass = pid in glass_ids
+            r, g, b, a = cls.hex_to_rgba(hex_col, is_glass=is_glass)
             lines.append(f"cad_assembly.add(parts[{pid!r}], name={pid!r}, color=cq.Color({r}, {g}, {b}, {a}))")
 
         lines.append("")

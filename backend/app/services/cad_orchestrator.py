@@ -96,7 +96,15 @@ class CadOrchestrator:
             }
         )
 
-        workflow.add_edge("modifier", "part_compiler")
+        workflow.add_conditional_edges(
+            "modifier",
+            lambda s: "compile" if (s.get("current_part_code") and not s.get("error_traceback")) else "fallback_create",
+            {
+                "compile": "part_compiler",
+                "fallback_create": "atomic_coder",
+            }
+        )
+        
         workflow.add_edge("atomic_coder", "part_compiler")
 
         # After compiling a sub-part: repair it, move to next sub-part, or finish at auditor
@@ -403,8 +411,9 @@ class CadOrchestrator:
             "   - `bolt_circle(body, n, r, d, face='>Z')` -> drills n through-holes of diameter d on radius r\n"
             "3. LOCAL ORIGIN & POSITIONING CONTRACT:\n"
             "   - Build the sub-component with its base at local Z=0 (do NOT add `position_mm` inside this script, because the Assembler applies `.translate(position_mm)`!).\n"
-            "4. VEHICLE CHASSIS & CABIN GLASS RULES:\n"
-            "   - When building a car `chassis_body`, sketch the 2D side silhouette on `cq.Workplane('XZ').polyline([...]).close().extrude(width/2, both=True)`, "
+            "4. VEHICLE CHASSIS & MULTI-WINDOW GLAZING RULES:\n"
+            "   - Every vehicle sub-part MUST be centered at X=0, Y=0 (spanning X = -L/2 to +L/2). For `wheel_set`, place front wheels at X = +wheelbase/2 and rear wheels at X = -wheelbase/2 (NEVER at positive-only X=800, 3200!).\n"
+            "   - When building `cabin_glass` / `windshield` for a car, truck, or aircraft: make its Y-extrusion width EQUAL to the full cabin width (e.g. `extrude(width/2, both=True)`) and its height from `Z=0` up to `cabin_height - 50mm` (leaving 50mm for the metal roof cap above it). The Master Assembler automatically boolean-cuts `cabin_glass` out of `body_shell`, so making `cabin_glass` span the full cabin width guarantees visible side windows AND front/rear windshields!\n"
             "AND cut out the side window openings (through Y) and front/rear windshield recesses in the upper cabin roof section using `.cut(...)`, PLUS cut cylindrical wheel arches at the front/rear axles!\n"
             "   - When building `cabin_glass` / `windshield`, sketch the sloped trapezoidal greenhouse profile on `cq.Workplane('XZ')` (base at Z=0 so when translated by `position_mm: [0, 0, z_beltline]` it fits cleanly inside the upper cabin frame!).\n"
             "5. Avoid `.shell()` on complex multi-body unions. Assign the final solid to `result` on the last line."

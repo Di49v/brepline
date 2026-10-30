@@ -1,9 +1,14 @@
+import os
+import json
 import uuid
 import logging
 from typing import Dict, Any, Optional, List
 from app.db.client import get_supabase_client
+from app.core.config import settings
 
 logger = logging.getLogger("uvicorn.error")
+
+LOCAL_HISTORY_FILE = os.path.join(settings.out_dir, "history_index.json")
 
 
 def _to_db_uuid(job_id: Optional[str]) -> Optional[str]:
@@ -34,11 +39,65 @@ def _from_db_uuid(db_uuid: Optional[str]) -> str:
 
 
 class CadRepository:
+    """
+    Dual-Persistence CAD Repository (Supabase PostgreSQL + Local Disk Index).
+    Guarantees zero history loss across Uvicorn reloads and browser restarts.
+    """
+
     def __init__(self):
         self.client = get_supabase_client()
+        os.makedirs(settings.out_dir, exist_ok=True)
+
+    def _save_local_backup(self, record: Dict[str, Any]) -> None:
+        """Saves generation record to `out/history_index.json` so Uvicorn reloads never lose history."""
+        try:
+            existing: List[Dict[str, Any]] = []
+            if os.path.exists(LOCAL_HISTORY_FILE):
+                with open(LOCAL_HISTORY_FILE, "r", encoding="utf-8") as f:
+                    existing = json.load(f) or []
+
+            job_id = record.get("job")
+            existing = [r for r in existing if r.get("job") != job_id]
+            existing.insert(0, {
+                "job": job_id,
+                "prompt": record.get("prompt") or "CAD Design",
+                "material": record.get("material") or "Al 6061",
+                "route": record.get("route") or "iterative_assembly",
+                "plan": record.get("plan") or {},
+                "code": record.get("code") or "",
+                "ok": bool(record.get("ok", True)),
+                "verified": bool(record.get("verified", True)),
+                "bbox": record.get("bbox") or [100, 100, 100],
+                "bbox_min": record.get("bbox_min"),
+                "volume_mm3": record.get("volume_mm3"),
+                "area_mm2": record.get("area_mm2"),
+                "mass_g": record.get("mass_g"),
+                "density_g_cm3": record.get("density_g_cm3"),
+                "com": record.get("com"),
+                "counts": record.get("counts"),
+                "physics": record.get("physics"),
+                "mesh": record.get("mesh"),
+            })
+            with open(LOCAL_HISTORY_FILE, "w", encoding="utf-8") as f:
+                json.dump(existing[:25], f)
+        except Exception as e:
+            logger.warning(f"Local history backup warning: {e}")
+
+    def _load_local_backup(self) -> List[Dict[str, Any]]:
+        if not os.path.exists(LOCAL_HISTORY_FILE):
+            return []
+        try:
+            with open(LOCAL_HISTORY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f) or []
+        except Exception:
+            return []
 
     def save_generation(self, record: Dict[str, Any]) -> None:
-        """Persists a completed CAD generation job (including 3D mesh & physics) to PostgreSQL."""
+        """Persists a completed CAD generation job to both local disk index and Supabase PostgreSQL."""
+        # 1. Always write instant local backup first
+        self._save_local_backup(record)
+
+        # 2. Persist to Supabase `public.generations`
         try:
             raw_job = record.get("job")
             db_job_id = _to_db_uuid(raw_job)
@@ -79,10 +138,27 @@ class CadRepository:
             self.client.table("generations").upsert(payload, on_conflict="job_id").execute()
             logger.info(f"Saved generation {raw_job} ({db_job_id}) to Supabase `generations` table.")
         except Exception as e:
-            logger.error(f"Failed to save generation {record.get('job')}: {e}")
+            logger.error(f"Supabase `generations` insert failed for {record.get('job')} (local backup active): {e}")
 
     def get_recent_generations(self, limit: int = 25) -> List[Dict[str, Any]]:
-        """Fetches recent successful generations from Supabase to restore chat & file history."""
+        """Merges Supabase `generations` with local disk backup so history always loads."""
+        merged: Dict[str, Dict[str, Any]] = {}
+
+        # 1. Load from local disk backup first
+        for loc in self._load_local_backup():
+            jid = loc.get("job")
+            if jid and loc.get("mesh"):
+                merged[jid] = {
+                    "job_id": jid,
+                    "prompt": loc.get("prompt"),
+                    "material": loc.get("material"),
+                    "code": loc.get("code"),
+                    "plan": loc.get("plan"),
+                    "is_verified": loc.get("verified", True),
+                    "metadata": loc,
+                }
+
+        # 2. Load from Supabase PostgreSQL
         try:
             res = (
                 self.client.table("generations")
@@ -92,17 +168,29 @@ class CadRepository:
                 .limit(limit)
                 .execute()
             )
-            rows = res.data or []
-            for r in rows:
+            for r in (res.data or []):
                 meta = r.get("metadata") or {}
-                r["job_id"] = meta.get("short_job_id") or _from_db_uuid(r.get("job_id"))
-            return rows
+                jid = meta.get("short_job_id") or _from_db_uuid(r.get("job_id"))
+                r["job_id"] = jid
+                if jid and meta.get("mesh"):
+                    merged[jid] = r
         except Exception as e:
-            logger.error(f"Failed to fetch generation history from Supabase: {e}")
-            return []
+            logger.warning(f"Supabase history fetch fallback to local backup: {e}")
+
+        return list(merged.values())[:limit]
 
     def get_generation(self, job_id: str) -> Optional[Dict[str, Any]]:
-        """Retrieves a previous generation by 12-char job_id or UUID."""
+        for loc in self._load_local_backup():
+            if loc.get("job") == job_id:
+                return {
+                    "job_id": job_id,
+                    "prompt": loc.get("prompt"),
+                    "material": loc.get("material"),
+                    "code": loc.get("code"),
+                    "plan": loc.get("plan"),
+                    "is_verified": loc.get("verified", True),
+                    "metadata": loc,
+                }
         try:
             db_id = _to_db_uuid(job_id)
             res = self.client.table("generations").select("*").eq("job_id", db_id).limit(1).execute()

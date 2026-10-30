@@ -457,15 +457,16 @@ function MeshModal({ s, onClose, onGoPricing }) {
   const [pts, setPts] = useState([])
   const [ck, setCk] = useState(0)
 
-  // Crash & Multi-Physics Lab State
   const [obstacle, setObstacle] = useState('concrete_wall')
   const [speed, setSpeed] = useState(72)
   const [wind, setWind] = useState(45)
   const [simMat, setSimMat] = useState('Al 6061')
   const [partMats, setPartMats] = useState({})
+  const [customColors, setCustomColors] = useState({})
   const [physData, setPhysData] = useState(null)
   const [showHeatmap, setShowHeatmap] = useState(false)
-  const [simAnim, setSimAnim] = useState({ active: false, running: false, progress: 0, crumpleRatio: 0.18, obstacle: 'concrete_wall' })
+  const [flipDirection, setFlipDirection] = useState(false)
+  const [simAnim, setSimAnim] = useState({ active: false, runId: 0, crumpleRatio: 0.18, obstacle: 'concrete_wall' })
 
   useEffect(() => {
     if (!s.open) return
@@ -479,22 +480,35 @@ function MeshModal({ s, onClose, onGoPricing }) {
     setPts([])
     setInfo(window.innerWidth >= 1100)
     setLab(false)
+    setFlipDirection(false)
     const initPhys = s.info && s.info.physics ? s.info.physics : null
     setPhysData(initPhys)
     setSimMat((s.info && s.info.m) || 'Al 6061')
     setPartMats((initPhys && initPhys.part_materials) || {})
-    setSimAnim({ active: false, running: false, progress: 0, crumpleRatio: 0.18, obstacle: 'concrete_wall' })
+    setCustomColors((initPhys && initPhys.part_colors) || {})
+    setSimAnim({ active: false, runId: 0, crumpleRatio: 0.18, obstacle: 'concrete_wall' })
     const onKey = e => { if (e.key === 'Escape') onClose() }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [s.open, s.job, s.info, s.mesh, onClose])
 
-  // Run 60 FPS Crash / Wind-Tunnel Animation + Backend Physics Recalculation
+  // Starts 60 FPS canvas animation in 0ms and fetches updated physics telemetry in parallel!
   const runCrashSim = async () => {
     setAuto(false)
-    let cr = 0.22
-    let fMode = 'ductile_crumple'
-    let impAxis = null
+    const estCr = Math.min(0.58, 0.08 + (speed / 220) * 0.35)
+    const nextRunId = Date.now()
+
+    // 1. Trigger 60 FPS canvas animation immediately (zero wait time!)
+    setSimAnim(prev => ({
+      active: true,
+      runId: nextRunId,
+      crumpleRatio: prev.crumpleRatio || estCr,
+      obstacle,
+      failureMode: prev.failureMode || 'ductile_crumple',
+      impactAxis: prev.impactAxis || null
+    }))
+
+    // 2. Fetch exact physics telemetry from backend in parallel
     try {
       if (s.job) {
         const res = await simulatePhysics(s.job, {
@@ -507,32 +521,25 @@ function MeshModal({ s, onClose, onGoPricing }) {
         if (res && res.physics) {
           setPhysData(res.physics)
           const ct = res.physics.edge_cases?.crash_test || {}
-          cr = ct.crumple_ratio || 0.22
-          fMode = ct.failure_mode || 'ductile_crumple'
-          impAxis = ct.impact_axis || res.physics.impact_axis || null
+          setSimAnim(prev => ({
+            ...prev,
+            crumpleRatio: ct.crumple_ratio || estCr,
+            failureMode: ct.failure_mode || 'ductile_crumple',
+            impactAxis: ct.impact_axis || res.physics.impact_axis || null
+          }))
         }
       }
     } catch {
-      cr = Math.min(0.55, 0.12 + (speed / 240) * 0.35)
+      /* keep local estimate */
     }
-
-    const tStart = performance.now()
-    const duration = 1800 // 1.8s 60fps impact animation
-    setSimAnim({ active: true, running: true, progress: 0, crumpleRatio: cr, obstacle, failureMode: fMode, impactAxis: impAxis })
-
-    const step = now => {
-      const p = Math.min(1, (now - tStart) / duration)
-      setSimAnim({ active: true, running: p < 1, progress: p, crumpleRatio: cr, obstacle, failureMode: fMode, impactAxis: impAxis })
-      if (p < 1) requestAnimationFrame(step)
-    }
-    requestAnimationFrame(step)
   }
 
   const resetSim = () => {
-    setSimAnim({ active: false, running: false, progress: 0, crumpleRatio: 0.18, obstacle })
+    setSimAnim({ active: false, runId: 0, crumpleRatio: 0.18, obstacle })
   }
 
-  const partColors = (physData && physData.part_colors) || (s.info?.physics?.part_colors) || null
+  const baseColors = (physData && physData.part_colors) || (s.info?.physics?.part_colors) || {}
+  const partColors = { ...baseColors, ...customColors }
   const crash = physData?.edge_cases?.crash_test
   const windTest = physData?.edge_cases?.wind_shear
   const buckTest = physData?.edge_cases?.axial_buckling
@@ -560,7 +567,8 @@ function MeshModal({ s, onClose, onGoPricing }) {
         <div className="mvw">
           {s.open && s.mesh
             ? <MeshViewer mesh={s.mesh} wire={wire} auto={auto} resetKey={rk} dims={dims} axes={axes} grid={grid}
-                measure={measure} clearKey={ck} onMeasure={setPts} partColors={partColors} simState={{ ...simAnim, showHeatmap }} />
+                measure={measure} clearKey={ck} onMeasure={setPts} partColors={partColors}
+                simState={{ ...simAnim, showHeatmap, speed, wind, partMats, simMat, flipDirection }} />
             : <div className="mv nomesh">Preview not available</div>}
           <div className="vt">
             {tgl(dims, setDims, 'Dimensions')}
@@ -575,14 +583,15 @@ function MeshModal({ s, onClose, onGoPricing }) {
           {info && !lab && s.info ? <InfoPanel v={s.info} mesh={s.mesh} pts={pts} measureOn={measure} /> : null}
 
           {lab && (
-            <div className="ip" style={{ width: 320, maxHeight: '82%', overflowY: 'auto' }}>
-              <h4 className="ih">Obstacle & Test Regime</h4>
+            <div className="ip" style={{ width: 330, maxHeight: '84%', overflowY: 'auto' }}>
+              <h4 className="ih">Roadway Proving Ground</h4>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 10 }}>
                 {[
                   ['concrete_wall', '🧱 Frontal Concrete Wall Impact'],
-                  ['bollard_pole', '💈 Center Bollard Pole Impact'],
+                  ['bollard_pole', '💈 Center Steel Bollard Pole'],
                   ['spike_strip', '📌 Road Spike Strip (Tire Blowout)'],
-                  ['wind_and_thrust', '🌪️ Crosswind Shear & 6G Buckling']
+                  ['speed_bump', '⛰️ High-Speed Baja Speed-Bump Jump'],
+                  ['wind_and_thrust', '🌪️ Crosswind Gale & Body-Roll Test']
                 ].map(([id, label]) => (
                   <button
                     key={id}
@@ -604,7 +613,7 @@ function MeshModal({ s, onClose, onGoPricing }) {
 
               <h4 className="ih">Simulation Parameters</h4>
               <div className="ir">
-                <span>Impact Speed</span>
+                <span>Vehicle Speed</span>
                 <b>{speed} km/h</b>
               </div>
               <input type="range" min="15" max="220" value={speed} onChange={e => setSpeed(Number(e.target.value))} style={{ width: '100%' }} />
@@ -624,26 +633,35 @@ function MeshModal({ s, onClose, onGoPricing }) {
 
               {s.mesh?.parts?.length > 0 && (
                 <>
-                  <h4 className="ih">Per-Part Material & Color</h4>
-                  {s.mesh.parts.map(pname => (
-                    <div className="ir" key={pname} style={{ gap: 6 }}>
-                      <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                        <i style={{ width: 10, height: 10, borderRadius: 2, background: (partColors && partColors[pname]) || '#94a3b8', display: 'inline-block' }} />
-                        {pname}
-                      </span>
-                      <select
-                        value={partMats[pname] || simMat}
-                        onChange={e => setPartMats(p => ({ ...p, [pname]: e.target.value }))}
-                      >
-                        {MATS.map(m => <option key={m}>{m}</option>)}
-                      </select>
-                    </div>
-                  ))}
+                  <h4 className="ih">Per-Part Color & Material</h4>
+                  {s.mesh.parts.map((pname, idx) => {
+                    const curHex = (partColors && partColors[pname]) || ['#ef4444', '#38bdf8', '#1e293b', '#94a3b8'][idx % 4]
+                    return (
+                      <div className="ir" key={pname} style={{ gap: 6 }}>
+                        <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                          <input
+                            type="color"
+                            value={curHex}
+                            title={`Change color of ${pname}`}
+                            onChange={e => setCustomColors(c => ({ ...c, [pname]: e.target.value }))}
+                            style={{ width: 20, height: 20, padding: 0, border: 'none', borderRadius: 4, cursor: 'pointer', background: 'none' }}
+                          />
+                          {pname}
+                        </span>
+                        <select
+                          value={partMats[pname] || simMat}
+                          onChange={e => setPartMats(p => ({ ...p, [pname]: e.target.value }))}
+                        >
+                          {MATS.map(m => <option key={m}>{m}</option>)}
+                        </select>
+                      </div>
+                    )
+                  })}
                 </>
               )}
 
               <h4 className="ih">Visual Render Mode</h4>
-              <div className="seg" style={{ marginBottom: 10 }}>
+              <div className="seg" style={{ marginBottom: 8 }}>
                 <button className={!showHeatmap ? 'on' : ''} onClick={() => setShowHeatmap(false)}>
                   🎨 True Material Colors
                 </button>
@@ -652,9 +670,16 @@ function MeshModal({ s, onClose, onGoPricing }) {
                 </button>
               </div>
 
-              <div style={{ display: 'flex', gap: 6, marginTop: 10 }}>
+              <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
                 <button className="btn p" style={{ flex: 1 }} onClick={runCrashSim}>
                   ▶ Run Simulation
+                </button>
+                <button
+                  className={'btn' + (flipDirection ? ' on' : '')}
+                  title="Flip Front/Rear Impact Direction"
+                  onClick={() => setFlipDirection(f => !f)}
+                >
+                  ⇄ Flip Dir
                 </button>
                 {simAnim.active && (
                   <button className="btn" onClick={resetSim}>Reset</button>
@@ -665,6 +690,7 @@ function MeshModal({ s, onClose, onGoPricing }) {
                 <>
                   <h4 className="ih">Edge-Case Telemetry</h4>
                   <div className="ir"><span>Status</span><b style={{ color: crash.survived ? '#2fb67c' : '#ef4444' }}>{crash.survived ? '✓ SURVIVED' : '⚠ PLASTIC FRACTURE'}</b></div>
+                  {crash.failure_description && <div className="eq" style={{ marginBottom: 6 }}>{crash.failure_description}</div>}
                   <div className="ir"><span>Safety Factor</span><b>{physData.overall_safety_factor}×</b></div>
                   <div className="ir"><span>Peak Deceleration</span><b>{crash.peak_deceleration_g} G</b></div>
                   <div className="ir"><span>Crumple Depth</span><b>{crash.crumple_depth_mm} mm ({(crash.crumple_ratio * 100).toFixed(1)}%)</b></div>

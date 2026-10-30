@@ -460,6 +460,9 @@ function MeshModal({ s, onClose, onGoPricing }) {
   const [obstacle, setObstacle] = useState('concrete_wall')
   const [speed, setSpeed] = useState(72)
   const [wind, setWind] = useState(45)
+  const [ageYears, setAgeYears] = useState(0)
+  const [tempC, setTempC] = useState(25)
+  const [humidityPct, setHumidityPct] = useState(50)
   const [simMat, setSimMat] = useState('Al 6061')
   const [partMats, setPartMats] = useState({})
   const [customColors, setCustomColors] = useState({})
@@ -492,21 +495,36 @@ function MeshModal({ s, onClose, onGoPricing }) {
     return () => window.removeEventListener('keydown', onKey)
   }, [s.open, s.job, s.info, s.mesh, onClose])
 
-  // Starts 60 FPS canvas animation in 0ms and fetches updated physics telemetry in parallel!
+  const animRafRef = useRef(0)
+
   const runCrashSim = async () => {
     setAuto(false)
-    const estCr = Math.min(0.58, 0.08 + (speed / 220) * 0.35)
-    const nextRunId = Date.now()
+    if (animRafRef.current) cancelAnimationFrame(animRafRef.current)
 
-    // 1. Trigger 60 FPS canvas animation immediately (zero wait time!)
-    setSimAnim(prev => ({
-      active: true,
-      runId: nextRunId,
-      crumpleRatio: prev.crumpleRatio || estCr,
-      obstacle,
-      failureMode: prev.failureMode || 'ductile_crumple',
-      impactAxis: prev.impactAxis || null
-    }))
+    // Scale animation duration inversely with speed:
+    // 20 km/h -> 2800ms (slow crawl); 72 km/h -> 1950ms; 220 km/h -> 1050ms (fast high-velocity crash)
+    const clampedSpd = Math.max(15, Math.min(240, Number(speed || 72)))
+    const duration = Math.round(2900 - ((clampedSpd - 15) / 225) * 1850)
+    const estCr = Math.min(0.58, 0.08 + (clampedSpd / 220) * 0.35)
+    const nextRunId = Date.now()
+    const tStart = performance.now()
+
+    const step = now => {
+      const p = Math.min(1, Math.max(0, (now - tStart) / duration))
+      setSimAnim(prev => ({
+        ...prev,
+        active: true,
+        running: p < 1,
+        runId: nextRunId,
+        progress: p,
+        crumpleRatio: prev.crumpleRatio || estCr,
+        obstacle
+      }))
+      if (p < 1) {
+        animRafRef.current = requestAnimationFrame(step)
+      }
+    }
+    animRafRef.current = requestAnimationFrame(step)
 
     // 2. Fetch exact physics telemetry from backend in parallel
     try {
@@ -516,7 +534,10 @@ function MeshModal({ s, onClose, onGoPricing }) {
           speed_kmh: speed,
           wind_m_s: wind,
           obstacle,
-          part_materials: partMats
+          part_materials: partMats,
+          age_years: ageYears,
+          temp_c: tempC,
+          humidity_pct: humidityPct
         })
         if (res && res.physics) {
           setPhysData(res.physics)
@@ -686,11 +707,68 @@ function MeshModal({ s, onClose, onGoPricing }) {
                 )}
               </div>
 
+              <h4 className="ih">Material Aging & Environment</h4>
+              <div className="ir">
+                <span>Climate Preset</span>
+                <select
+                  onChange={e => {
+                    const [a, t, h] = e.target.value.split(',').map(Number)
+                    setAgeYears(a); setTempC(t); setHumidityPct(h)
+                  }}
+                >
+                  <option value="0,25,50">🏭 Factory New (0 yr · 25°C · 50% RH)</option>
+                  <option value="5,35,85">🌴 Tropical / Coastal (5 yr · 35°C · 85% RH)</option>
+                  <option value="10,45,25">🏜️ Desert Thermal (10 yr · 45°C · 25% RH)</option>
+                  <option value="8,-20,65">❄️ Arctic Sub-Zero (8 yr · -20°C · 65% RH)</option>
+                </select>
+              </div>
+              <div className="ir" style={{ marginTop: 4 }}>
+                <span>Service Age</span>
+                <b>{ageYears} yrs</b>
+              </div>
+              <input type="range" min="0" max="25" step="1" value={ageYears} onChange={e => setAgeYears(Number(e.target.value))} style={{ width: '100%' }} />
+              <div className="ir" style={{ marginTop: 4 }}>
+                <span>Temp / Humidity</span>
+                <b>{tempC}°C · {humidityPct}% RH</b>
+              </div>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <input type="range" min="-30" max="85" value={tempC} onChange={e => setTempC(Number(e.target.value))} style={{ width: '50%' }} title="Ambient Temperature (°C)" />
+                <input type="range" min="10" max="100" value={humidityPct} onChange={e => setHumidityPct(Number(e.target.value))} style={{ width: '50%' }} title="Relative Humidity (%)" />
+              </div>
+
               {crash && (
                 <>
                   <h4 className="ih">Edge-Case Telemetry</h4>
                   <div className="ir"><span>Status</span><b style={{ color: crash.survived ? '#2fb67c' : '#ef4444' }}>{crash.survived ? '✓ SURVIVED' : '⚠ PLASTIC FRACTURE'}</b></div>
                   {crash.failure_description && <div className="eq" style={{ marginBottom: 6 }}>{crash.failure_description}</div>}
+                  {physData?.ncap_rating && (
+                    <div className="ir">
+                      <span>NCAP Rating</span>
+                      <b style={{ color: '#f59e0b', letterSpacing: 1 }}>
+                        {physData.ncap_rating.star_string} ({physData.ncap_rating.aop_score_16}/16 pt)
+                      </b>
+                    </div>
+                  )}
+                  {physData?.aging_report && ageYears > 0 && (
+                    <div className="ir">
+                      <span>Strength Retention</span>
+                      <b style={{ color: physData.aging_report.retention_pct < 75 ? '#ef4444' : '#eab308' }}>
+                        {physData.aging_report.retention_pct}% ({physData.aging_report.degraded_yield_mpa} MPa)
+                      </b>
+                    </div>
+                  )}
+                  {physData?.error_metrics && (
+                    <>
+                      <div className="ir">
+                        <span>CAD B-Rep Error</span>
+                        <b>±{physData.error_metrics.cad_brep_error_pct}% (Exact Kernel)</b>
+                      </div>
+                      <div className="ir">
+                        <span>FEA Solver Margin</span>
+                        <b>±{physData.error_metrics.fea_surrogate_error_pct}% ({physData.error_metrics.solver_confidence_pct}% Conf.)</b>
+                      </div>
+                    </>
+                  )}
                   <div className="ir"><span>Safety Factor</span><b>{physData.overall_safety_factor}×</b></div>
                   <div className="ir"><span>Peak Deceleration</span><b>{crash.peak_deceleration_g} G</b></div>
                   <div className="ir"><span>Crumple Depth</span><b>{crash.crumple_depth_mm} mm ({(crash.crumple_ratio * 100).toFixed(1)}%)</b></div>

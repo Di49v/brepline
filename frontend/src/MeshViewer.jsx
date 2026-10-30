@@ -102,37 +102,37 @@ function prep(mesh) {
     area += l / 2
   }
 
-  // Automatically detect which end (+1 = mx, -1 = mn) is the aerodynamic Front Nose of the vehicle!
+  // Detect Front Nose (+1 = +X, -1 = -X) by comparing max Z height of body_shell at +X tip vs -X tip!
+  // On every car/truck, the aerodynamic front hood/nose is lower in Z than the rear cabin/trunk/spoiler.
   const partNames = mesh.parts || []
   const triPart = mesh.tri_part || null
-  let autoFrontSignX = 1
-  if (partNames.length && triPart) {
-    const spoilerIdx = partNames.findIndex(nm => /spoiler|tail|rear|nozzle|fin/i.test(String(nm)))
-    if (spoilerIdx >= 0) {
-      let sumX = 0, cnt = 0
-      for (let t = 0; t < m; t++) {
-        if (triPart[t] === spoilerIdx) {
-          sumX += V[T[t * 3] * 3]
-          cnt++
-        }
-      }
-      if (cnt > 0) {
-        // If rear_spoiler is at +X (> c[0]), then the Front Nose is at -X (-1)!
-        autoFrontSignX = (sumX / cnt) > c[0] ? -1 : 1
-      }
-    } else {
-      // Compare average Z height of extreme +X end vs extreme -X end (lower hood = front nose)
-      const spanX = Math.max(mx[0] - mn[0], 1)
-      let zPosSum = 0, zPosCnt = 0, zNegSum = 0, zNegCnt = 0
-      for (let i = 0; i < n; i++) {
-        const vx = V[i * 3], vz = V[i * 3 + 2]
-        if (vx > mx[0] - spanX * 0.22) { zPosSum += vz; zPosCnt++ }
-        if (vx < mn[0] + spanX * 0.22) { zNegSum += vz; zNegCnt++ }
-      }
-      if (zPosCnt > 0 && zNegCnt > 0) {
-        autoFrontSignX = (zNegSum / zNegCnt) < (zPosSum / zPosCnt) ? -1 : 1
-      }
+  const bodyIdx = partNames.findIndex(nm => /body|chassis|shell/i.test(String(nm)))
+  const spanX = Math.max(mx[0] - mn[0], 1)
+  let zPosMax = -1e9, zNegMax = -1e9
+  let zPosSum = 0, zPosCnt = 0, zNegSum = 0, zNegCnt = 0
+
+  if (bodyIdx >= 0 && triPart) {
+    for (let t = 0; t < m; t++) {
+      if (triPart[t] !== bodyIdx) continue
+      const i0 = T[t * 3] * 3
+      const vx = V[i0], vz = V[i0 + 2]
+      if (vx > mx[0] - spanX * 0.25) { zPosSum += vz; zPosCnt++; if (vz > zPosMax) zPosMax = vz }
+      if (vx < mn[0] + spanX * 0.25) { zNegSum += vz; zNegCnt++; if (vz > zNegMax) zNegMax = vz }
     }
+  }
+  if (zPosCnt === 0 || zNegCnt === 0) {
+    for (let i = 0; i < n; i++) {
+      const vx = V[i * 3], vz = V[i * 3 + 2]
+      if (vx > mx[0] - spanX * 0.25) { zPosSum += vz; zPosCnt++; if (vz > zPosMax) zPosMax = vz }
+      if (vx < mn[0] + spanX * 0.25) { zNegSum += vz; zNegCnt++; if (vz > zNegMax) zNegMax = vz }
+    }
+  }
+  let autoFrontSignX = 1
+  if (zPosCnt > 0 && zNegCnt > 0) {
+    // Whichever end has the lower profile height is the Front Hood/Nose!
+    const scorePos = (zPosSum / zPosCnt) * 0.6 + zPosMax * 0.4
+    const scoreNeg = (zNegSum / zNegCnt) * 0.6 + zNegMax * 0.4
+    autoFrontSignX = scorePos <= scoreNeg ? 1 : -1
   }
 
   p = {
@@ -229,7 +229,7 @@ export function drawMesh(ctx, w, h, mesh, o = {}) {
   const frontSpan = Math.max(p.mx[crashAxis] - p.mn[crashAxis], 1)
 
   const simActive = Boolean(sim && sim.active)
-  const prog = simActive ? Math.min(1, Math.max(0, animProgress)) : 0
+  const prog = simActive ? Math.min(1, Math.max(0, sim.progress !== undefined ? sim.progress : animProgress)) : 0
   const speedKmh = simActive ? Number(sim.speed || 72) : 72
   const crumpleRatio = simActive ? Math.min(0.68, Math.max(0.03, sim.crumpleRatio || 0.18)) : 0
   const obstacle = simActive ? (sim.obstacle || 'concrete_wall') : null
@@ -239,10 +239,10 @@ export function drawMesh(ctx, w, h, mesh, o = {}) {
 
   // High-speed camera impact shake right at the moment of collision (prog 0.36 -> 0.58)
   let shakeX = 0, shakeY = 0
-  if (simActive && obstacle !== 'wind_and_thrust' && prog > 0.36 && prog < 0.62) {
-    const shakeAmp = Math.min(14, (speedKmh / 140) * 7.5) * Math.exp(-(prog - 0.36) * 14)
-    shakeX = Math.sin(prog * 280) * shakeAmp
-    shakeY = Math.cos(prog * 340) * shakeAmp * 0.7
+  if (simActive && obstacle !== 'wind_and_thrust' && prog > 0.36 && prog < 0.64) {
+    const shakeAmp = Math.min(12, (speedKmh / 140) * 6.5) * Math.exp(-(prog - 0.36) * 14)
+    shakeX = Math.sin(prog * 260) * shakeAmp
+    shakeY = Math.cos(prog * 320) * shakeAmp * 0.7
   }
   const ox = w / 2 + shakeX
   const oy = h / 2 + shakeY
@@ -278,14 +278,13 @@ export function drawMesh(ctx, w, h, mesh, o = {}) {
         vMatMode[i0] = mCode; vMatMode[i1] = mCode; vMatMode[i2] = mCode
       }
     } else {
-      const defaultMCode = matToCode(primaryMat)
-      vMatMode.fill(defaultMCode)
+      vMatMode.fill(matToCode(primaryMat))
     }
   }
 
   // Stationary Obstacle Plane at `fixedWallCoord`
   const fixedWallCoord = frontExtreme - dirSign * (frontSpan * 0.04)
-  const impactPhase = prog <= 0.36 ? 0 : 1 - Math.pow(1 - (prog - 0.36) / 0.64, 2.4)
+  const impactPhase = prog <= 0.38 ? 0 : 1 - Math.pow(1 - (prog - 0.38) / 0.62, 2.2)
 
   // Elastic rebound for Rubber or low-speed impacts
   const isRubberBody = String(primaryMat).toLowerCase().includes('rubber')
@@ -294,9 +293,33 @@ export function drawMesh(ctx, w, h, mesh, o = {}) {
     : 0
 
   const crushAdvance = (impactPhase * crumpleRatio * frontSpan) - reboundBack
-  const approachShift = prog <= 0.36
-    ? -dirSign * (1 - prog / 0.36) * (frontSpan * 0.32)
+  const approachShift = prog <= 0.38
+    ? -dirSign * (1 - prog / 0.38) * (frontSpan * 0.35)
     : dirSign * crushAdvance
+
+  // Precompute Rigid-Body Axle Pitch & Airborne Jump Kinematics for `speed_bump`
+  let bumpTravelX = 0, bumpPitchRad = 0, bumpHeaveZ = 0
+  if (simActive && obstacle === 'speed_bump') {
+    bumpTravelX = dirSign * (prog - 0.50) * (spanX * 0.85)
+    const bumpHalfW = spanX * 0.14
+    const bumpMaxH = spanZ * 0.18 * Math.min(1.5, Math.max(0.7, speedKmh / 75))
+    const frontAxleWorldX = c[0] + dirSign * (spanX * 0.30) + bumpTravelX
+    const rearAxleWorldX = c[0] - dirSign * (spanX * 0.30) + bumpTravelX
+    const rampZ = wx => {
+      const d = Math.abs(wx - c[0])
+      if (d >= bumpHalfW) return 0
+      const h = Math.cos((d / bumpHalfW) * (Math.PI / 2))
+      return bumpMaxH * h * h
+    }
+    const zF = rampZ(frontAxleWorldX)
+    const zR = rampZ(rearAxleWorldX)
+    // Add ballistic airborne jump arc after front axle clears the crest at high speeds!
+    const airArc = speedKmh > 65 && prog > 0.42 && prog < 0.88
+      ? Math.sin(((prog - 0.42) / 0.46) * Math.PI) * bumpMaxH * Math.min(1.4, (speedKmh - 55) / 110)
+      : 0
+    bumpHeaveZ = (zF + zR) * 0.5 + airArc
+    bumpPitchRad = Math.atan2((zF - zR) * dirSign, spanX * 0.60)
+  }
 
   const vStress = simActive ? new Float32Array(n) : null
 
@@ -322,7 +345,7 @@ export function drawMesh(ctx, w, h, mesh, o = {}) {
         localStress = Math.min(1, zNorm * 1.15 * flutter * (role === 3 ? 1.4 : 0.9))
       } else if (obstacle === 'spike_strip') {
         // Vehicle drives forward in `dirSign` direction over road spikes at X = c[0]!
-        const travel = dirSign * (prog - 0.35) * (spanX * 0.48)
+        const travel = dirSign * (prog - 0.42) * (spanX * 0.72)
         const origVx = vx
         vx += travel
         const zFromGround = vz - p.mn[2]
@@ -331,47 +354,43 @@ export function drawMesh(ctx, w, h, mesh, o = {}) {
 
         // Sequential axle blowout: a wheel only deflates AFTER its X coordinate crosses the spikes at c[0]!
         const distPastSpikes = (vx - c[0]) * dirSign
-        const axleCrossed = distPastSpikes > -spanX * 0.05
+        const axleCrossed = distPastSpikes > -spanX * 0.04
 
-        if (prog > 0.22 && axleCrossed) {
-          const localDeflate = Math.min(1, Math.max(0, (distPastSpikes + spanX * 0.05) / (spanX * 0.25)))
+        if (prog > 0.20 && axleCrossed) {
+          const localDeflate = Math.min(1, Math.max(0, (distPastSpikes + spanX * 0.04) / (spanX * 0.22)))
           if (isWheel) {
             if (zFromGround < tireRadiusEst * 0.78) {
               const crushUp = (tireRadiusEst * 0.78 - zFromGround) * 0.75 * localDeflate
               vz += crushUp
-              vy += (vy >= c[1] ? 1 : -1) * crushUp * 0.55 * Math.sin(i * 9.17 + prog * 15.0)
+              vy += (vy >= c[1] ? 1 : -1) * crushUp * 0.50 * Math.sin(i * 9.17 + prog * 15.0)
               localStress = Math.min(1, 0.82 + 0.18 * localDeflate)
             } else {
-              vz -= tireRadiusEst * 0.25 * localDeflate
+              vz -= tireRadiusEst * 0.24 * localDeflate
               localStress = 0.55 * localDeflate
             }
           } else {
-            const drop = tireRadiusEst * 0.24 * localDeflate
-            vz -= drop
+            vz -= tireRadiusEst * 0.24 * localDeflate
             localStress = 0.20 * localDeflate
           }
-        } else if (prog > 0.35 && !isWheel) {
+        } else if (prog > 0.30 && !isWheel) {
           // Slight pitch forward while front axle is deflated and rear axle is still inflated
           const isFrontHalf = (origVx - c[0]) * dirSign > 0
-          if (isFrontHalf) vz -= tireRadiusEst * 0.14 * ((prog - 0.35) / 0.65)
+          if (isFrontHalf) vz -= tireRadiusEst * 0.12 * ((prog - 0.30) / 0.70)
         }
       } else if (obstacle === 'speed_bump') {
-        // High-Speed Baja Speed-Bump Jump: Vehicle drives over a 3D curved asphalt ramp at X = c[0]!
-        const travel = dirSign * (prog - 0.42) * (spanX * 0.62)
-        vx += travel
-        const bumpWidth = spanX * 0.22
-        const bumpHeight = spanZ * 0.22 * Math.min(1.6, speedKmh / 75)
-        const distFromBump = Math.abs(vx - c[0])
-        if (distFromBump < bumpWidth) {
-          const hump = Math.cos((distFromBump / bumpWidth) * (Math.PI / 2))
-          const lift = bumpHeight * (hump * hump)
-          const isWheel = vRole ? role === 1 : ((vz - p.mn[2]) < spanZ * 0.28)
-          // Wheels compress suspension slightly while lifting chassis over the crest
-          vz += isWheel ? lift * 0.95 : lift * 0.82
-          localStress = Math.min(1, hump * (isWheel ? 0.95 : 0.55) * (speedKmh / 90))
-        }
+        // True Rigid-Body Suspension Pitch & Airborne Jump over the Speed Bump!
+        const dx = vx - c[0]
+        const dz = vz - c[2]
+        const cosP = Math.cos(bumpPitchRad), sinP = Math.sin(bumpPitchRad)
+        vx = c[0] + dx * cosP - dz * sinP + bumpTravelX
+        vz = c[2] + dx * sinP + dz * cosP + bumpHeaveZ
+
+        // Highlight suspension & tire stress when crossing the ramp
+        const isWheel = vRole ? role === 1 : ((V[i * 3 + 2] - p.mn[2]) < spanZ * 0.30)
+        const suspensionLoad = Math.min(1, (bumpHeaveZ / Math.max(spanZ * 0.18, 1)) * (speedKmh / 85))
+        localStress = isWheel ? Math.min(1, suspensionLoad * 1.25) : suspensionLoad * 0.45
       } else {
-        // Frontal Concrete Wall or Center Bollard Pole (Always hits Front Nose in `dirSign` direction!)
+        // Frontal Concrete Wall or Center Steel Bollard Pole
         let primary = (crashAxis === 2 ? vz : (crashAxis === 0 ? vx : vy)) + approachShift
         if (crashAxis === 2) vz = primary
         else if (crashAxis === 0) vx = primary
@@ -397,38 +416,49 @@ export function drawMesh(ctx, w, h, mesh, o = {}) {
               else if (crashAxis === 0) vx = clamped
               else vy = clamped
               vy += (vy >= c[1] ? 1 : -1) * pen * (0.45 + frac * 0.75)
-              vz += (frac - 0.35) * pen * 0.5
+              vz += (frac - 0.35) * pen * 0.4
+            } else if (obstacle === 'bollard_pole') {
+              // Cylindrical Bollard Pole Indentation: center vertices wrap around the cylindrical pole profile
+              // WITHOUT shooting upward into a vertical spike!
+              const cylDepth = Math.sqrt(Math.max(0, poleRadius * poleRadius - distFromPoleCenter * distFromPoleCenter))
+              const clamped = fixedWallCoord - dirSign * (cylDepth * 0.35)
+              if (crashAxis === 2) vz = clamped
+              else if (crashAxis === 0) vx = clamped
+              else vy = clamped
+              // Slight hood buckle (capped at 8% of spanZ so it never spikes!)
+              vz += Math.min(spanZ * 0.08, pen * 0.08) * Math.sin((distFromPoleCenter / poleRadius) * (Math.PI / 2))
             } else {
-              // Ductile accordion crumple + hood buckling upward
+              // Concrete Wall Ductile Accordion Crumple
               const foldFreq = matMode === 3 ? 0.025 : 0.045
-              const foldWave = Math.sin((pen / Math.max(frontSpan * foldFreq, 1)) * Math.PI * 2) * 0.14
+              const foldWave = Math.sin((pen / Math.max(frontSpan * foldFreq, 1)) * Math.PI * 2) * 0.12
               const clamped = fixedWallCoord - dirSign * Math.abs(foldWave) * (frontSpan * 0.015)
               if (crashAxis === 2) {
                 vz = clamped
-                vx += (vx - c[0]) * (0.32 + foldWave) * (pen / frontSpan)
-                vy += (vy - c[1]) * (0.32 + foldWave) * (pen / frontSpan)
+                vx += (vx - c[0]) * (0.30 + foldWave) * (pen / frontSpan)
+                vy += (vy - c[1]) * (0.30 + foldWave) * (pen / frontSpan)
               } else if (crashAxis === 0) {
                 vx = clamped
-                vy += (vy >= c[1] ? 1 : -1) * pen * (0.18 + foldWave)
-                vz += Math.max(0, (vz - p.mn[2]) / Math.max(spanZ, 1)) * pen * (0.32 + Math.abs(foldWave))
+                vy += (vy >= c[1] ? 1 : -1) * pen * (0.16 + foldWave)
+                vz += Math.min(spanZ * 0.18, Math.max(0, (vz - p.mn[2]) / Math.max(spanZ, 1)) * pen * 0.22)
               } else {
                 vy = clamped
-                vx += (vx >= c[0] ? 1 : -1) * pen * (0.18 + foldWave)
+                vx += (vx >= c[0] ? 1 : -1) * pen * (0.16 + foldWave)
               }
             }
             localStress = Math.min(1, 0.65 + (pen / (crumpleRatio * frontSpan + 1e-3)) * 0.50)
           } else if (obstacle === 'bollard_pole') {
-            // Left and right fenders wrap forward around the stationary pole!
-            const wrapFactor = Math.exp(-(distFromPoleCenter - poleRadius) / (latSpan * 0.28))
-            const dragBack = pen * wrapFactor * 0.82
+            // Outer fenders advance forward past the pole while wrapping inward toward Y=0!
+            const normLat = (distFromPoleCenter - poleRadius) / Math.max(latSpan * 0.5 - poleRadius, 1)
+            const inwardPinch = pen * 0.28 * (1 - normLat * 0.5)
+            const dragBack = pen * 0.45 * Math.exp(-normLat * 2.2)
             if (crashAxis === 2) vz -= dirSign * dragBack
             else if (crashAxis === 0) {
               vx -= dirSign * dragBack
-              vy -= Math.sign(latCoord) * pen * wrapFactor * 0.24
+              vy -= Math.sign(latCoord) * inwardPinch
             } else {
               vy -= dirSign * dragBack
             }
-            localStress = Math.min(0.92, wrapFactor * 0.90)
+            localStress = Math.min(0.92, Math.exp(-normLat * 1.8) * 0.90)
           }
         } else if (impactPhase > 0) {
           const distToWall = Math.max(0, -pen)
@@ -632,7 +662,7 @@ export function drawMesh(ctx, w, h, mesh, o = {}) {
       const pY = crashAxis === 1 ? fixedWallCoord : p.c[1]
       const bot = crashAxis === 2 ? pr(p.mn[0] - spanX * 0.3, p.c[1], fixedWallCoord) : pr(pX, pY, p.mn[2])
       const top = crashAxis === 2 ? pr(p.mx[0] + spanX * 0.3, p.c[1], fixedWallCoord) : pr(pX, pY, p.mx[2] + spanZ * 0.28)
-      ctx.strokeStyle = '#f59e0b'
+      ctx.strokeStyle = 'rgba(245, 158, 11, 0.85)'
       ctx.lineWidth = Math.max(14, diag * 0.045 * s)
       ctx.lineCap = 'round'
       ctx.beginPath()
@@ -663,8 +693,8 @@ export function drawMesh(ctx, w, h, mesh, o = {}) {
       ctx.fillStyle = 'rgba(245, 158, 11, 0.35)'
       ctx.strokeStyle = '#f59e0b'
       ctx.lineWidth = 2.5
-      const bw = spanX * 0.16
-      const bh = spanZ * 0.16
+      const bw = spanX * 0.14
+      const bh = spanZ * 0.15
       const c1 = pr(p.c[0] - bw, p.mn[1] - spanY * 0.15, p.mn[2])
       const c2 = pr(p.c[0], p.mn[1] - spanY * 0.15, p.mn[2] + bh)
       const c3 = pr(p.c[0] + bw, p.mn[1] - spanY * 0.15, p.mn[2])

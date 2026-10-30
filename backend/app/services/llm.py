@@ -38,7 +38,7 @@ class LLMService:
                 timeout=300.0,
                 max_retries=0
             ))
-            for key in settings.gemini_key_pool
+            for key in settings.gemini_key_pool 
         ]
 
         # 3. Groq Cloud Client Pool (Sharded across all keys in PLAN_API_KEYS / PLAN_API_KEY)

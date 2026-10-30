@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import MeshViewer, { Thumb, meshStats, fm } from './MeshViewer.jsx'
-import { generate, vote as sendVote, fileUrl, health, cancelJob, simulatePhysics } from './api.js'
+import { generate, vote as sendVote, fileUrl, health, cancelJob, simulatePhysics, fetchHistory } from './api.js'
 import ShapeEditor from './ShapeEditor.jsx'
 
 /* ---------- static data ---------- */
@@ -20,6 +20,8 @@ const SUB = [
 ]
 const ACCENTS = ['#f26a1b', '#e0a100', '#2f7de1', '#2fb67c']
 const CHIPS = [
+  ['SPORTS CAR', 'Build a GT sports car with a sculpted aerodynamic body shell, translucent glass windshield canopy, 4 rubber wheels with alloy rims, and a rear spoiler'],
+  ['ROCKET', 'Build a multi-stage sounding rocket with nose cone, fuselage, boat-tail nozzle, and 4 swept fins'],
   ['BRACKET', 'L-bracket 60 mm wide, 40 mm base, 40 mm tall, 5 mm thick, two 6 mm mounting holes in the base'],
   ['GEAR', 'Create a 24-tooth spur gear, module 2, 10 mm bore, 8 mm thick'],
   ['ENCLOSURE', 'Electronics enclosure 80 x 50 x 30 mm, 2 mm walls, open top, USB cutout on one side'],
@@ -43,7 +45,7 @@ const P = {
 }
 
 /* ---------- helpers ---------- */
-const fname = t => t.split(' ').slice(0, 3).join('_').toLowerCase().replace(/[^a-z0-9_]/g, '') || 'part'
+const fname = t => String(t || 'part').split(' ').slice(0, 3).join('_').toLowerCase().replace(/[^a-z0-9_]/g, '') || 'part'
 
 // real download from the backend: ext = step | stl | py
 function dl(job, ext) {
@@ -57,16 +59,17 @@ function dl(job, ext) {
 }
 
 const fmtMass = g => (g >= 1000 ? (g / 1000).toFixed(2) + ' kg' : Number(g || 0).toFixed(1) + ' g')
-const fmtSize = b => (b || []).map(x => Math.round(x * 10) / 10).join(' × ') + ' mm'
+const fmtSize = b => (Array.isArray(b) ? b : [0, 0, 0]).map(x => Math.round(Number(x || 0) * 10) / 10).join(' × ') + ' mm'
 
 // turn a backend result into one "version" of a chat answer
 function toVersion(r, prompt, f, m) {
+  const safePrompt = String(prompt || 'CAD Design')
   return {
     job: r.job,
-    n: fname(prompt),
-    title: (r.plan && r.plan.object) || prompt.slice(0, 40),
-    f,
-    m,
+    n: fname(safePrompt),
+    title: (r.plan && r.plan.object) || safePrompt.slice(0, 40),
+    f: f || 'STEP',
+    m: m || 'Al 6061',
     mass_g: r.mass_g || 0,
     bbox: r.bbox || [0, 0, 0],
     mesh: r.mesh,
@@ -361,11 +364,10 @@ function Result({ v, onOpen3d, onRefine, onEditShape }) {
 const nf = (x, d = 1) => Number(x).toLocaleString('en-US', { maximumFractionDigits: d })
 const c3 = q => `(${fm(q[0])}, ${fm(q[1])}, ${fm(q[2])})`
 
-// numbers and the maths behind them
 function InfoPanel({ v, mesh, pts, measureOn }) {
   const st = useMemo(() => (mesh ? meshStats(mesh) : null), [mesh])
   if (!v) return null
-  const [W, D, H] = v.bbox
+  const [W, D, H] = v.bbox || [0, 0, 0]
   const bmin = v.bmin || (st ? st.min : null)
   const V = v.vol
   const area = v.area || (st ? st.area : null)
@@ -455,14 +457,16 @@ function MeshModal({ s, onClose, onGoPricing }) {
   const [pts, setPts] = useState([])
   const [ck, setCk] = useState(0)
 
-  // Crash & Multi-Physics Lab State
   const [obstacle, setObstacle] = useState('concrete_wall')
   const [speed, setSpeed] = useState(72)
   const [wind, setWind] = useState(45)
   const [simMat, setSimMat] = useState('Al 6061')
   const [partMats, setPartMats] = useState({})
+  const [customColors, setCustomColors] = useState({})
   const [physData, setPhysData] = useState(null)
-  const [simAnim, setSimAnim] = useState({ active: false, running: false, progress: 0, crumpleRatio: 0.18, obstacle: 'concrete_wall' })
+  const [showHeatmap, setShowHeatmap] = useState(false)
+  const [flipDirection, setFlipDirection] = useState(false)
+  const [simAnim, setSimAnim] = useState({ active: false, runId: 0, crumpleRatio: 0.18, obstacle: 'concrete_wall' })
 
   useEffect(() => {
     if (!s.open) return
@@ -476,20 +480,35 @@ function MeshModal({ s, onClose, onGoPricing }) {
     setPts([])
     setInfo(window.innerWidth >= 1100)
     setLab(false)
+    setFlipDirection(false)
     const initPhys = s.info && s.info.physics ? s.info.physics : null
     setPhysData(initPhys)
     setSimMat((s.info && s.info.m) || 'Al 6061')
     setPartMats((initPhys && initPhys.part_materials) || {})
-    setSimAnim({ active: false, running: false, progress: 0, crumpleRatio: 0.18, obstacle: 'concrete_wall' })
+    setCustomColors((initPhys && initPhys.part_colors) || {})
+    setSimAnim({ active: false, runId: 0, crumpleRatio: 0.18, obstacle: 'concrete_wall' })
     const onKey = e => { if (e.key === 'Escape') onClose() }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [s.open, s.job, s.info, s.mesh, onClose])
 
-  // Run 60 FPS Crash / Wind-Tunnel Animation + Backend Physics Recalculation
+  // Starts 60 FPS canvas animation in 0ms and fetches updated physics telemetry in parallel!
   const runCrashSim = async () => {
     setAuto(false)
-    let cr = 0.22
+    const estCr = Math.min(0.58, 0.08 + (speed / 220) * 0.35)
+    const nextRunId = Date.now()
+
+    // 1. Trigger 60 FPS canvas animation immediately (zero wait time!)
+    setSimAnim(prev => ({
+      active: true,
+      runId: nextRunId,
+      crumpleRatio: prev.crumpleRatio || estCr,
+      obstacle,
+      failureMode: prev.failureMode || 'ductile_crumple',
+      impactAxis: prev.impactAxis || null
+    }))
+
+    // 2. Fetch exact physics telemetry from backend in parallel
     try {
       if (s.job) {
         const res = await simulatePhysics(s.job, {
@@ -501,30 +520,26 @@ function MeshModal({ s, onClose, onGoPricing }) {
         })
         if (res && res.physics) {
           setPhysData(res.physics)
-          cr = (res.physics.edge_cases?.crash_test?.crumple_ratio || 0.15) + (speed / 320) * 0.25
+          const ct = res.physics.edge_cases?.crash_test || {}
+          setSimAnim(prev => ({
+            ...prev,
+            crumpleRatio: ct.crumple_ratio || estCr,
+            failureMode: ct.failure_mode || 'ductile_crumple',
+            impactAxis: ct.impact_axis || res.physics.impact_axis || null
+          }))
         }
       }
     } catch {
-      cr = Math.min(0.55, 0.12 + (speed / 240) * 0.35)
+      /* keep local estimate */
     }
-
-    const tStart = performance.now()
-    const duration = 1800 // 1.8s 60fps impact animation
-    setSimAnim({ active: true, running: true, progress: 0, crumpleRatio: cr, obstacle })
-
-    const step = now => {
-      const p = Math.min(1, (now - tStart) / duration)
-      setSimAnim({ active: true, running: p < 1, progress: p, crumpleRatio: cr, obstacle })
-      if (p < 1) requestAnimationFrame(step)
-    }
-    requestAnimationFrame(step)
   }
 
   const resetSim = () => {
-    setSimAnim({ active: false, running: false, progress: 0, crumpleRatio: 0.18, obstacle })
+    setSimAnim({ active: false, runId: 0, crumpleRatio: 0.18, obstacle })
   }
 
-  const partColors = (physData && physData.part_colors) || (s.info?.physics?.part_colors) || null
+  const baseColors = (physData && physData.part_colors) || (s.info?.physics?.part_colors) || {}
+  const partColors = { ...baseColors, ...customColors }
   const crash = physData?.edge_cases?.crash_test
   const windTest = physData?.edge_cases?.wind_shear
   const buckTest = physData?.edge_cases?.axial_buckling
@@ -552,7 +567,8 @@ function MeshModal({ s, onClose, onGoPricing }) {
         <div className="mvw">
           {s.open && s.mesh
             ? <MeshViewer mesh={s.mesh} wire={wire} auto={auto} resetKey={rk} dims={dims} axes={axes} grid={grid}
-                measure={measure} clearKey={ck} onMeasure={setPts} partColors={partColors} simState={simAnim} />
+                measure={measure} clearKey={ck} onMeasure={setPts} partColors={partColors}
+                simState={{ ...simAnim, showHeatmap, speed, wind, partMats, simMat, flipDirection }} />
             : <div className="mv nomesh">Preview not available</div>}
           <div className="vt">
             {tgl(dims, setDims, 'Dimensions')}
@@ -567,13 +583,15 @@ function MeshModal({ s, onClose, onGoPricing }) {
           {info && !lab && s.info ? <InfoPanel v={s.info} mesh={s.mesh} pts={pts} measureOn={measure} /> : null}
 
           {lab && (
-            <div className="ip" style={{ width: 320, maxHeight: '82%', overflowY: 'auto' }}>
-              <h4 className="ih">Obstacle & Test Regime</h4>
+            <div className="ip" style={{ width: 330, maxHeight: '84%', overflowY: 'auto' }}>
+              <h4 className="ih">Roadway Proving Ground</h4>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 10 }}>
                 {[
                   ['concrete_wall', '🧱 Frontal Concrete Wall Impact'],
-                  ['bollard_pole', '💈 Center Bollard Pole Impact'],
-                  ['wind_and_thrust', '🌪️ Crosswind Shear & 6G Buckling']
+                  ['bollard_pole', '💈 Center Steel Bollard Pole'],
+                  ['spike_strip', '📌 Road Spike Strip (Tire Blowout)'],
+                  ['speed_bump', '⛰️ High-Speed Baja Speed-Bump Jump'],
+                  ['wind_and_thrust', '🌪️ Crosswind Gale & Body-Roll Test']
                 ].map(([id, label]) => (
                   <button
                     key={id}
@@ -595,7 +613,7 @@ function MeshModal({ s, onClose, onGoPricing }) {
 
               <h4 className="ih">Simulation Parameters</h4>
               <div className="ir">
-                <span>Impact Speed</span>
+                <span>Vehicle Speed</span>
                 <b>{speed} km/h</b>
               </div>
               <input type="range" min="15" max="220" value={speed} onChange={e => setSpeed(Number(e.target.value))} style={{ width: '100%' }} />
@@ -615,27 +633,53 @@ function MeshModal({ s, onClose, onGoPricing }) {
 
               {s.mesh?.parts?.length > 0 && (
                 <>
-                  <h4 className="ih">Per-Part Material & Color</h4>
-                  {s.mesh.parts.map(pname => (
-                    <div className="ir" key={pname} style={{ gap: 6 }}>
-                      <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                        <i style={{ width: 10, height: 10, borderRadius: 2, background: (partColors && partColors[pname]) || '#94a3b8', display: 'inline-block' }} />
-                        {pname}
-                      </span>
-                      <select
-                        value={partMats[pname] || simMat}
-                        onChange={e => setPartMats(p => ({ ...p, [pname]: e.target.value }))}
-                      >
-                        {MATS.map(m => <option key={m}>{m}</option>)}
-                      </select>
-                    </div>
-                  ))}
+                  <h4 className="ih">Per-Part Color & Material</h4>
+                  {s.mesh.parts.map((pname, idx) => {
+                    const curHex = (partColors && partColors[pname]) || ['#ef4444', '#38bdf8', '#1e293b', '#94a3b8'][idx % 4]
+                    return (
+                      <div className="ir" key={pname} style={{ gap: 6 }}>
+                        <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                          <input
+                            type="color"
+                            value={curHex}
+                            title={`Change color of ${pname}`}
+                            onChange={e => setCustomColors(c => ({ ...c, [pname]: e.target.value }))}
+                            style={{ width: 20, height: 20, padding: 0, border: 'none', borderRadius: 4, cursor: 'pointer', background: 'none' }}
+                          />
+                          {pname}
+                        </span>
+                        <select
+                          value={partMats[pname] || simMat}
+                          onChange={e => setPartMats(p => ({ ...p, [pname]: e.target.value }))}
+                        >
+                          {MATS.map(m => <option key={m}>{m}</option>)}
+                        </select>
+                      </div>
+                    )
+                  })}
                 </>
               )}
 
-              <div style={{ display: 'flex', gap: 6, marginTop: 10 }}>
+              <h4 className="ih">Visual Render Mode</h4>
+              <div className="seg" style={{ marginBottom: 8 }}>
+                <button className={!showHeatmap ? 'on' : ''} onClick={() => setShowHeatmap(false)}>
+                  🎨 True Material Colors
+                </button>
+                <button className={showHeatmap ? 'on' : ''} onClick={() => setShowHeatmap(true)}>
+                  🔥 FEA Stress Heatmap
+                </button>
+              </div>
+
+              <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
                 <button className="btn p" style={{ flex: 1 }} onClick={runCrashSim}>
                   ▶ Run Simulation
+                </button>
+                <button
+                  className={'btn' + (flipDirection ? ' on' : '')}
+                  title="Flip Front/Rear Impact Direction"
+                  onClick={() => setFlipDirection(f => !f)}
+                >
+                  ⇄ Flip Dir
                 </button>
                 {simAnim.active && (
                   <button className="btn" onClick={resetSim}>Reset</button>
@@ -646,6 +690,7 @@ function MeshModal({ s, onClose, onGoPricing }) {
                 <>
                   <h4 className="ih">Edge-Case Telemetry</h4>
                   <div className="ir"><span>Status</span><b style={{ color: crash.survived ? '#2fb67c' : '#ef4444' }}>{crash.survived ? '✓ SURVIVED' : '⚠ PLASTIC FRACTURE'}</b></div>
+                  {crash.failure_description && <div className="eq" style={{ marginBottom: 6 }}>{crash.failure_description}</div>}
                   <div className="ir"><span>Safety Factor</span><b>{physData.overall_safety_factor}×</b></div>
                   <div className="ir"><span>Peak Deceleration</span><b>{crash.peak_deceleration_g} G</b></div>
                   <div className="ir"><span>Crumple Depth</span><b>{crash.crumple_depth_mm} mm ({(crash.crumple_ratio * 100).toFixed(1)}%)</b></div>
@@ -671,7 +716,7 @@ function MeshModal({ s, onClose, onGoPricing }) {
           )}
         </div>
         <div className="mf">
-          <span>{simAnim.active ? 'FE Stress Heatmap Active (Green = Elastic · Red = Plastic Yield) · ' : ''}{measure ? 'Click two points to measure · ' : ''}Drag to rotate · Scroll or pinch to zoom · Esc to close</span>
+          <span>{simAnim.active ? 'Simulation Active · ' : ''}{measure ? 'Click two points to measure · ' : ''}Drag to rotate · Scroll or pinch to zoom · Esc to close</span>
           <span>{s.bbox ? fmtSize(s.bbox) : ''}</span>
         </div>
       </div>
@@ -750,18 +795,21 @@ export default function App() {
   }, [])
 
   /* data (real: filled as you generate) */
+  const [userName, setUserName] = useState(() => readLS('bp-user', 'Gurtej'))
+  useEffect(() => { writeLS('bp-user', userName) }, [userName])
+
   const [hist, setHist] = useState([])
   const [files, setFiles] = useState([])
   const [hs, setHs] = useState('')
   const [fs, setFs] = useState('')
   const [ff, setFf] = useState('All')
 
-  const shownHist = hist.filter(h => h.t.toLowerCase().includes(hs.toLowerCase()))
-  const shownFiles = files.filter(x => x.n.includes(fs.toLowerCase()) && (ff === 'All' || x.f === ff))
-  const verifiedCount = files.filter(x => x.verified).length
+  const shownHist = hist.filter(h => h && String(h.t || '').toLowerCase().includes(hs.toLowerCase()))
+  const shownFiles = files.filter(x => x && String(x.n || '').toLowerCase().includes(fs.toLowerCase()) && (ff === 'All' || x.f === ff))
+  const verifiedCount = files.filter(x => x && x.verified).length
   const topFmt = (() => {
     const c = {}
-    files.forEach(x => { c[x.f] = (c[x.f] || 0) + 1 })
+    files.forEach(x => { if (x && x.f) c[x.f] = (c[x.f] || 0) + 1 })
     return Object.keys(c).sort((a, b) => c[b] - c[a])[0] || 'STEP'
   })()
 
@@ -827,15 +875,15 @@ export default function App() {
   const [chats, setChats] = useState([{ id: 1, msgs: [] }])
   const [activeId, setActiveId] = useState(1)
   const cid = useRef(1)
-  const cur = chats.find(c => c.id === activeId) || chats[chats.length - 1]
-  const msgs = cur.msgs
-  const allMsgs = chats.flatMap(c => c.msgs)
+  const cur = chats.find(c => c.id === activeId) || chats[chats.length - 1] || { id: 1, msgs: [] }
+  const msgs = cur.msgs || []
+  const allMsgs = chats.flatMap(c => c.msgs || [])
   const setMsgs = fn => setChats(cs => cs.map(c => {
     const n = fn(c.msgs)
     return n.length === c.msgs.length && n.every((x, i) => x === c.msgs[i]) ? c : { ...c, msgs: n }
   }))
   const addMsg = M => setChats(cs => cs.map(c => (c.id === cur.id ? { ...c, msgs: [...c.msgs, M] } : c)))
-  useEffect(() => { if (!chats.some(c => c.id === activeId)) setActiveId(chats[chats.length - 1].id) }, [chats, activeId])
+  useEffect(() => { if (chats.length && !chats.some(c => c.id === activeId)) setActiveId(chats[chats.length - 1].id) }, [chats, activeId])
 
   // FIXED: Only auto-scroll when a new message is added or chat tab changes, NEVER on 1s log poll ticks!
   useEffect(() => {
@@ -899,7 +947,7 @@ export default function App() {
 
   const send = txt => {
     const t = (typeof txt === 'string' ? txt : inp).trim()
-    if (!t || busyCount) return // one generation at a time; press Stop to cancel the current one
+    if (!t || busyCount) return
     setInp('')
     if (inpRef.current) inpRef.current.style.height = 'auto'
     askPerm()
@@ -984,12 +1032,12 @@ export default function App() {
     const M = allMsgs.find(x => x.id === id)
     const jobs = new Set(M ? M.vers.map(v => v.job) : [])
     setMsgs(p => p.filter(x => x.id !== id))
-    setHist(h => h.filter(x => x.id !== id))
-    setFiles(fl => fl.filter(x => !jobs.has(x.v.job)))
+    setHist(h => h.filter(x => x && x.id !== id))
+    setFiles(fl => fl.filter(x => x && x.v && !jobs.has(x.v.job)))
   }
   const askRemoveTurn = (id, label) => ask({
     title: 'Delete this design?',
-    body: `"${label}" will be removed from the chat, history and generated files of this session. Copies on the server expire on their own after about 24 hours.`,
+    body: `"${label}" will be removed from the chat, history and generated files of this session.`,
     ok: 'Delete', danger: true, run: () => removeTurn(id)
   })
   const removeChat = c => {
@@ -997,19 +1045,19 @@ export default function App() {
     const ids = new Set(c.msgs.map(m => m.id))
     const jobs = new Set(c.msgs.flatMap(m => m.vers.map(v => v.job)))
     const nid = ++cid.current
-    setHist(h => h.filter(x => !ids.has(x.id)))
-    setFiles(fl => fl.filter(x => !jobs.has(x.v.job)))
+    setHist(h => h.filter(x => x && !ids.has(x.id)))
+    setFiles(fl => fl.filter(x => x && x.v && !jobs.has(x.v.job)))
     setChats(cs => { const r = cs.filter(x => x.id !== c.id); return r.length ? r : [{ id: nid, msgs: [] }] })
   }
   const askRemoveChat = c => ask({
     title: 'Delete this chat?',
-    body: `"${c.msgs[0].text.slice(0, 42)}"${c.msgs.length > 1 ? ` and its ${c.msgs.length} designs` : ''} will be removed from the sidebar, history and generated files. Copies on the server expire on their own after about 24 hours.`,
+    body: `"${c.msgs[0].text.slice(0, 42)}"${c.msgs.length > 1 ? ` and its ${c.msgs.length} designs` : ''} will be removed from this session.`,
     ok: 'Delete', danger: true, run: () => removeChat(c)
   })
   const askRemoveFile = x => ask({
     title: 'Delete this file?',
-    body: `${x.n}.${x.f.toLowerCase()} will be removed from your generated files. The chat message that produced it stays.`,
-    ok: 'Delete', danger: true, run: () => setFiles(fl => fl.filter(y => y.fid !== x.fid))
+    body: `${x.n}.${x.f.toLowerCase()} will be removed from your generated files.`,
+    ok: 'Delete', danger: true, run: () => setFiles(fl => fl.filter(y => y && y.fid !== x.fid))
   })
 
   /* custom polygon / profile editor */
@@ -1035,6 +1083,35 @@ export default function App() {
   /* upgrade pill: shown on every load for the Free plan; x hides it until next load */
   const [upb, setUpb] = useState(true)
 
+  // Load saved generations directly from Supabase PostgreSQL on startup
+  useEffect(() => {
+    fetchHistory().then(res => {
+      if (!res || !res.ok || !Array.isArray(res.items) || !res.items.length) return
+      const dbMsgs = []
+      const dbHist = []
+      const dbFiles = []
+      res.items.slice().reverse().forEach(r => {
+        if (!r || !r.mesh || !r.mesh.verts) return
+        const id = ++uid.current
+        const promptText = String(r.prompt || (r.plan && r.plan.object) || 'CAD Design')
+        const matName = r.material || 'Al 6061'
+        const v = toVersion(r, promptText, 'STEP', matName)
+        dbMsgs.push({
+          id, text: promptText, f: 'STEP', m: matName, parent: null,
+          vers: [v], cur: 0, vote: 0, busy: false, editing: false,
+          err: null, stopped: false, trace: null, logs: ['Restored from Supabase'], partialMesh: null, t0: Date.now()
+        })
+        dbHist.unshift({ id, t: promptText.slice(0, 42), d: 'Saved in DB', f: 'STEP' })
+        dbFiles.unshift({ fid: ++uid.current, n: v.n, f: 'STEP', size: fmtSize(v.bbox), mass: fmtMass(v.mass_g), verified: v.verified, v })
+      })
+      if (dbMsgs.length) {
+        setChats([{ id: 1, msgs: dbMsgs }])
+        setHist(dbHist)
+        setFiles(dbFiles)
+      }
+    }).catch(() => {})
+  }, [])
+
   return (
     <>
       <Sprite />
@@ -1055,7 +1132,7 @@ export default function App() {
         <SidebarGen items={busyList} onStop={stopAll} onOpen={openTurn} />
         <div className="cap">Recent</div>
         <div className="rlist">
-          {chats.filter(c => c.msgs.length).slice().reverse().slice(0, 10).map(c => (
+          {chats.filter(c => c.msgs && c.msgs.length).slice().reverse().slice(0, 10).map(c => (
             <div key={c.id} className={'ri' + (c.id === cur.id && view === 'chat' ? ' on' : '')} onClick={() => openChat(c.id)} title={c.msgs[0].text}>
               {c.msgs.some(m => m.busy) && <i className="sgd" title="Generating" />}
               <span className="rt">{c.msgs[0].text.slice(0, 42)}</span>
@@ -1080,8 +1157,8 @@ export default function App() {
           </div>
         </div>
         <div className="user" onClick={() => go('settings')}>
-          <div className="av">T</div>
-          <div>Tegkirat<small>Free plan</small></div>
+          <div className="av">{String(userName || 'G')[0].toUpperCase()}</div>
+          <div>{userName}<small>Free plan</small></div>
         </div>
       </aside>
       <div className="scrim" onClick={() => setSbOff(true)} />
@@ -1122,12 +1199,12 @@ export default function App() {
                 </div>
               )}
               {msgs.map(M => {
-                const v = M.vers[M.cur]
+                const v = M.vers && M.vers[M.cur]
                 const loading = M.busy
                 return (
                   <Fragment key={M.id}>
                     <div className="m u" id={'m-' + M.id}>
-                      <div className="ic">T</div>
+                      <div className="ic">{String(userName || 'G')[0].toUpperCase()}</div>
                       <div className="t">
                         {M.editing ? (
                           <EditBox init={M.text} onSave={val => saveEdit(M.id, val)} onCancel={() => patch(M.id, { editing: false })} />
@@ -1148,7 +1225,50 @@ export default function App() {
                       <div className="t">
                         <div className="body">
                           {loading ? (
-                            <Thinking state="busy" logs={M.logs} t0={M.t0} partialMesh={M.partialMesh} onStop={() => stopOne(M.id)} />
+                            <>
+                              <Thinking state="busy" logs={M.logs} t0={M.t0} partialMesh={null} onStop={() => stopOne(M.id)} />
+                              {M.partialMesh && M.partialMesh.verts && M.partialMesh.verts.length > 0 && (
+                                <div className="cad" style={{ marginTop: 10, borderStyle: 'dashed' }}>
+                                  <div
+                                    className="prev"
+                                    onClick={() => open3d({
+                                      job: M.id,
+                                      title: `${M.text.slice(0, 32)} (Building live…)`,
+                                      n: fname(M.text),
+                                      f: M.f,
+                                      m: M.m,
+                                      mesh: M.partialMesh,
+                                      bbox: [0, 0, 0],
+                                      mass_g: 0
+                                    })}
+                                  >
+                                    <Thumb mesh={M.partialMesh} alt="Live assembly progress" />
+                                  </div>
+                                  <div className="meta">
+                                    <div><small>Status</small>Compiling sub-parts…</div>
+                                    <div><small>Components</small>{(M.partialMesh.parts && M.partialMesh.parts.length) || 1} built</div>
+                                    <div><small>Preview</small>Interactive 3D Ready</div>
+                                  </div>
+                                  <div className="acts">
+                                    <button
+                                      className="btn p"
+                                      onClick={() => open3d({
+                                        job: M.id,
+                                        title: `${M.text.slice(0, 32)} (Building live…)`,
+                                        n: fname(M.text),
+                                        f: M.f,
+                                        m: M.m,
+                                        mesh: M.partialMesh,
+                                        bbox: [0, 0, 0],
+                                        mass_g: 0
+                                      })}
+                                    >
+                                      <Ic n="exp" />Open Live 3D Playground
+                                    </button>
+                                  </div>
+                                </div>
+                              )}
+                            </>
                           ) : v ? (
                             <>
                               <Thinking state="done" logs={v.think && v.think.logs} secs={v.think && v.think.secs} />
@@ -1170,7 +1290,7 @@ export default function App() {
                         <div className="tbw">
                           {!loading && (
                             <div className="tb">
-                              {M.vers.length > 1 && (
+                              {M.vers && M.vers.length > 1 && (
                                 <span className="pg">
                                   <button disabled={!M.cur} onClick={() => nav(M.id, -1)}><PI k="l" /></button>
                                   {M.cur + 1} / {M.vers.length}
@@ -1211,7 +1331,7 @@ export default function App() {
                 onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() } }}
               />
               <div className="bar">
-                <button className="btn" title="Draw your own polygon or profile" aria-label="Draw shape" onClick={drawShape}><Ic n="clip"/><span className="lbl">Draw shape</span></button>
+                <button className="btn" title="Draw your own polygon or profile" aria-label="Draw shape" onClick={drawShape}><Ic n="clip" /><span className="lbl">Draw shape</span></button>
                 {/* desktop / tablet: separate dropdowns */}
                 <div className="opts-d">
                   <select value={mat} onChange={e => setMat(e.target.value)}>{MATS.map(x => <option key={x}>{x}</option>)}</select>
@@ -1248,7 +1368,7 @@ export default function App() {
         {/* HISTORY */}
         <section className={'view' + (view === 'hist' ? ' on' : '')} id="hist">
           <div className="page">
-            <h2>History</h2><p>Designs from this session.</p>
+            <h2>History</h2><p>Designs from this session & Supabase database.</p>
             <div className="tools"><input type="search" placeholder="Search history" value={hs} onChange={e => setHs(e.target.value)} /></div>
             <div>
               {shownHist.length ? shownHist.map(h => (
@@ -1265,7 +1385,7 @@ export default function App() {
         {/* FILES */}
         <section className={'view' + (view === 'files' ? ' on' : '')} id="files">
           <div className="page">
-            <h2>Generated files</h2><p>CAD models from this session. Files are kept on the server for about 24 hours.</p>
+            <h2>Generated files</h2><p>CAD models persisted in Supabase.</p>
             <div className="stats">
               <div className="stat"><b>{files.length}</b>Models generated</div>
               <div className="stat"><b>{verifiedCount}</b>Verified models</div>
@@ -1280,10 +1400,10 @@ export default function App() {
                 <div className="f" key={x.fid}>
                   <button className="fx" title="Delete" aria-label="Delete file" onClick={() => askRemoveFile(x)}><PI k="x" /></button>
                   <div className="prev" onClick={() => open3d(x.v)}>
-                    {x.v.mesh ? <Thumb mesh={x.v.mesh} alt={x.n} partColors={x.v.physics && x.v.physics.part_colors} /> : <PartIcon />}
+                    {x.v && x.v.mesh ? <Thumb mesh={x.v.mesh} alt={x.n} partColors={x.v.physics && x.v.physics.part_colors} /> : <PartIcon />}
                   </div>
                   <div className="in">
-                    <b>{x.n}.{x.f.toLowerCase()}</b>
+                    <b>{x.n}.{String(x.f || 'step').toLowerCase()}</b>
                     <small>{x.size} / {x.mass}</small>
                     <div className="row">
                       <span className="tag">{x.f}</span>
@@ -1358,7 +1478,7 @@ export default function App() {
 
               <div className={'panel' + (panel === 'account' ? ' on' : '')}>
                 <h3>Account</h3><p>Your profile and plan.</p>
-                <div className="srow"><div><b>Name</b><small>Shown in the sidebar</small></div><input type="text" defaultValue="Tegkirat" /></div>
+                <div className="srow"><div><b>Name</b><small>Shown in the sidebar</small></div><input type="text" value={userName} onChange={e => setUserName(e.target.value)} /></div>
                 <div className="srow"><div><b>Plan</b><small>Free plan</small></div>
                   <button className="btn p" onClick={() => go('pricing')}>Upgrade</button></div>
                 <div className="srow"><div><b>Sign out</b><small>End this session</small></div><button className="btn">Sign out</button></div>

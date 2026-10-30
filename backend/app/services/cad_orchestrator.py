@@ -96,7 +96,15 @@ class CadOrchestrator:
             }
         )
 
-        workflow.add_edge("modifier", "part_compiler")
+        workflow.add_conditional_edges(
+            "modifier",
+            lambda s: "compile" if (s.get("current_part_code") and not s.get("error_traceback")) else "fallback_create",
+            {
+                "compile": "part_compiler",
+                "fallback_create": "atomic_coder",
+            }
+        )
+        
         workflow.add_edge("atomic_coder", "part_compiler")
 
         # After compiling a sub-part: repair it, move to next sub-part, or finish at auditor
@@ -119,9 +127,9 @@ class CadOrchestrator:
     def route_coder_strategy(self, state: CadGraphState) -> str:
         """
         Dual-Gate Archetype Router:
-        1. If the cached row has the SAME `archetype_tag` (e.g. 'ogive_cone', 'l_bracket', 'radial_fin_set'),
-           route to `modifier` at similarity >= 0.76!
-        2. Otherwise, require similarity >= 0.86.
+        1. NEVER allow generic `custom_part` to match across different objects unless similarity >= 0.90!
+        2. For specific geometric archetypes (`cylindrical_tube`, `ogive_cone`, `wheel_set`, etc.),
+           route to `modifier` at similarity >= 0.78.
         """
         if state.get("fresh") or state.get("error_traceback"):
             return "create"
@@ -136,9 +144,9 @@ class CadOrchestrator:
         target_tag = str(part.get("archetype_tag") or "").lower().strip()
         cached_tags = [str(t).lower().strip() for t in (best.get("tags") or [])]
 
-        # Gate 1: Exact whole-object match (>= 0.86) or matching archetype tag (>= 0.76)
-        same_archetype = bool(target_tag and target_tag in cached_tags)
-        if (same_archetype and sim >= 0.76) or sim >= 0.86:
+        # Specific geometric archetype match (exclude catch-all 'custom_part' from loose matching!)
+        is_specific_archetype = bool(target_tag and target_tag != "custom_part" and target_tag in cached_tags)
+        if (is_specific_archetype and sim >= 0.78) or sim >= 0.90:
             logger.info(
                 f"Cache HIT (sim={sim:.2f}, archetype={target_tag}, tags={cached_tags}). "
                 f"Routing to Agent 2A (modifier)."
@@ -174,17 +182,14 @@ class CadOrchestrator:
             "You are Agent 0: Industrial CAD Architect. Expand the user's CAD prompt into "
             "a clear, material-agnostic geometric specification in millimeters.\n"
             "COORDINATE SYSTEM CONVENTIONS:\n"
-            "- Always Z-axis UP (+Z is vertical height).\n"
-            "- Axisymmetric vertical objects (rockets, towers, bottles, pillars, gears, flanges) MUST stand vertically along the +Z axis (base at Z=0, apex at Z=height).\n"
-            "- Ground vehicles (cars, motorcycles, trucks) face along +X (length), with wheel axles along +Y (width) and height along +Z.\n"
+            "- Always Z-axis UP (+Z is vertical height, ground plane at Z=0).\n"
+            "- Axisymmetric vertical objects (rockets, towers, pillars, gears, flanges) stand vertically along +Z centered at (X=0, Y=0), base at Z=0.\n"
+            "- Ground vehicles (cars, trucks, motorcycles) MUST be centered at (X=0, Y=0), face along +X (length), with length spanning from X = -L/2 (rear bumper) to X = +L/2 (front bumper), width spanning Y = -W/2 to +W/2, and ground at Z=0!\n"
             "CRITICAL GEOMETRIC RULES:\n"
             "1. Remove specific material names (e.g., Al 6061, PLA).\n"
-            "2. NEVER specify skeletal parts (frames, forks, swingarms, handlebars, legs) as large (L x W x H) bounding boxes! "
-            "Specify them as tubular cylinders/struts with actual tube diameters (e.g., 25mm-40mm tube OD) so they don't become giant solid bricks.\n"
-            "3. For contoured bodies (car bodies, fuel tanks, seats, fairings), specify their 2D side-profile silhouette in the XZ plane "
-            "(with key (X, Z) polygon vertices) extruded symmetrically along Y, rather than rectangular boxes.\n"
-            "4. For wheels, specify outer tire diameter, rim/hub recess diameter, width along the Y-axis axle, and exact (X, Y, Z) center coordinates.\n"
-            "5. Keep major bodies as water-tight solids without fragile .shell() operations.\n"
+            "2. NEVER specify 'voids', 'cavities', or 'empty spaces' as separate components! Describe only physical solid sub-components (e.g. for a car: sculpted body shell with wheel arches, translucent cabin glass greenhouse/windshield sitting on the beltline, 4 wheels with rims, front grille/headlights, rear spoiler).\n"
+            "3. For contoured vehicle bodies, specify a rich 8-to-10-vertex 2D side-profile silhouette in the XZ plane (spanning X = -L/2 to +L/2, with distinct front hood, sloped windshield, roof plateau, rear deck, and ground clearance Z=250mm) extruded symmetrically along Y.\n"
+            "4. Keep major bodies as water-tight solids without fragile .shell() operations.\n"
             "Output ONLY the concise expanded geometric specification."
         )
         expanded = await self.llm.generate(
@@ -203,7 +208,7 @@ class CadOrchestrator:
 
     async def node_specifier(self, state: CadGraphState) -> Dict[str, Any]:
         """
-        Agent 1: Decomposes specification into 1 to 4 functional sub-assemblies
+        Agent 1: Decomposes specification into functional sub-assemblies
         with universal topological archetypes, realistic per-part materials, and hex colors.
         """
         sys_prompt = (
@@ -211,15 +216,18 @@ class CadOrchestrator:
             "CRITICAL DECOMPOSITION RULES:\n"
             "1. For single mechanical parts (e.g., bracket, spur gear, flange, washer, enclosure, bolt), set `is_assembly: false` "
             "and output EXACTLY 1 part in `parts` with `position_mm: [0, 0, 0]`.\n"
-            "2. For multi-component vehicles/machines (e.g., rocket, car, motorcycle, drone), set `is_assembly: true` "
-            "and decompose into 2 to 4 major functional sub-assemblies (MAX 4 parts! Group symmetric arrays like 'all 4 wheels' or 'all 4 fins' into a SINGLE part entry!).\n"
-            "3. AXIS ALIGNMENT:\n"
+            "2. For multi-component vehicles/machines (e.g., rocket, car, motorcycle, drone, truck), set `is_assembly: true` "
+            "and decompose into 3 to 6 physical solid sub-assemblies (Group symmetric arrays like 'all 4 wheels' or 'all 4 fins' into a SINGLE part entry!).\n"
+            "   - NEVER create a part for a 'void', 'cavity', or 'empty space' (like `cabin_void`)! Every entry in `parts` is unioned as a solid object!\n"
+            "   - For a car/vehicle, include: `body_shell` (lower chassis + hood + trunk), `cabin_glass` (translucent upper windshield/windows greenhouse), `wheel_set` (4 tires with rims), and optional `rear_spoiler` or `front_bumper_grille`.\n"
+            "3. AXIS ALIGNMENT & MATING COORDINATES:\n"
             "   - Rockets/towers stand vertically along +Z! E.g. if `fuselage_tube` has height 1200mm at `position_mm: [0, 0, 0]`, then `nose_cone` MUST be at `position_mm: [0, 0, 1200]`, and `fin_set` MUST include `body_radius_mm` (equal to fuselage outer radius) in its `dimensions` at `position_mm: [0, 0, 0]`.\n"
+            "   - Cars/vehicles are centered at X=0, Y=0 (spanning X = -L/2 to +L/2). Set `position_mm: [0, 0, 0]` for parts built in vehicle coordinates, OR for `cabin_glass` set `position_mm: [0, 0, beltline_z_mm]` (e.g. `[0, 0, 750]`) so the glass greenhouse sits on top of the lower body beltline!\n"
             "4. Each part MUST include:\n"
-            "   - `id`: short snake_case name (e.g., 'chassis_body', 'cabin_glass', 'wheel_set', 'nose_cone', 'fuselage_tube', 'fin_set').\n"
+            "   - `id`: short snake_case name (e.g., 'body_shell', 'cabin_glass', 'wheel_set', 'nose_cone', 'fuselage_tube', 'fin_set').\n"
             "   - `archetype_tag`: choose ONE canonical shape family from: "
             "['cylindrical_tube', 'ogive_cone', 'conical_frustum', 'radial_fin_set', 'spur_gear', 'flanged_plate', 'l_bracket', 'enclosure_box', 'wheel_set', 'tubular_frame', 'contoured_body', 'custom_part'].\n"
-            "   - `archetype_query`: MUST start with `<archetype_tag>: ` followed by a standardized, material-agnostic description of the shape along +Z and its key dimensions in mm.\n"
+            "   - `archetype_query`: MUST start with `<archetype_tag>: ` followed by a standardized, material-agnostic description of the shape and its key dimensions in mm.\n"
             "   - `dimensions`: dictionary of ALL numeric dimensions (including `body_radius_mm` for fins) AND hole/cutout features in mm.\n"
             "   - `position_mm`: [X, Y, Z] world translation offset where this sub-part's local (0,0,0) origin sits in the final assembly.\n"
             "   - `default_material`: choose realistic material for this sub-part from ['Al 6061', 'Steel', 'Titanium', 'Carbon Fiber', 'Brass', 'Copper', 'Glass', 'Rubber', 'PLA', 'ABS'] "
@@ -248,7 +256,12 @@ class CadOrchestrator:
         bom = self.llm.extract_json(raw_json)
         parts_list = bom.get("parts") or []
 
-        # Fallback if LLM returned empty parts array
+        # Filter out any accidentally generated "void" or "cavity" dummy parts!
+        parts_list = [
+            p for p in parts_list
+            if "void" not in str(p.get("id", "")).lower() and "cavity" not in str(p.get("id", "")).lower()
+        ]
+
         if not parts_list:
             parts_list = [{
                 "id": "main_body",
@@ -259,10 +272,8 @@ class CadOrchestrator:
                 "default_material": state.get("material", "Al 6061"),
                 "color_hex": "#94a3b8"
             }]
-            bom["parts"] = parts_list
 
-        # Cap at 4 functional sub-assemblies to guarantee fast build times
-        parts_list = parts_list[:4]
+        parts_list = parts_list[:8]
         bom["parts"] = parts_list
 
         part_names = ", ".join(p.get("id", f"part_{i+1}") for i, p in enumerate(parts_list))
@@ -319,22 +330,35 @@ class CadOrchestrator:
         """Agent 2A: Surgical Parametric Modifier for a matched sub-part or template."""
         matches = state.get("cache_matches") or []
         best_match = matches[0]
+        sim = float(best_match.get("similarity") or 0.0)
         part = state.get("current_part") or {}
         pid = part.get("id", "main_body")
         idx = state.get("current_part_index", 1)
         total = state.get("total_parts", 1)
         bom = state.get("bom_json") or {}
 
-        logger.info(f"[{idx}/{total}] Cache HIT ({best_match['similarity']:.2f}) for '{pid}'. Running Agent 2A.")
+        # Fast-Path 1: Ultra-high similarity (>= 0.93) means dimensions already match the cached sub-part!
+        # Return instantly in 0.001s without wasting an LLM call!
+        if sim >= 0.93:
+            logger.info(f"[{idx}/{total}] Exact Cache HIT ({sim:.2f}) for '{pid}'. Serving directly in 0ms.")
+            return {
+                "current_part_code": best_match["code"],
+                "current_part_cached": True,
+                "cached_hit": True,
+                "progress_log": f"served {pid} ({idx}/{total}) directly from pgvector cache"
+            }
+
+        logger.info(f"[{idx}/{total}] Cache HIT ({sim:.2f}) for '{pid}'. Running Agent 2A.")
         sys_prompt = (
             "You are Agent 2A: Parametric CAD Modifier. You are given a verified CadQuery script from cache.\n"
             "CRITICAL RULES:\n"
             "1. Pre-loaded helper functions `radial(shape, n, r=0)`, `spur_gear(m, z, t, bore=0)`, and `bolt_circle(body, n, r, d, face='>Z')` "
             "ARE already defined in the global namespace! Keep using them—do NOT rewrite or remove `radial(...)`!\n"
-            "2. Update ONLY the numeric parameter variables at the top of the script to match the Target Sub-Part dimensions "
-            "(for fins, set `body_radius` to the fuselage outer radius from the BOM so fins attach to the outer skin, never 0).\n"
-            "3. If the Target Specification requires mounting holes or cutouts missing from the template, add them cleanly.\n"
-            "4. Keep the final `result = ...` assignment intact on the last line.\n"
+            "2. DO NOT DELETE styling features, roof bevels (`roof_cut`), rocker sill undercuts (`sill_cut`), fillets, or wheel-arch cutouts from the cached template! "
+            "The cached template's multi-point silhouette and styling cuts are what make the CAD model look realistic. Keep all styling cuts intact and only update numeric dimensions/coordinates to match the target BOM.\n"
+            "3. For rocket fins, set `body_radius` to the fuselage outer radius from the BOM (never 0).\n"
+            "4. If the Target Specification requires mounting holes or cutouts missing from the template, add them cleanly.\n"
+            "5. Keep the final `result = ...` assignment intact on the last line.\n"
             "Output ONLY valid Python code inside a ```python ``` block."
         )
         context_spec = state["raw_prompt"] if total == 1 else f"{part.get('archetype_query')} | {part.get('dimensions')}"
@@ -345,13 +369,18 @@ class CadOrchestrator:
             f"Cached Template Code:\n```python\n{best_match['code']}\n```"
         )
 
-        raw_code = await self.llm.generate(
-            [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_content}],
-            temperature=0.1,
-            max_tokens=8192,
-            role="modifier"
-        )
-        extracted = self.llm.extract_code(raw_code) or best_match["code"]
+        try:
+            raw_code = await self.llm.generate(
+                [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_content}],
+                temperature=0.1,
+                max_tokens=8192,
+                role="modifier"
+            )
+            extracted = self.llm.extract_code(raw_code) or best_match["code"]
+        except Exception as e:
+            logger.warning(f"Agent 2A modifier failed ({e}); using verified cached template directly.")
+            extracted = best_match["code"]
+
         return {
             "current_part_code": extracted,
             "current_part_cached": True,
@@ -360,7 +389,7 @@ class CadOrchestrator:
         }
 
     async def node_atomic_coder(self, state: CadGraphState) -> Dict[str, Any]:
-        """Agent 2B: Generates origin-centered CadQuery code for `current_part`."""
+        """Agent 2B: Generates CadQuery code for `current_part` with window cutouts and anti-double-offset protection."""
         part = state.get("current_part") or {}
         pid = part.get("id", "main_body")
         idx = state.get("current_part_index", 1)
@@ -372,23 +401,22 @@ class CadOrchestrator:
 
         sys_prompt = (
             "You are Agent 2B: Expert OpenCASCADE and CadQuery Engineer. Output ONLY valid Python code inside a ```python ``` block.\n"
-            "COORDINATE CONVENTION: +Z = Up/Vertical Axis (rockets, cylinders, cones stand along +Z from Z=0 to Z=height). "
-            "For ground vehicles, +X = Forward, +Y = Left/Right Axle Axis, +Z = Up.\n"
+            "COORDINATE CONVENTION: +Z = Up/Vertical Axis. Rockets/towers stand vertically along +Z (base at Z=0). "
+            "Ground vehicles face along +X (length), +Y (left/right width), +Z (height above ground).\n"
             "CRITICAL CAD MODELING RULES:\n"
             "1. Always `import cadquery as cq` and `import math`.\n"
             "2. Pre-loaded helpers available in global namespace (do NOT redefine or import them):\n"
             "   - `spur_gear(m, z, t, bore=0)` -> returns a cq.Workplane spur gear\n"
             "   - `radial(shape, n, r=0)` -> copies `shape` n times around Z axis and unions them\n"
             "   - `bolt_circle(body, n, r, d, face='>Z')` -> drills n through-holes of diameter d on radius r\n"
-            "3. BUILD ONLY THE REQUESTED COMPONENT AROUND LOCAL ORIGIN (0, 0, 0) WITH BASE AT Z=0:\n"
-            "   - Do NOT apply the assembly's world `position_mm` translation inside this script; the Master Assembler will translate it later.\n"
-            "   - For `ogive_cone` or `nose_cone`, build a solid cone/loft on `cq.Workplane('XY').circle(r_base).workplane(offset=height).circle(0.5).loft()` (do NOT use `.revolve()` with negative X center as OpenCASCADE self-intersects!).\n"
-            "   - For `radial_fin_set`, place the fin root at `X = body_radius` (outer radius of fuselage) and use `result = radial(single_fin, fin_count)`.\n"
-            "4. NO BOXY BRICKS FOR VEHICLES/ASSEMBLIES:\n"
-            "   - For car bodies, fuel tanks, seats, or fairings, sketch a 2D side silhouette on `cq.Workplane('XZ').polyline([...]).close().extrude(width/2, both=True)`.\n"
-            "   - For frames, forks, handlebars, and struts, use cylinders/tubes (radius 12-25mm), NOT huge bounding boxes.\n"
-            "   - For wheels, sketch on `cq.Workplane('XZ').circle(r_tire).extrude(width/2, both=True)` so the axle runs along Y.\n"
-            "5. Avoid `.shell()` or fragile `.fillet()` on complex intersections. Assign the final solid to `result` on the last line."
+            "3. LOCAL ORIGIN & POSITIONING CONTRACT:\n"
+            "   - Build the sub-component with its base at local Z=0 (do NOT add `position_mm` inside this script, because the Assembler applies `.translate(position_mm)`!).\n"
+            "4. VEHICLE CHASSIS & MULTI-WINDOW GLAZING RULES:\n"
+            "   - Every vehicle sub-part MUST be centered at X=0, Y=0 (spanning X = -L/2 to +L/2). For `wheel_set`, place front wheels at X = +wheelbase/2 and rear wheels at X = -wheelbase/2 (NEVER at positive-only X=800, 3200!).\n"
+            "   - When building `cabin_glass` / `windshield` for a car, truck, or aircraft: make its Y-extrusion width EQUAL to the full cabin width (e.g. `extrude(width/2, both=True)`) and its height from `Z=0` up to `cabin_height - 50mm` (leaving 50mm for the metal roof cap above it). The Master Assembler automatically boolean-cuts `cabin_glass` out of `body_shell`, so making `cabin_glass` span the full cabin width guarantees visible side windows AND front/rear windshields!\n"
+            "AND cut out the side window openings (through Y) and front/rear windshield recesses in the upper cabin roof section using `.cut(...)`, PLUS cut cylindrical wheel arches at the front/rear axles!\n"
+            "   - When building `cabin_glass` / `windshield`, sketch the sloped trapezoidal greenhouse profile on `cq.Workplane('XZ')` (base at Z=0 so when translated by `position_mm: [0, 0, z_beltline]` it fits cleanly inside the upper cabin frame!).\n"
+            "5. Avoid `.shell()` on complex multi-body unions. Assign the final solid to `result` on the last line."
         )
 
         if total == 1:
@@ -499,7 +527,7 @@ class CadOrchestrator:
             "exec_result": exec_result,
         }
         
-        # Stitch all parts compiled so far so the live UI preview shows the growing assembly!
+        # Stitch all parts compiled so far so the live Playground shows the growing assembly!
         preview_mesh = exec_result.get("mesh")
         if len(compiled) > 1:
             bom_parts = (state.get("bom_json") or {}).get("parts") or []
@@ -566,6 +594,7 @@ class CadOrchestrator:
             has_named_parts=has_named_parts,
             valid=bool(res.get("valid", True)),
             compiled_parts=compiled_parts,
+            prompt=state["raw_prompt"],
         )
 
         # 2. Now attach per-part colors and materials onto `report`!
@@ -593,7 +622,13 @@ class CadOrchestrator:
             "mass_g": report["mass_g"],
             "physics": report,
             "attempts": state.get("repair_attempts", 0) + 1,
-            "llm_model": settings.coder_model
+            "llm_model": settings.coder_model,
+            "mesh": res.get("mesh"), 
+            "bbox_min": res.get("bbox_min"), 
+            "area_mm2": res.get("area"), 
+            "com": res.get("com"), 
+            "counts": res.get("counts"), 
+            "density_g_cm3": report["density_g_cm3"]
         })
 
         # Also cache the complete stitched assembly under its canonical query if multi-part

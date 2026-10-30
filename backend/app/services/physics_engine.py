@@ -253,18 +253,27 @@ class PhysicsEngine:
         cross_a_mm = lx if impact_axis == "Z" else ly
         cross_b_mm = ly if impact_axis == "Z" else lz
 
-        # --- Weighted Multi-Part Mass Calculation ---
+        # --- Weighted Multi-Part Mass & Structural Yield Calculation ---
         part_reports: List[Dict[str, Any]] = []
         potential_savings_g = 0.0
         weighted_mass_g = 0.0
+        structural_yield_num = 0.0
+        structural_vol_den = 0.0
 
         if compiled_parts:
             for pid, pdata in compiled_parts.items():
-                p_vol = float(pdata.get("volume_mm3") or (vol_mm3 / max(len(compiled_parts), 1)))
+                p_vol = max(float(pdata.get("volume_mm3") or (vol_mm3 / max(len(compiled_parts), 1))), 1.0)
                 p_mat = pdata.get("material") or material
                 p_obj = cls.get_material_obj(p_mat)
                 p_mass_g = round(p_vol * (p_obj.density_g_cm3 / 1000.0), 2)
                 weighted_mass_g += p_mass_g
+                role = cls.classify_part_role(pid)
+                # Primary structure & aerodynamic body govern overall crash crumple resistance!
+                if role in ("primary_structure", "aerodynamic_surface", "thermal_propulsion"):
+                    structural_yield_num += p_vol * p_obj.yield_mpa
+                    structural_vol_den += p_vol
+            if structural_vol_den > 0:
+                sigma_y = structural_yield_num / structural_vol_den
         else:
             weighted_mass_g = round(vol_mm3 * (rho / 1000.0), 2)
 

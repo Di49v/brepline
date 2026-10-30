@@ -244,15 +244,36 @@ async def get_job(job_id: str):
 
 
 @router.post("/jobs/{job_id}/simulate")
-async def simulate_job_physics(job_id: str, body: SimulateRequest):
+async def simulate_job_physics(
+    job_id: str,
+    body: SimulateRequest,
+    repo: CadRepository = Depends(get_repository)
+):
     """
     Real-Time Interactive Physics & Crash Playground Endpoint.
-    Recalculates impact crumple depth, failure mode (shatter vs crumple), peak G deceleration,
-    crosswind shear, and role-aware per-part material optimization in <5ms.
+    Automatically falls back to Supabase if job_id is not in memory after a server restart.
     """
     state = JOB_STATES.get(job_id)
     if not state or not state.get("result"):
-        raise HTTPException(status_code=404, detail="Job result not found in active session")
+        db_row = repo.get_generation(job_id)
+        if not db_row:
+            raise HTTPException(status_code=404, detail="Job result not found")
+        meta = db_row.get("metadata") or {}
+        state = {
+            "status": "done",
+            "result": {
+                "job": job_id,
+                "ok": True,
+                "plan": db_row.get("plan") or {},
+                "physics": meta.get("physics") or {},
+                "volume_mm3": meta.get("volume_mm3") or 1000.0,
+                "bbox": meta.get("bbox") or [100.0, 100.0, 100.0],
+                "counts": meta.get("counts") or {},
+                "mesh": meta.get("mesh") or {},
+                "verified": db_row.get("is_verified", True),
+            }
+        }
+        JOB_STATES[job_id] = state
 
     res = state["result"]
     vol = float(res.get("volume_mm3") or 1000.0)
@@ -267,15 +288,23 @@ async def simulate_job_physics(job_id: str, body: SimulateRequest):
     existing_phys = res.get("physics") or {}
     part_breakdown = existing_phys.get("part_breakdown") or []
     existing_colors = existing_phys.get("part_colors") or {}
+    existing_mats = existing_phys.get("part_materials") or {}
     compiled_parts_stub = {}
 
     for p in part_breakdown:
         pid = p.get("part_id", "part")
-        override_mat = (body.part_materials or {}).get(pid) or p.get("material") or body.material
+        orig_mat = existing_mats.get(pid) or p.get("material") or body.material
+        override_mat = (body.part_materials or {}).get(pid) or orig_mat
+        # Preserve original vibrant color (e.g. #ef4444 crimson) unless the user changed this part's material!
+        if override_mat == orig_mat and pid in existing_colors:
+            chosen_color = existing_colors[pid]
+        else:
+            chosen_color = PhysicsEngine.get_material(override_mat).get("color_hex", existing_colors.get(pid, "#94a3b8"))
+
         compiled_parts_stub[pid] = {
             "volume_mm3": p.get("volume_mm3", vol / max(len(part_breakdown), 1)),
             "material": override_mat,
-            "color_hex": PhysicsEngine.get_material(override_mat).get("color_hex", existing_colors.get(pid, "#94a3b8")),
+            "color_hex": chosen_color,
             "bbox": [bbox[0] / 2, bbox[1] / 2, bbox[2] / 2]
         }
 
@@ -414,4 +443,56 @@ async def build_showcase_preset(preset_name: str, seed_db: bool = False):
         "partial_mesh": res.get("mesh"),
         "result": result_payload
     }
+    
+    orchestrator.repo.save_generation({
+     **result_payload,
+     "prompt": preset["prompt"],
+     "material": preset["material"],
+     "route": "showcase_preset",
+     "llm_model": "preset_verified"
+    })
+    
     return result_payload
+
+@router.get("/history")
+async def get_history(repo: CadRepository = Depends(get_repository)):
+    """Loads persisted generations from Supabase PostgreSQL and re-hydrates active session state."""
+    rows = repo.get_recent_generations(limit=25)
+    items = []
+    for r in rows:
+        jid = r.get("job_id")
+        meta = r.get("metadata") or {}
+        mesh = meta.get("mesh")
+        if not jid or not mesh or not mesh.get("verts"):
+            continue
+        phys = meta.get("physics") or {}
+        result_obj = {
+            "job": jid,
+            "ok": True,
+            "prompt": r.get("prompt") or "CAD Design",
+            "material": r.get("material") or "Al 6061",
+            "code": r.get("code") or "",
+            "plan": r.get("plan") or {},
+            "physics": phys,
+            "volume_mm3": meta.get("volume_mm3"),
+            "area_mm2": meta.get("area_mm2"),
+            "mass_g": meta.get("mass_g") or phys.get("mass_g") or 0.0,
+            "density_g_cm3": meta.get("density_g_cm3") or phys.get("density_g_cm3") or 2.7,
+            "bbox": meta.get("bbox") or [100, 100, 100],
+            "bbox_min": meta.get("bbox_min"),
+            "com": meta.get("com"),
+            "counts": meta.get("counts"),
+            "mesh": mesh,
+            "verified": bool(r.get("is_verified", True)),
+            "cached": True,
+        }
+        # Re-hydrate in-memory JOB_STATES so /simulate works immediately after backend restarts!
+        if jid not in JOB_STATES:
+            JOB_STATES[jid] = {
+                "status": "done",
+                "log": ["restored from supabase database"],
+                "partial_mesh": None,
+                "result": result_obj,
+            }
+        items.append(result_obj)
+    return {"ok": True, "items": items}

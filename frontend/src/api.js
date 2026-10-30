@@ -1,5 +1,4 @@
-// src/api.js  -- talks to the Brepline backend.
-// .env (frontend):  VITE_API_URL=https://<your-space>.hf.space   VITE_ACCESS_CODE=<same as backend ACCESS_CODE>
+// src/api.js -- talks to the Brepline backend.
 const BASE = (import.meta.env.VITE_API_URL || "http://localhost:7860").replace(/\/$/, "");
 const CODE = import.meta.env.VITE_ACCESS_CODE || "";
 const H = { "Content-Type": "application/json", "X-Access-Code": CODE };
@@ -105,6 +104,11 @@ export async function simulatePhysics(job, { material = "Al 6061", speed_kmh = 6
     body: JSON.stringify({ material, speed_kmh, wind_m_s, obstacle, part_materials }),
   }));
 }
+
+export const fetchHistory = () =>
+  fetch(`${BASE}/api/history`, { headers: H })
+    .then(r => (r.ok ? r.json() : { ok: false, items: [] }))
+    .catch(() => ({ ok: false, items: [] }));
 
 export const validateShape = (spec, signal) =>
   fetch(`${BASE}/api/shape/validate`, { method: "POST", headers: H, signal, body: JSON.stringify({ spec }) })

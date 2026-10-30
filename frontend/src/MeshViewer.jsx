@@ -193,16 +193,45 @@ export function drawMesh(ctx, w, h, mesh, o = {}) {
 
   // Real-time simulation parameters (progress 0.0 -> 1.0)
   const simActive = sim && sim.active
-  const prog = simActive ? Math.min(1, Math.max(0, sim.progress || 0)) : 0
-  const crumpleRatio = simActive ? Math.min(0.70, Math.max(0.03, sim.crumpleRatio || 0.18)) : 0
+  // Smooth cubic ease-out after impact so motion feels physically damped
+  const rawProg = simActive ? Math.min(1, Math.max(0, sim.progress || 0)) : 0
+  const prog = rawProg
+  const crumpleRatio = simActive ? Math.min(0.68, Math.max(0.03, sim.crumpleRatio || 0.18)) : 0
   const obstacle = simActive ? (sim.obstacle || 'concrete_wall') : null
   const failureMode = simActive ? (sim.failureMode || 'ductile_crumple') : 'ductile_crumple'
+  const showHeatmap = simActive ? Boolean(sim.showHeatmap) : false
 
-  const impactPhase = prog <= 0.42 ? 0 : (prog - 0.42) / 0.58
-  const approachOffset = simActive && obstacle !== 'wind_and_thrust' && obstacle !== 'spike_strip'
-    ? (prog <= 0.42 ? -(1 - prog / 0.42) * (frontSpan * 0.30) : 0)
-    : 0
-  const wallCoord = frontMax - impactPhase * crumpleRatio * frontSpan
+  // Classify each vertex by its sub-part role using mesh.parts & mesh.tri_part
+  const partNames = mesh.parts || []
+  const triPart = mesh.tri_part || null
+  const vRole = simActive && partNames.length && triPart ? new Uint8Array(n) : null // 0=body, 1=wheel, 2=glass, 3=aero
+  if (vRole) {
+    const pRoles = partNames.map(nm => {
+      const s = String(nm || '').toLowerCase()
+      if (s.includes('wheel') || s.includes('tire') || s.includes('tyre')) return 1
+      if (s.includes('glass') || s.includes('window') || s.includes('windshield') || s.includes('canopy')) return 2
+      if (s.includes('fin') || s.includes('wing') || s.includes('spoiler')) return 3
+      return 0
+    })
+    for (let t = 0; t < m; t++) {
+      const rCode = pRoles[triPart[t] % pRoles.length] || 0
+      if (rCode > 0) {
+        vRole[T[t * 3]] = rCode
+        vRole[T[t * 3 + 1]] = rCode
+        vRole[T[t * 3 + 2]] = rCode
+      }
+    }
+  }
+
+  // Stationary Obstacle Plane in World Coordinates (`fixedWallCoord` NEVER moves!)
+  // During approach (0 -> 0.40): vehicle moves from -0.28*L up to touching the stationary wall.
+  // During impact (0.40 -> 1.0): vehicle continues advancing by +crumpleRatio*L into the stationary wall!
+  const fixedWallCoord = frontMax - frontSpan * 0.04
+  const impactPhase = prog <= 0.40 ? 0 : 1 - Math.pow(1 - (prog - 0.40) / 0.60, 2.2)
+  const crushAdvance = impactPhase * crumpleRatio * frontSpan
+  const approachShift = prog <= 0.40
+    ? -(1 - prog / 0.40) * (frontSpan * 0.28)
+    : crushAdvance
 
   const vStress = simActive ? new Float32Array(n) : null
 
@@ -211,93 +240,107 @@ export function drawMesh(ctx, w, h, mesh, o = {}) {
     let vy = V[i * 3 + 1]
     let vz = V[i * 3 + 2]
     let localStress = 0
+    const role = vRole ? vRole[i] : 0
 
     if (simActive) {
       if (obstacle === 'wind_and_thrust') {
         // High-altitude diagonal crosswind shear + cantilever deflection along top (+Z)
         const zNorm = Math.max(0, (vz - p.mn[2]) / Math.max(spanZ, 1))
-        const flutter = Math.sin(prog * Math.PI * 5) * 0.28 + 0.72
-        const bendDeflect = (zNorm * zNorm) * (Math.max(spanX, spanY) * 0.10) * Math.max(crumpleRatio, 0.15) * 2.8 * flutter
+        const flutter = Math.sin(prog * Math.PI * 6) * 0.30 + 0.70
+        const aeroMult = role === 3 ? 2.2 : 1.0
+        const bendDeflect = (zNorm * zNorm) * (Math.max(spanX, spanY) * 0.09) * Math.max(crumpleRatio, 0.14) * 2.5 * flutter * aeroMult
         vy += bendDeflect
-        localStress = Math.min(1, zNorm * 1.2 * flutter)
+        localStress = Math.min(1, zNorm * 1.15 * flutter * (role === 3 ? 1.4 : 0.9))
       } else if (obstacle === 'spike_strip') {
-        // Vehicle drives forward over road spikes at Z = p.mn[2] -> lower tires puncture, shred & deflate!
-        const travel = (prog - 0.35) * (spanX * 0.42)
+        // Vehicle drives forward along X across the stationary spike strip at X = c[0]
+        const travel = (prog - 0.35) * (spanX * 0.45)
         vx += travel
         const zFromGround = vz - p.mn[2]
-        const tireZoneHeight = spanZ * 0.32
-        if (prog > 0.32 && zFromGround < tireZoneHeight) {
-          const deflateProg = (prog - 0.32) / 0.68
-          const crushUp = (tireZoneHeight - zFromGround) * 0.58 * deflateProg
-          vz += crushUp
-          vy += (vy >= c[1] ? 1 : -1) * crushUp * 0.42 * Math.sin(i * 7.13)
-          localStress = Math.min(1, 0.72 + (1 - zFromGround / tireZoneHeight) * 0.38)
-        } else if (prog > 0.32) {
-          const drop = tireZoneHeight * 0.26 * ((prog - 0.32) / 0.68)
-          vz -= drop
-          localStress = 0.22
+        const tireRadiusEst = spanZ * 0.28
+        const isWheel = vRole ? role === 1 : (zFromGround < tireRadiusEst)
+
+        if (prog > 0.30) {
+          const deflateProg = Math.min(1, (prog - 0.30) / 0.70)
+          if (isWheel) {
+            // ONLY wheel/tire vertices flatten at the bottom & shred laterally!
+            if (zFromGround < tireRadiusEst * 0.75) {
+              const crushUp = (tireRadiusEst * 0.75 - zFromGround) * 0.72 * deflateProg
+              vz += crushUp
+              vy += (vy >= c[1] ? 1 : -1) * crushUp * 0.55 * Math.sin(i * 9.17 + prog * 12.0)
+              localStress = Math.min(1, 0.80 + 0.20 * deflateProg)
+            } else {
+              vz -= tireRadiusEst * 0.24 * deflateProg
+              localStress = 0.55 * deflateProg
+            }
+          } else {
+            // Rigid car body/glass/spoiler stays intact and drops lower onto the deflated rims!
+            const drop = tireRadiusEst * 0.24 * deflateProg
+            const pitchNoseDown = ((vx - c[0]) / Math.max(spanX, 1)) * (tireRadiusEst * 0.08) * deflateProg
+            vz -= (drop + pitchNoseDown)
+            localStress = 0.18 * deflateProg
+          }
         }
       } else {
-        // Move vehicle/rocket along its primary travel axis toward the obstacle
-        let primary = (crashAxis === 2 ? vz : (crashAxis === 0 ? vx : vy)) + approachOffset
+        // Frontal Concrete Wall or Center Bollard Pole (Stationary Obstacle at fixedWallCoord!)
+        let primary = (crashAxis === 2 ? vz : (crashAxis === 0 ? vx : vy)) + approachShift
         if (crashAxis === 2) vz = primary
         else if (crashAxis === 0) vx = primary
         else vy = primary
 
         const latCoord = crashAxis === 0 ? (vy - c[1]) : (vx - c[0])
         const latSpan = Math.max(crashAxis === 0 ? spanY : spanX, 1)
-        const poleRadius = latSpan * 0.18
+        const poleRadius = latSpan * 0.16
         const distFromPoleCenter = Math.abs(latCoord)
         const inContact = obstacle === 'bollard_pole' ? distFromPoleCenter < poleRadius : true
 
-        if (impactPhase > 0 && primary > wallCoord) {
-          const pen = primary - wallCoord
+        if (impactPhase > 0 && primary > fixedWallCoord) {
+          const pen = primary - fixedWallCoord
           if (inContact) {
-            if (failureMode === 'brittle_shatter') {
+            if (failureMode === 'brittle_shatter' || role === 2) {
               // Brittle shatter (Glass / PLA): fragments scatter outward and downward!
               const hash = Math.sin(i * 12.9898) * 43758.5453
               const frac = hash - Math.floor(hash)
-              const clamped = wallCoord - frac * pen * 0.35
+              const clamped = fixedWallCoord - frac * pen * 0.25
               if (crashAxis === 2) vz = clamped
               else if (crashAxis === 0) vx = clamped
               else vy = clamped
-              vy += (vy >= c[1] ? 1 : -1) * pen * (0.45 + frac * 0.8)
-              vz -= pen * 0.35 * frac
+              vy += (vy >= c[1] ? 1 : -1) * pen * (0.45 + frac * 0.75)
+              vz += (frac - 0.35) * pen * 0.5
             } else {
-              // Ductile accordion crumple (Al 6061 / Steel / Titanium) with harmonic folding ripples
-              const foldWave = Math.sin((pen / Math.max(frontSpan * 0.05, 1)) * Math.PI * 2) * 0.08
-              const clamped = wallCoord + pen * 0.06
+              // Ductile accordion crumple against stationary barrier + hood buckling upward
+              const foldWave = Math.sin((pen / Math.max(frontSpan * 0.04, 1)) * Math.PI * 2) * 0.12
+              const clamped = fixedWallCoord - Math.abs(foldWave) * (frontSpan * 0.015)
               if (crashAxis === 2) {
                 vz = clamped
-                vx += (vx - c[0]) * (0.28 + foldWave) * (pen / frontSpan)
-                vy += (vy - c[1]) * (0.28 + foldWave) * (pen / frontSpan)
+                vx += (vx - c[0]) * (0.32 + foldWave) * (pen / frontSpan)
+                vy += (vy - c[1]) * (0.32 + foldWave) * (pen / frontSpan)
               } else if (crashAxis === 0) {
                 vx = clamped
-                vy += (vy >= c[1] ? 1 : -1) * pen * (0.24 + foldWave)
-                vz += ((vz - p.mn[2]) / Math.max(spanZ, 1)) * pen * 0.22
+                vy += (vy >= c[1] ? 1 : -1) * pen * (0.18 + foldWave)
+                vz += Math.max(0, (vz - p.mn[2]) / Math.max(spanZ, 1)) * pen * (0.28 + Math.abs(foldWave))
               } else {
                 vy = clamped
-                vx += (vx >= c[0] ? 1 : -1) * pen * (0.24 + foldWave)
+                vx += (vx >= c[0] ? 1 : -1) * pen * (0.18 + foldWave)
               }
             }
-            localStress = Math.min(1, 0.62 + (pen / (crumpleRatio * frontSpan + 1e-3)) * 0.55)
+            localStress = Math.min(1, 0.65 + (pen / (crumpleRatio * frontSpan + 1e-3)) * 0.50)
           } else if (obstacle === 'bollard_pole') {
-            // Outer fenders wrap forward around the central bollard pole!
-            const wrapFactor = Math.exp(-(distFromPoleCenter - poleRadius) / (latSpan * 0.25))
-            const wrapShift = pen * wrapFactor * 0.65
-            if (crashAxis === 2) vz -= wrapShift
+            // Left and right fenders advance past the pole while wrapping inward toward center!
+            const wrapFactor = Math.exp(-(distFromPoleCenter - poleRadius) / (latSpan * 0.28))
+            const dragBack = pen * wrapFactor * 0.82
+            if (crashAxis === 2) vz -= dragBack
             else if (crashAxis === 0) {
-              vx -= wrapShift
-              vy -= Math.sign(latCoord) * wrapShift * 0.25
+              vx -= dragBack
+              vy -= Math.sign(latCoord) * pen * wrapFactor * 0.22
             } else {
-              vy -= wrapShift
+              vy -= dragBack
             }
-            localStress = Math.min(0.88, wrapFactor * 0.85)
+            localStress = Math.min(0.92, wrapFactor * 0.90)
           }
         } else if (impactPhase > 0) {
-          const distToWall = Math.max(0, wallCoord - primary)
-          const decay = Math.exp(-distToWall / (frontSpan * 0.26))
-          localStress = decay * impactPhase * 0.68
+          const distToWall = Math.max(0, fixedWallCoord - primary)
+          const decay = Math.exp(-distToWall / (frontSpan * 0.25))
+          localStress = decay * impactPhase * (role === 2 ? 0.85 : 0.65)
         }
       }
       vStress[i] = localStress
@@ -329,8 +372,6 @@ export function drawMesh(ctx, w, h, mesh, o = {}) {
   ctx.restore()
 
   // Prepare per-part shade palettes if mesh has named sub-parts
-  const partNames = mesh.parts || []
-  const triPart = mesh.tri_part || null
   const partPalettes = partNames.length > 0
     ? partNames.map((pname, idx) => {
         const hex = (partColors && partColors[pname]) || DEFAULT_PART_HEX[idx % DEFAULT_PART_HEX.length]
@@ -378,24 +419,34 @@ export function drawMesh(ctx, w, h, mesh, o = {}) {
   ctx.lineWidth = 0.7
   let lastFill = ''
   let lastAlpha = 1.0
+  const glassShatterActive = simActive && impactPhase > 0.12 && crumpleRatio > 0.14 && obstacle !== 'wind_and_thrust' && obstacle !== 'spike_strip'
+
   for (let k = 0; k < m; k++) {
     const t = order[k]
     const a = T[t * 3] * 3, b = T[t * 3 + 1] * 3, d = T[t * 3 + 2] * 3
     let col
     let alpha = 1.0
-    if (simActive && Stress[t] > 6) {
-      col = HEATMAP_PALETTE[Stress[t]]
-    } else if (partPalettes && triPart && triPart[t] !== undefined) {
+    let isGlassTri = false
+
+    if (partPalettes && triPart && triPart[t] !== undefined) {
       const pIdx = triPart[t] % partPalettes.length
       const pname = (partNames[pIdx] || '').toLowerCase()
       const pHex = ((partColors && partColors[partNames[pIdx]]) || '').toLowerCase()
       if (pname.includes('glass') || pname.includes('window') || pname.includes('windshield') || pname.includes('canopy') || pHex === '#38bdf8') {
-        alpha = 0.55
+        alpha = 0.58
+        isGlassTri = true
       }
       col = partPalettes[pIdx][S[t]]
     } else {
       col = defaultPal[S[t]]
     }
+
+    // Only override with Heatmap colors if user toggled `showHeatmap = true`!
+    if (simActive && showHeatmap && Stress[t] > 6) {
+      col = HEATMAP_PALETTE[Stress[t]]
+      alpha = 1.0
+    }
+
     if (alpha !== lastAlpha) {
       lastAlpha = alpha
       ctx.globalAlpha = alpha
@@ -405,6 +456,28 @@ export function drawMesh(ctx, w, h, mesh, o = {}) {
       ctx.fillStyle = col
       ctx.strokeStyle = col
     }
+
+    // Per-Triangle Glass Shard Explosion when glass shatters on impact!
+    if ((isGlassTri || failureMode === 'brittle_shatter') && glassShatterActive && Stress[t] > 10) {
+      const shardSeed = Math.sin(t * 19.31 + 1.7) * 43758.5453
+      const rnd = shardSeed - Math.floor(shardSeed)
+      const burst = impactPhase * (crumpleRatio * 2.2) * (0.4 + rnd * 1.4) * Math.min(w, h) * 0.14
+      const nxScreen = N[t * 3] * cy - N[t * 3 + 1] * sy
+      const nyScreen = -((N[t * 3] * sy + N[t * 3 + 1] * cy) * sp + N[t * 3 + 2] * cp)
+      const dxShard = nxScreen * burst + (rnd - 0.5) * burst * 0.8
+      const dyShard = nyScreen * burst + (impactPhase * impactPhase) * burst * 0.9 // gravity drop
+      const cxTri = (P[a] + P[b] + P[d]) / 3 + dxShard
+      const cyTri = (P[a + 1] + P[b + 1] + P[d + 1]) / 3 + dyShard
+      const shrink = 0.72 // separate shards visually
+      ctx.beginPath()
+      ctx.moveTo(cxTri + (P[a] - (P[a] + P[b] + P[d]) / 3) * shrink, cyTri + (P[a + 1] - (P[a + 1] + P[b + 1] + P[d + 1]) / 3) * shrink)
+      ctx.lineTo(cxTri + (P[b] - (P[a] + P[b] + P[d]) / 3) * shrink, cyTri + (P[b + 1] - (P[a + 1] + P[b + 1] + P[d + 1]) / 3) * shrink)
+      ctx.lineTo(cxTri + (P[d] - (P[a] + P[b] + P[d]) / 3) * shrink, cyTri + (P[d + 1] - (P[a + 1] + P[b + 1] + P[d + 1]) / 3) * shrink)
+      ctx.closePath()
+      ctx.fill()
+      continue
+    }
+
     ctx.beginPath()
     ctx.moveTo(P[a], P[a + 1]); ctx.lineTo(P[b], P[b + 1]); ctx.lineTo(P[d], P[d + 1])
     ctx.closePath()
@@ -413,57 +486,55 @@ export function drawMesh(ctx, w, h, mesh, o = {}) {
   }
   ctx.globalAlpha = 1.0
 
-  // Draw 3D Obstacle Overlay aligned with crashAxis (Z-top for rockets, X-front for vehicles)
+  // Draw Stationary 3D Obstacle Overlay at `fixedWallCoord`
   if (simActive) {
     const pr = makeProj(p, w, h, { yaw, pitch, zoom })
     ctx.save()
     if (obstacle === 'concrete_wall') {
       let corners
       if (crashAxis === 2) {
-        // Horizontal ceiling barrier above rocket nose cone (+Z)
         corners = [
-          pr(p.mn[0] - spanX * 0.35, p.mn[1] - spanY * 0.35, wallCoord),
-          pr(p.mx[0] + spanX * 0.35, p.mn[1] - spanY * 0.35, wallCoord),
-          pr(p.mx[0] + spanX * 0.35, p.mx[1] + spanY * 0.35, wallCoord),
-          pr(p.mn[0] - spanX * 0.35, p.mx[1] + spanY * 0.35, wallCoord),
+          pr(p.mn[0] - spanX * 0.35, p.mn[1] - spanY * 0.35, fixedWallCoord),
+          pr(p.mx[0] + spanX * 0.35, p.mn[1] - spanY * 0.35, fixedWallCoord),
+          pr(p.mx[0] + spanX * 0.35, p.mx[1] + spanY * 0.35, fixedWallCoord),
+          pr(p.mn[0] - spanX * 0.35, p.mx[1] + spanY * 0.35, fixedWallCoord),
         ]
       } else if (crashAxis === 0) {
         corners = [
-          pr(wallCoord, p.mn[1] - spanY * 0.25, p.mn[2]),
-          pr(wallCoord, p.mx[1] + spanY * 0.25, p.mn[2]),
-          pr(wallCoord, p.mx[1] + spanY * 0.25, p.mx[2] + spanZ * 0.25),
-          pr(wallCoord, p.mn[1] - spanY * 0.25, p.mx[2] + spanZ * 0.25),
+          pr(fixedWallCoord, p.mn[1] - spanY * 0.25, p.mn[2]),
+          pr(fixedWallCoord, p.mx[1] + spanY * 0.25, p.mn[2]),
+          pr(fixedWallCoord, p.mx[1] + spanY * 0.25, p.mx[2] + spanZ * 0.25),
+          pr(fixedWallCoord, p.mn[1] - spanY * 0.25, p.mx[2] + spanZ * 0.25),
         ]
       } else {
         corners = [
-          pr(p.mn[0] - spanX * 0.25, wallCoord, p.mn[2]),
-          pr(p.mx[0] + spanX * 0.25, wallCoord, p.mn[2]),
-          pr(p.mx[0] + spanX * 0.25, wallCoord, p.mx[2] + spanZ * 0.25),
-          pr(p.mn[0] - spanX * 0.25, wallCoord, p.mx[2] + spanZ * 0.25),
+          pr(p.mn[0] - spanX * 0.25, fixedWallCoord, p.mn[2]),
+          pr(p.mx[0] + spanX * 0.25, fixedWallCoord, p.mn[2]),
+          pr(p.mx[0] + spanX * 0.25, fixedWallCoord, p.mx[2] + spanZ * 0.25),
+          pr(p.mn[0] - spanX * 0.25, fixedWallCoord, p.mx[2] + spanZ * 0.25),
         ]
       }
       ctx.fillStyle = 'rgba(239, 68, 68, 0.22)'
       ctx.strokeStyle = '#ef4444'
-      ctx.lineWidth = 2
+      ctx.lineWidth = 2.2
       ctx.beginPath()
       corners.forEach((pt, idx) => (idx ? ctx.lineTo(pt[0], pt[1]) : ctx.moveTo(pt[0], pt[1])))
       ctx.closePath()
       ctx.fill()
       ctx.stroke()
     } else if (obstacle === 'bollard_pole') {
-      const pX = crashAxis === 0 ? wallCoord : p.c[0]
-      const pY = crashAxis === 1 ? wallCoord : p.c[1]
-      const bot = crashAxis === 2 ? pr(p.mn[0] - spanX * 0.3, p.c[1], wallCoord) : pr(pX, pY, p.mn[2])
-      const top = crashAxis === 2 ? pr(p.mx[0] + spanX * 0.3, p.c[1], wallCoord) : pr(pX, pY, p.mx[2] + spanZ * 0.25)
+      const pX = crashAxis === 0 ? fixedWallCoord : p.c[0]
+      const pY = crashAxis === 1 ? fixedWallCoord : p.c[1]
+      const bot = crashAxis === 2 ? pr(p.mn[0] - spanX * 0.3, p.c[1], fixedWallCoord) : pr(pX, pY, p.mn[2])
+      const top = crashAxis === 2 ? pr(p.mx[0] + spanX * 0.3, p.c[1], fixedWallCoord) : pr(pX, pY, p.mx[2] + spanZ * 0.28)
       ctx.strokeStyle = '#f59e0b'
-      ctx.lineWidth = Math.max(12, diag * 0.045 * s)
+      ctx.lineWidth = Math.max(14, diag * 0.045 * s)
       ctx.lineCap = 'round'
       ctx.beginPath()
       ctx.moveTo(bot[0], bot[1])
       ctx.lineTo(top[0], top[1])
       ctx.stroke()
     } else if (obstacle === 'spike_strip') {
-      // Draw 3D metallic road spikes across the ground plane at X = c[0]
       ctx.strokeStyle = '#ef4444'
       ctx.fillStyle = '#f59e0b'
       ctx.lineWidth = 2
@@ -485,7 +556,7 @@ export function drawMesh(ctx, w, h, mesh, o = {}) {
     } else if (obstacle === 'wind_and_thrust') {
       ctx.strokeStyle = '#38bdf8'
       ctx.fillStyle = '#38bdf8'
-      ctx.lineWidth = 2
+      ctx.lineWidth = 2.2
       for (let k = 0; k < 5; k++) {
         const zLvl = p.mn[2] + ((k + 0.5) / 5) * spanZ
         const start = pr(p.c[0], p.mn[1] - spanY * 0.55, zLvl)

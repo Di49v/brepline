@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import MeshViewer, { Thumb, meshStats, fm } from './MeshViewer.jsx'
-import { generate, vote as sendVote, fileUrl, health, cancelJob, simulatePhysics } from './api.js'
+import { generate, vote as sendVote, fileUrl, health, cancelJob, simulatePhysics, fetchHistory } from './api.js'
 import ShapeEditor from './ShapeEditor.jsx'
 
 /* ---------- static data ---------- */
@@ -45,7 +45,7 @@ const P = {
 }
 
 /* ---------- helpers ---------- */
-const fname = t => t.split(' ').slice(0, 3).join('_').toLowerCase().replace(/[^a-z0-9_]/g, '') || 'part'
+const fname = t => String(t || 'part').split(' ').slice(0, 3).join('_').toLowerCase().replace(/[^a-z0-9_]/g, '') || 'part'
 
 // real download from the backend: ext = step | stl | py
 function dl(job, ext) {
@@ -59,16 +59,17 @@ function dl(job, ext) {
 }
 
 const fmtMass = g => (g >= 1000 ? (g / 1000).toFixed(2) + ' kg' : Number(g || 0).toFixed(1) + ' g')
-const fmtSize = b => (b || []).map(x => Math.round(x * 10) / 10).join(' × ') + ' mm'
+const fmtSize = b => (Array.isArray(b) ? b : [0, 0, 0]).map(x => Math.round(Number(x || 0) * 10) / 10).join(' × ') + ' mm'
 
 // turn a backend result into one "version" of a chat answer
 function toVersion(r, prompt, f, m) {
+  const safePrompt = String(prompt || 'CAD Design')
   return {
     job: r.job,
-    n: fname(prompt),
-    title: (r.plan && r.plan.object) || prompt.slice(0, 40),
-    f,
-    m,
+    n: fname(safePrompt),
+    title: (r.plan && r.plan.object) || safePrompt.slice(0, 40),
+    f: f || 'STEP',
+    m: m || 'Al 6061',
     mass_g: r.mass_g || 0,
     bbox: r.bbox || [0, 0, 0],
     mesh: r.mesh,
@@ -363,11 +364,10 @@ function Result({ v, onOpen3d, onRefine, onEditShape }) {
 const nf = (x, d = 1) => Number(x).toLocaleString('en-US', { maximumFractionDigits: d })
 const c3 = q => `(${fm(q[0])}, ${fm(q[1])}, ${fm(q[2])})`
 
-// numbers and the maths behind them
 function InfoPanel({ v, mesh, pts, measureOn }) {
   const st = useMemo(() => (mesh ? meshStats(mesh) : null), [mesh])
   if (!v) return null
-  const [W, D, H] = v.bbox
+  const [W, D, H] = v.bbox || [0, 0, 0]
   const bmin = v.bmin || (st ? st.min : null)
   const V = v.vol
   const area = v.area || (st ? st.area : null)
@@ -464,6 +464,7 @@ function MeshModal({ s, onClose, onGoPricing }) {
   const [simMat, setSimMat] = useState('Al 6061')
   const [partMats, setPartMats] = useState({})
   const [physData, setPhysData] = useState(null)
+  const [showHeatmap, setShowHeatmap] = useState(false)
   const [simAnim, setSimAnim] = useState({ active: false, running: false, progress: 0, crumpleRatio: 0.18, obstacle: 'concrete_wall' })
 
   useEffect(() => {
@@ -559,7 +560,7 @@ function MeshModal({ s, onClose, onGoPricing }) {
         <div className="mvw">
           {s.open && s.mesh
             ? <MeshViewer mesh={s.mesh} wire={wire} auto={auto} resetKey={rk} dims={dims} axes={axes} grid={grid}
-                measure={measure} clearKey={ck} onMeasure={setPts} partColors={partColors} simState={simAnim} />
+                measure={measure} clearKey={ck} onMeasure={setPts} partColors={partColors} simState={{ ...simAnim, showHeatmap }} />
             : <div className="mv nomesh">Preview not available</div>}
           <div className="vt">
             {tgl(dims, setDims, 'Dimensions')}
@@ -641,6 +642,16 @@ function MeshModal({ s, onClose, onGoPricing }) {
                 </>
               )}
 
+              <h4 className="ih">Visual Render Mode</h4>
+              <div className="seg" style={{ marginBottom: 10 }}>
+                <button className={!showHeatmap ? 'on' : ''} onClick={() => setShowHeatmap(false)}>
+                  🎨 True Material Colors
+                </button>
+                <button className={showHeatmap ? 'on' : ''} onClick={() => setShowHeatmap(true)}>
+                  🔥 FEA Stress Heatmap
+                </button>
+              </div>
+
               <div style={{ display: 'flex', gap: 6, marginTop: 10 }}>
                 <button className="btn p" style={{ flex: 1 }} onClick={runCrashSim}>
                   ▶ Run Simulation
@@ -679,7 +690,7 @@ function MeshModal({ s, onClose, onGoPricing }) {
           )}
         </div>
         <div className="mf">
-          <span>{simAnim.active ? 'FE Stress Heatmap Active (Green = Elastic · Red = Plastic Yield) · ' : ''}{measure ? 'Click two points to measure · ' : ''}Drag to rotate · Scroll or pinch to zoom · Esc to close</span>
+          <span>{simAnim.active ? 'Simulation Active · ' : ''}{measure ? 'Click two points to measure · ' : ''}Drag to rotate · Scroll or pinch to zoom · Esc to close</span>
           <span>{s.bbox ? fmtSize(s.bbox) : ''}</span>
         </div>
       </div>
@@ -761,29 +772,18 @@ export default function App() {
   const [userName, setUserName] = useState(() => readLS('bp-user', 'Gurtej'))
   useEffect(() => { writeLS('bp-user', userName) }, [userName])
 
-  const [hist, setHist] = useState(() => {
-    try { return JSON.parse(readLS('bp-hist', '[]')) || [] } catch { return [] }
-  })
-  const [files, setFiles] = useState(() => {
-    try { return JSON.parse(readLS('bp-files', '[]')) || [] } catch { return [] }
-  })
-  useEffect(() => {
-    try { writeLS('bp-hist', JSON.stringify(hist.slice(0, 15))) } catch { /* quota */ }
-  }, [hist])
-  useEffect(() => {
-    // Store lightweight file metadata + mesh (up to 8 recent models) so page reload keeps your 3D models!
-    try { writeLS('bp-files', JSON.stringify(files.slice(0, 8))) } catch { /* quota */ }
-  }, [files])
+  const [hist, setHist] = useState([])
+  const [files, setFiles] = useState([])
   const [hs, setHs] = useState('')
   const [fs, setFs] = useState('')
   const [ff, setFf] = useState('All')
 
-  const shownHist = hist.filter(h => h.t.toLowerCase().includes(hs.toLowerCase()))
-  const shownFiles = files.filter(x => x.n.includes(fs.toLowerCase()) && (ff === 'All' || x.f === ff))
-  const verifiedCount = files.filter(x => x.verified).length
+  const shownHist = hist.filter(h => h && String(h.t || '').toLowerCase().includes(hs.toLowerCase()))
+  const shownFiles = files.filter(x => x && String(x.n || '').toLowerCase().includes(fs.toLowerCase()) && (ff === 'All' || x.f === ff))
+  const verifiedCount = files.filter(x => x && x.verified).length
   const topFmt = (() => {
     const c = {}
-    files.forEach(x => { c[x.f] = (c[x.f] || 0) + 1 })
+    files.forEach(x => { if (x && x.f) c[x.f] = (c[x.f] || 0) + 1 })
     return Object.keys(c).sort((a, b) => c[b] - c[a])[0] || 'STEP'
   })()
 
@@ -849,15 +849,15 @@ export default function App() {
   const [chats, setChats] = useState([{ id: 1, msgs: [] }])
   const [activeId, setActiveId] = useState(1)
   const cid = useRef(1)
-  const cur = chats.find(c => c.id === activeId) || chats[chats.length - 1]
-  const msgs = cur.msgs
-  const allMsgs = chats.flatMap(c => c.msgs)
+  const cur = chats.find(c => c.id === activeId) || chats[chats.length - 1] || { id: 1, msgs: [] }
+  const msgs = cur.msgs || []
+  const allMsgs = chats.flatMap(c => c.msgs || [])
   const setMsgs = fn => setChats(cs => cs.map(c => {
     const n = fn(c.msgs)
     return n.length === c.msgs.length && n.every((x, i) => x === c.msgs[i]) ? c : { ...c, msgs: n }
   }))
   const addMsg = M => setChats(cs => cs.map(c => (c.id === cur.id ? { ...c, msgs: [...c.msgs, M] } : c)))
-  useEffect(() => { if (!chats.some(c => c.id === activeId)) setActiveId(chats[chats.length - 1].id) }, [chats, activeId])
+  useEffect(() => { if (chats.length && !chats.some(c => c.id === activeId)) setActiveId(chats[chats.length - 1].id) }, [chats, activeId])
 
   // FIXED: Only auto-scroll when a new message is added or chat tab changes, NEVER on 1s log poll ticks!
   useEffect(() => {
@@ -921,7 +921,7 @@ export default function App() {
 
   const send = txt => {
     const t = (typeof txt === 'string' ? txt : inp).trim()
-    if (!t || busyCount) return // one generation at a time; press Stop to cancel the current one
+    if (!t || busyCount) return
     setInp('')
     if (inpRef.current) inpRef.current.style.height = 'auto'
     askPerm()
@@ -1006,12 +1006,12 @@ export default function App() {
     const M = allMsgs.find(x => x.id === id)
     const jobs = new Set(M ? M.vers.map(v => v.job) : [])
     setMsgs(p => p.filter(x => x.id !== id))
-    setHist(h => h.filter(x => x.id !== id))
-    setFiles(fl => fl.filter(x => !jobs.has(x.v.job)))
+    setHist(h => h.filter(x => x && x.id !== id))
+    setFiles(fl => fl.filter(x => x && x.v && !jobs.has(x.v.job)))
   }
   const askRemoveTurn = (id, label) => ask({
     title: 'Delete this design?',
-    body: `"${label}" will be removed from the chat, history and generated files of this session. Copies on the server expire on their own after about 24 hours.`,
+    body: `"${label}" will be removed from the chat, history and generated files of this session.`,
     ok: 'Delete', danger: true, run: () => removeTurn(id)
   })
   const removeChat = c => {
@@ -1019,19 +1019,19 @@ export default function App() {
     const ids = new Set(c.msgs.map(m => m.id))
     const jobs = new Set(c.msgs.flatMap(m => m.vers.map(v => v.job)))
     const nid = ++cid.current
-    setHist(h => h.filter(x => !ids.has(x.id)))
-    setFiles(fl => fl.filter(x => !jobs.has(x.v.job)))
+    setHist(h => h.filter(x => x && !ids.has(x.id)))
+    setFiles(fl => fl.filter(x => x && x.v && !jobs.has(x.v.job)))
     setChats(cs => { const r = cs.filter(x => x.id !== c.id); return r.length ? r : [{ id: nid, msgs: [] }] })
   }
   const askRemoveChat = c => ask({
     title: 'Delete this chat?',
-    body: `"${c.msgs[0].text.slice(0, 42)}"${c.msgs.length > 1 ? ` and its ${c.msgs.length} designs` : ''} will be removed from the sidebar, history and generated files. Copies on the server expire on their own after about 24 hours.`,
+    body: `"${c.msgs[0].text.slice(0, 42)}"${c.msgs.length > 1 ? ` and its ${c.msgs.length} designs` : ''} will be removed from this session.`,
     ok: 'Delete', danger: true, run: () => removeChat(c)
   })
   const askRemoveFile = x => ask({
     title: 'Delete this file?',
-    body: `${x.n}.${x.f.toLowerCase()} will be removed from your generated files. The chat message that produced it stays.`,
-    ok: 'Delete', danger: true, run: () => setFiles(fl => fl.filter(y => y.fid !== x.fid))
+    body: `${x.n}.${x.f.toLowerCase()} will be removed from your generated files.`,
+    ok: 'Delete', danger: true, run: () => setFiles(fl => fl.filter(y => y && y.fid !== x.fid))
   })
 
   /* custom polygon / profile editor */
@@ -1057,6 +1057,35 @@ export default function App() {
   /* upgrade pill: shown on every load for the Free plan; x hides it until next load */
   const [upb, setUpb] = useState(true)
 
+  // Load saved generations directly from Supabase PostgreSQL on startup
+  useEffect(() => {
+    fetchHistory().then(res => {
+      if (!res || !res.ok || !Array.isArray(res.items) || !res.items.length) return
+      const dbMsgs = []
+      const dbHist = []
+      const dbFiles = []
+      res.items.slice().reverse().forEach(r => {
+        if (!r || !r.mesh || !r.mesh.verts) return
+        const id = ++uid.current
+        const promptText = String(r.prompt || (r.plan && r.plan.object) || 'CAD Design')
+        const matName = r.material || 'Al 6061'
+        const v = toVersion(r, promptText, 'STEP', matName)
+        dbMsgs.push({
+          id, text: promptText, f: 'STEP', m: matName, parent: null,
+          vers: [v], cur: 0, vote: 0, busy: false, editing: false,
+          err: null, stopped: false, trace: null, logs: ['Restored from Supabase'], partialMesh: null, t0: Date.now()
+        })
+        dbHist.unshift({ id, t: promptText.slice(0, 42), d: 'Saved in DB', f: 'STEP' })
+        dbFiles.unshift({ fid: ++uid.current, n: v.n, f: 'STEP', size: fmtSize(v.bbox), mass: fmtMass(v.mass_g), verified: v.verified, v })
+      })
+      if (dbMsgs.length) {
+        setChats([{ id: 1, msgs: dbMsgs }])
+        setHist(dbHist)
+        setFiles(dbFiles)
+      }
+    }).catch(() => {})
+  }, [])
+
   return (
     <>
       <Sprite />
@@ -1077,7 +1106,7 @@ export default function App() {
         <SidebarGen items={busyList} onStop={stopAll} onOpen={openTurn} />
         <div className="cap">Recent</div>
         <div className="rlist">
-          {chats.filter(c => c.msgs.length).slice().reverse().slice(0, 10).map(c => (
+          {chats.filter(c => c.msgs && c.msgs.length).slice().reverse().slice(0, 10).map(c => (
             <div key={c.id} className={'ri' + (c.id === cur.id && view === 'chat' ? ' on' : '')} onClick={() => openChat(c.id)} title={c.msgs[0].text}>
               {c.msgs.some(m => m.busy) && <i className="sgd" title="Generating" />}
               <span className="rt">{c.msgs[0].text.slice(0, 42)}</span>
@@ -1102,7 +1131,7 @@ export default function App() {
           </div>
         </div>
         <div className="user" onClick={() => go('settings')}>
-          <div className="av">T</div>
+          <div className="av">{String(userName || 'G')[0].toUpperCase()}</div>
           <div>{userName}<small>Free plan</small></div>
         </div>
       </aside>
@@ -1144,12 +1173,12 @@ export default function App() {
                 </div>
               )}
               {msgs.map(M => {
-                const v = M.vers[M.cur]
+                const v = M.vers && M.vers[M.cur]
                 const loading = M.busy
                 return (
                   <Fragment key={M.id}>
                     <div className="m u" id={'m-' + M.id}>
-                      <div className="ic">T</div>
+                      <div className="ic">{String(userName || 'G')[0].toUpperCase()}</div>
                       <div className="t">
                         {M.editing ? (
                           <EditBox init={M.text} onSave={val => saveEdit(M.id, val)} onCancel={() => patch(M.id, { editing: false })} />
@@ -1235,7 +1264,7 @@ export default function App() {
                         <div className="tbw">
                           {!loading && (
                             <div className="tb">
-                              {M.vers.length > 1 && (
+                              {M.vers && M.vers.length > 1 && (
                                 <span className="pg">
                                   <button disabled={!M.cur} onClick={() => nav(M.id, -1)}><PI k="l" /></button>
                                   {M.cur + 1} / {M.vers.length}
@@ -1276,7 +1305,7 @@ export default function App() {
                 onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() } }}
               />
               <div className="bar">
-                <button className="btn" title="Draw your own polygon or profile" aria-label="Draw shape" onClick={drawShape}><Ic n="clip"/><span className="lbl">Draw shape</span></button>
+                <button className="btn" title="Draw your own polygon or profile" aria-label="Draw shape" onClick={drawShape}><Ic n="clip" /><span className="lbl">Draw shape</span></button>
                 {/* desktop / tablet: separate dropdowns */}
                 <div className="opts-d">
                   <select value={mat} onChange={e => setMat(e.target.value)}>{MATS.map(x => <option key={x}>{x}</option>)}</select>
@@ -1313,7 +1342,7 @@ export default function App() {
         {/* HISTORY */}
         <section className={'view' + (view === 'hist' ? ' on' : '')} id="hist">
           <div className="page">
-            <h2>History</h2><p>Designs from this session.</p>
+            <h2>History</h2><p>Designs from this session & Supabase database.</p>
             <div className="tools"><input type="search" placeholder="Search history" value={hs} onChange={e => setHs(e.target.value)} /></div>
             <div>
               {shownHist.length ? shownHist.map(h => (
@@ -1330,7 +1359,7 @@ export default function App() {
         {/* FILES */}
         <section className={'view' + (view === 'files' ? ' on' : '')} id="files">
           <div className="page">
-            <h2>Generated files</h2><p>CAD models from this session. Files are kept on the server for about 24 hours.</p>
+            <h2>Generated files</h2><p>CAD models persisted in Supabase.</p>
             <div className="stats">
               <div className="stat"><b>{files.length}</b>Models generated</div>
               <div className="stat"><b>{verifiedCount}</b>Verified models</div>
@@ -1345,10 +1374,10 @@ export default function App() {
                 <div className="f" key={x.fid}>
                   <button className="fx" title="Delete" aria-label="Delete file" onClick={() => askRemoveFile(x)}><PI k="x" /></button>
                   <div className="prev" onClick={() => open3d(x.v)}>
-                    {x.v.mesh ? <Thumb mesh={x.v.mesh} alt={x.n} partColors={x.v.physics && x.v.physics.part_colors} /> : <PartIcon />}
+                    {x.v && x.v.mesh ? <Thumb mesh={x.v.mesh} alt={x.n} partColors={x.v.physics && x.v.physics.part_colors} /> : <PartIcon />}
                   </div>
                   <div className="in">
-                    <b>{x.n}.{x.f.toLowerCase()}</b>
+                    <b>{x.n}.{String(x.f || 'step').toLowerCase()}</b>
                     <small>{x.size} / {x.mass}</small>
                     <div className="row">
                       <span className="tag">{x.f}</span>
@@ -1423,7 +1452,7 @@ export default function App() {
 
               <div className={'panel' + (panel === 'account' ? ' on' : '')}>
                 <h3>Account</h3><p>Your profile and plan.</p>
-                <div className="srow"><div><b>Name</b><small>Shown in the sidebar</small></div><input type="text"value={userName} onChange={e => setUserName(e.target.value)} /></div>
+                <div className="srow"><div><b>Name</b><small>Shown in the sidebar</small></div><input type="text" value={userName} onChange={e => setUserName(e.target.value)} /></div>
                 <div className="srow"><div><b>Plan</b><small>Free plan</small></div>
                   <button className="btn p" onClick={() => go('pricing')}>Upgrade</button></div>
                 <div className="srow"><div><b>Sign out</b><small>End this session</small></div><button className="btn">Sign out</button></div>

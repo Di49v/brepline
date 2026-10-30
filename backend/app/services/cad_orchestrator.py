@@ -622,7 +622,13 @@ class CadOrchestrator:
             "mass_g": report["mass_g"],
             "physics": report,
             "attempts": state.get("repair_attempts", 0) + 1,
-            "llm_model": settings.coder_model
+            "llm_model": settings.coder_model,
+            "mesh": res.get("mesh"), 
+            "bbox_min": res.get("bbox_min"), 
+            "area_mm2": res.get("area"), 
+            "com": res.get("com"), 
+            "counts": res.get("counts"), 
+            "density_g_cm3": report["density_g_cm3"]
         })
 
         # Also cache the complete stitched assembly under its canonical query if multi-part

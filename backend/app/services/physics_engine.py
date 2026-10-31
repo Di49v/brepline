@@ -148,6 +148,22 @@ OBSTACLE_PRESETS: Dict[str, ObstaclePreset] = {
         sharpness_factor=1.0,
         description="High-penetration road spikes testing tire blowout/deflation and undercarriage armor."
     ),
+    "speed_bump": ObstaclePreset(
+        id="speed_bump",
+        name="High-Speed Baja Speed-Bump Jump",
+        contact_zone="undercarriage_tires",
+        stress_concentration=1.6,
+        sharpness_factor=0.1,
+        description="Vertical launch over a ramp testing suspension, undercarriage and landing loads."
+    ),
+    "wind_tunnel": ObstaclePreset(
+        id="wind_tunnel",
+        name="Bernoulli Wind Tunnel",
+        contact_zone="aerodynamic_lateral",
+        stress_concentration=1.0,
+        sharpness_factor=0.0,
+        description="Steady airflow over the body to measure pressure difference, lift/downforce and drag."
+    ),
     "wind_and_thrust": ObstaclePreset(
         id="wind_and_thrust",
         name="Crosswind Shear & 6G Buckling",
@@ -233,10 +249,13 @@ class PhysicsEngine:
         speed_kmh: float = 64.0,
         wind_m_s: float = 45.0,
         obstacle: str = "concrete_wall",
-        prompt: str = ""
+        prompt: str = "",
+        wind_yaw_deg: float = 0.0,
+        wind_pitch_deg: float = 0.0
     ) -> Dict[str, Any]:
         mat_obj = cls.get_material_obj(material)
         obs_obj = cls.get_obstacle_obj(obstacle)
+        is_aero = obstacle == "wind_tunnel"   # aero-only mode: no crash test
         rho = mat_obj.density_g_cm3
         sigma_y = mat_obj.yield_mpa
         youngs_mpa = mat_obj.youngs_gpa * 1000.0
@@ -346,6 +365,69 @@ class PhysicsEngine:
         euler_critical_load_n = (math.pi ** 2 * youngs_mpa * moment_of_inertia_mm4) / max((primary_len_mm ** 2), 1.0)
         buckling_safety_factor = round(min(euler_critical_load_n / max(axial_load_6g_n, 0.1), 99.0), 2)
 
+        # --- 5. Bernoulli Aerodynamics (pressure-difference lift / downforce) ---
+        # p + 1/2 rho v^2 = const  ->  p_surface = p_inf + 1/2 rho (V^2 - v_local^2)
+        # dP = p_bottom - p_top = 1/2 rho (v_top^2 - v_bottom^2)   (+ = lift, - = downforce)
+        rho_air_b = 1.225
+        mu_air = 1.81e-5
+        sound_m_s = 340.3
+        # Worst-case relative flow: vehicle/part speed combined with crosswind gust (vector sum)
+        V_inf = max(wind_m_s if is_aero else math.hypot(v_m_s, wind_m_s), 0.1)  # wind tunnel: flow = wind speed only
+        dyn_q_pa = 0.5 * rho_air_b * V_inf ** 2
+
+        part_names = " ".join((compiled_parts or {}).keys()).lower() + " " + (prompt or "").lower()
+        has_spoiler = any(w in part_names for w in ("spoiler", "wing", "splitter", "diffuser"))
+
+        domain = domain_info["domain"]
+        if domain == "ground_vehicle":
+            # Roof/canopy accelerates flow slightly; underbody + diffuser/spoiler accelerates it more
+            k_top, k_bot = 1.05, (1.18 if has_spoiler else 1.12)
+            planform_m2 = (lx * ly) / 1e6
+            frontal_m2 = (ly * lz) / 1e6
+            cd_aero = 0.30 if has_spoiler else 0.28
+            char_len_m = lx / 1000.0
+        elif domain == "aerospace_rocket":
+            # Slender body at angle of attack from crosswind: alpha = atan(wind / axial speed)
+            alpha = math.atan2(wind_m_s, max(v_m_s, 1.0))
+            alpha = min(alpha, math.radians(15.0))
+            cl_target = 2.0 * math.pi * alpha          # thin-body lift slope
+            k_top = 1.0 + 0.5 * cl_target / 2.0
+            k_bot = 1.0 - 0.5 * cl_target / 2.0
+            planform_m2 = (lx * lz) / 1e6               # side (normal-force) area
+            frontal_m2 = (lx * ly) / 1e6
+            cd_aero = 0.45
+            char_len_m = lz / 1000.0
+        else:
+            k_top, k_bot = 1.04, 1.00
+            planform_m2 = (lx * ly) / 1e6
+            frontal_m2 = (ly * lz) / 1e6
+            cd_aero = 1.05
+            char_len_m = lx / 1000.0
+
+        v_top = k_top * V_inf
+        v_bot = k_bot * V_inf
+        p_top_pa = 0.5 * rho_air_b * (V_inf ** 2 - v_top ** 2)     # gauge pressure on upper surface
+        p_bot_pa = 0.5 * rho_air_b * (V_inf ** 2 - v_bot ** 2)     # gauge pressure on lower surface
+        delta_p_pa = p_bot_pa - p_top_pa                            # +lift / -downforce
+        side_force_n = 0.0
+        if is_aero:
+            yaw_r = math.radians(wind_yaw_deg)
+            pit_r = math.radians(wind_pitch_deg)
+            # pitch = angle of attack -> thin-body lift slope (0.3 * 2*pi per rad as a finite-body allowance)
+            delta_p_pa += dyn_q_pa * (2.0 * math.pi * 0.3 * pit_r)
+            # yaw -> side force on the lateral projected area (Cy ~ 1.0)
+            side_area_m2 = (lx * lz) / 1e6
+            side_force_n = math.copysign(0.5 * rho_air_b * (V_inf * math.sin(yaw_r)) ** 2 * side_area_m2, yaw_r)
+        lift_force_n = delta_p_pa * planform_m2
+        drag_force_n = dyn_q_pa * cd_aero * frontal_m2
+        cl = lift_force_n / max(dyn_q_pa * planform_m2, 1e-9)
+        reynolds = rho_air_b * V_inf * max(char_len_m, 1e-3) / mu_air
+        mach = V_inf / sound_m_s
+        dynamic_pressure_pa = dyn_q_pa
+        flow_velocity_m_s = V_inf
+        weight_n = mass_kg * 9.81
+        lift_to_weight = lift_force_n / max(weight_n, 1e-6)
+
         # --- 4. Role-Aware Per-Part Breakdown & Intelligent Material Recommendations ---
         part_animations: Dict[str, Dict[str, Any]] = {}
         if compiled_parts:
@@ -358,7 +440,8 @@ class PhysicsEngine:
                 part_animations[pid] = asdict(p_obj.animation)
 
                 # Estimate local part safety factor based on slenderness and material yield
-                local_stress = max(impact_stress_mpa * (0.45 if role == "transparent_glazing" else 0.8), wind_bending_stress_mpa)
+                impact_for_parts = 0.0 if is_aero else impact_stress_mpa
+                local_stress = max(impact_for_parts * (0.45 if role == "transparent_glazing" else 0.8), wind_bending_stress_mpa)
                 p_sf = round(min(p_obj.yield_mpa / max(local_stress, 1.0), 25.0), 2)
 
                 status = "optimal"
@@ -430,7 +513,10 @@ class PhysicsEngine:
         if n_solids and n_solids > 1 and not has_named_parts:
             warning = f"result has {n_solids} disconnected solids; make features overlap so they fuse into one"
 
-        overall_sf = round(min(crash_safety_factor, wind_safety_factor, buckling_safety_factor), 2)
+        if is_aero:
+            overall_sf = round(min(wind_safety_factor, buckling_safety_factor), 2)
+        else:
+            overall_sf = round(min(crash_safety_factor, wind_safety_factor, buckling_safety_factor), 2)
 
         return {
             "mass_g": mass_g,
@@ -445,11 +531,12 @@ class PhysicsEngine:
             "part_animations": part_animations,
             "edge_cases": {
                 "crash_test": {
+                    "skipped": is_aero,
                     "obstacle": obstacle,
                     "obstacle_name": obs_obj.name,
                     "impact_axis": impact_axis,
                     "failure_mode": "tire_blowout" if tire_punctured else failure_mode,
-                    "failure_description": failure_desc,
+                    "failure_description": "Aerodynamic test only (no impact simulated)" if is_aero else failure_desc,
                     "speed_kmh": speed_kmh,
                     "kinetic_energy_j": round(ke_joules, 1),
                     "mean_crush_force_kn": round(mean_crush_force_n / 1000.0, 2),
@@ -473,6 +560,27 @@ class PhysicsEngine:
                     "euler_critical_n": round(euler_critical_load_n, 1),
                     "safety_factor": buckling_safety_factor,
                     "survived": buckling_safety_factor >= 1.5
+                },
+                "bernoulli_aerodynamics": {
+                    "dynamic_pressure_pa": round(dynamic_pressure_pa, 1),
+                    "flow_velocity_m_s": round(flow_velocity_m_s, 1),
+                    "v_top_m_s": round(v_top, 1),
+                    "v_bottom_m_s": round(v_bot, 1),
+                    "p_top_pa": round(p_top_pa, 1),
+                    "p_bottom_pa": round(p_bot_pa, 1),
+                    "delta_p_pa": round(delta_p_pa, 1),
+                    "planform_area_m2": round(planform_m2, 4),
+                    "lift_force_n": round(lift_force_n, 1),
+                    "drag_force_n": round(drag_force_n, 1),
+                    "lift_coefficient": round(cl, 3),
+                    "lift_to_weight": round(lift_to_weight, 2),
+                    "reynolds": round(reynolds),
+                    "mach": round(mach, 3),
+                    "has_spoiler": has_spoiler,
+                    "downforce": lift_force_n < 0,
+                    "side_force_n": round(side_force_n, 1),
+                    "wind_yaw_deg": wind_yaw_deg,
+                    "wind_pitch_deg": wind_pitch_deg
                 }
             },
             "part_breakdown": part_reports,

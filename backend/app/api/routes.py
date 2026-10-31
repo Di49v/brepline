@@ -319,7 +319,9 @@ async def simulate_job_physics(
         speed_kmh=body.speed_kmh,
         wind_m_s=body.wind_m_s,
         obstacle=body.obstacle,
-        prompt=obj_name
+        prompt=obj_name,
+        wind_yaw_deg=body.wind_yaw_deg,
+        wind_pitch_deg=body.wind_pitch_deg,
     )
     if compiled_parts_stub:
         updated_physics["part_colors"] = {pid: d["color_hex"] for pid, d in compiled_parts_stub.items()}

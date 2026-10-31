@@ -1,11 +1,12 @@
-/* Shared 2D overlay for the 3D pop-up viewer: XYZ axis arrows + a scale bar in mm.
-   Call it at the end of every frame, after the model is drawn.
-     x        2D canvas context
-     W, H     canvas size in device pixels
-     r        devicePixelRatio
-     pxPerMm  screen pixels per model millimetre (at the model centre)
-     rot      (X, Y, Z) => [sx, sy, depth]   the viewer's current rotation
-     color    text/line colour (theme aware)  */
+/* Shared 2D overlay for the 3D pop-up viewer: XYZ axis arrows, scale bar in mm, 
+   and real-time aerodynamics data. Call it at the end of every frame.
+     x           2D canvas context
+     W, H        canvas size in device pixels
+     r           devicePixelRatio
+     pxPerMm     screen pixels per model millimetre (at the model centre)
+     rot         (X, Y, Z) => [sx, sy, depth]   the viewer's current rotation
+     color       text/line colour (theme aware)
+     edge_cases  Physics simulation edge cases (contains Bernoulli data) */
 
 const AXES = [
   { l: 'X', v: [1, 0, 0], c: '#e5484d' },
@@ -21,7 +22,7 @@ const niceMm = t => {
 }
 const label = mm => (mm >= 1000 ? Number((mm / 1000).toPrecision(3)) + ' m' : Number(mm.toPrecision(3)) + ' mm')
 
-export function drawOverlay(x, { W, H, r, pxPerMm, rot, color = '#888' }) {
+export function drawOverlay(x, { W, H, r, pxPerMm, rot, color = '#888', edge_cases = null }) {
   x.save()
   x.lineCap = 'round'
   x.lineJoin = 'round'
@@ -84,5 +85,39 @@ export function drawOverlay(x, { W, H, r, pxPerMm, rot, color = '#888' }) {
     x.fillStyle = color
     x.fillText(label(mm), (x0 + x1) / 2, y - 12 * r)
   }
+
+  /* Bernoulli Aerodynamics Overlay, top-right */
+  if (edge_cases && edge_cases.bernoulli_aerodynamics) {
+    const ba = edge_cases.bernoulli_aerodynamics
+    x.textAlign = 'right'
+    x.textBaseline = 'top'
+    
+    const padX = 22 * r
+    const startY = 22 * r
+    const lineHeight = 16 * r
+    let curY = startY
+
+    // Header
+    x.font = `bold ${12 * r}px Inter, system-ui, sans-serif`
+    x.fillStyle = '#3e7bff' // Highlight color for header
+    x.fillText('Aerodynamics Lab', W - padX, curY)
+    curY += lineHeight * 1.2
+
+    // Metrics
+    x.font = `500 ${11 * r}px Inter, system-ui, sans-serif`
+    x.fillStyle = color
+    x.fillText(`Flow Velocity: ${ba.flow_velocity_m_s} m/s`, W - padX, curY)
+    curY += lineHeight
+    x.fillText(`Dynamic Pressure: ${ba.dynamic_pressure_pa} Pa`, W - padX, curY)
+    curY += lineHeight
+    x.fillText(`Lift Coefficient: ${ba.lift_coefficient}`, W - padX, curY)
+    curY += lineHeight
+    
+    // Highlighted Force
+    x.font = `bold ${11 * r}px Inter, system-ui, sans-serif`
+    x.fillStyle = ba.lift_force_n < 0 ? '#e5484d' : '#30a46c' // Red for downforce, green for lift
+    x.fillText(`${ba.lift_force_n < 0 ? 'Downforce' : 'Lift Force'}: ${Math.abs(ba.lift_force_n)} N`, W - padX, curY)
+  }
+
   x.restore()
 }

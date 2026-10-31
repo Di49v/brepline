@@ -1,6 +1,6 @@
 // src/MeshViewer.jsx
 // Dependency-free software renderer + Multi-Color Sub-Parts + Real-Time 60 FPS Crash/Stress Lab + CAD overlays for the real mesh.
-//   <MeshViewer mesh wire auto resetKey grid axes dims measure clearKey onMeasure />   interactive viewer
+//   <MeshViewer mesh wire auto resetKey grid axes dims measure clearKey onMeasure edgeCases />   interactive viewer
 //   <Thumb mesh />                                                                      static preview image
 // CAD coordinates are Z-up, millimetres. mesh = { verts:[x,y,z,...], tris:[i,j,k,...] }.
 import { useEffect, useRef, useState } from 'react'
@@ -1022,7 +1022,7 @@ const clamp = (v, a, b) => Math.max(a, Math.min(b, v))
 export default function MeshViewer({
   mesh, wire = false, auto = true, resetKey = 0,
   grid = false, axes = false, dims = false, measure = false, clearKey = 0, onMeasure,
-  partColors = null, simState = null
+  partColors = null, simState = null, edgeCases = null
 }) {
   const cv = useRef(null)
   const S = useRef({
@@ -1030,7 +1030,7 @@ export default function MeshViewer({
     animRunId: 0, animT0: 0, animProg: 0, animDuration: 1400
   })
   const opt = useRef({})
-  opt.current = { wire, auto, grid, axes, dims, measure, partColors, simState }
+  opt.current = { wire, auto, grid, axes, dims, measure, partColors, simState, edgeCases }
   const cb = useRef(onMeasure)
   cb.current = onMeasure
   const dark = useDark()
@@ -1113,7 +1113,17 @@ export default function MeshViewer({
         })
         const V = mesh.verts
         const hv = s.hover >= 0 ? [V[s.hover * 3], V[s.hover * 3 + 1], V[s.hover * 3 + 2]] : null
-        drawOverlay(ctx, w, h, mesh, view, { dark: dk, acc, grid: o.grid, axes: o.axes, dims: o.dims, measure: o.measure, hover: hv, pts: s.pts })
+        drawOverlay(ctx, w, h, mesh, view, { 
+          dark: dk, 
+          acc, 
+          grid: o.grid, 
+          axes: o.axes, 
+          dims: o.dims, 
+          measure: o.measure, 
+          hover: hv, 
+          pts: s.pts,
+          edge_cases: o.edgeCases
+        })
       }
       raf = requestAnimationFrame(loop)
     }

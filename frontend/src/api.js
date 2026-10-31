@@ -97,11 +97,22 @@ export async function buildShape({ spec, name = "", material = "Al 6061", parent
  * Interactive Physics & Crash Lab API: recalculates crash crumple depth, peak G,
  * crosswind bending stress, and per-part material savings in <10ms.
  */
-export async function simulatePhysics(job, { material = "Al 6061", speed_kmh = 64, wind_m_s = 45, obstacle = "concrete_wall", part_materials = null }) {
+export async function simulatePhysics(job, {
+  material = "Al 6061",
+  speed_kmh = 64,
+  wind_m_s = 45,
+  obstacle = "concrete_wall",
+  part_materials = null,
+  wind_yaw_deg = 0,
+  wind_pitch_deg = 0,
+}) {
   return j(await fetch(`${BASE}/api/jobs/${job}/simulate`, {
     method: "POST",
     headers: H,
-    body: JSON.stringify({ material, speed_kmh, wind_m_s, obstacle, part_materials }),
+    body: JSON.stringify({
+      material, speed_kmh, wind_m_s, obstacle, part_materials,
+      wind_yaw_deg, wind_pitch_deg,
+    }),
   }));
 }
 

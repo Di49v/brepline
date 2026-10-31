@@ -1,4 +1,5 @@
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Component, Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import * as THREE from 'three'
 import MeshViewer, { Thumb, meshStats, fm } from './MeshViewer.jsx'
 import { generate, vote as sendVote, fileUrl, health, cancelJob, simulatePhysics, fetchHistory } from './api.js'
 import ShapeEditor from './ShapeEditor.jsx'
@@ -18,7 +19,7 @@ const SUB = [
   ['data', 'Data controls'],
   ['account', 'Account']
 ]
-const ACCENTS = ['#f26a1b', '#e0a100', '#2f7de1', '#2fb67c']
+const ACCENTS = ['#38bdf8', '#3b82f6', '#10b981', '#f59e0b']
 const CHIPS = [
   ['SPORTS CAR', 'Build a GT sports car with a sculpted aerodynamic body shell, translucent glass windshield canopy, 4 rubber wheels with alloy rims, and a rear spoiler'],
   ['ROCKET', 'Build a multi-stage sounding rocket with nose cone, fuselage, boat-tail nozzle, and 4 swept fins'],
@@ -27,7 +28,6 @@ const CHIPS = [
   ['ENCLOSURE', 'Electronics enclosure 80 x 50 x 30 mm, 2 mm walls, open top, USB cutout on one side'],
   ['FLANGE', 'Pipe flange 100 mm diameter, 10 mm thick, 40 mm bore, 4 bolt holes of 6 mm on a 70 mm circle']
 ]
-// names must match the backend MATERIAL_LIBRARY table
 const MATS = ['Al 6061', 'Steel', 'Titanium', 'Carbon Fiber', 'Brass', 'Copper', 'Glass', 'Rubber', 'PLA', 'ABS']
 const FMTS = ['STEP', 'STL']
 const P = {
@@ -47,7 +47,6 @@ const P = {
 /* ---------- helpers ---------- */
 const fname = t => String(t || 'part').split(' ').slice(0, 3).join('_').toLowerCase().replace(/[^a-z0-9_]/g, '') || 'part'
 
-// real download from the backend: ext = step | stl | py
 function dl(job, ext) {
   const a = document.createElement('a')
   a.href = fileUrl(job, String(ext).toLowerCase())
@@ -61,7 +60,6 @@ function dl(job, ext) {
 const fmtMass = g => (g >= 1000 ? (g / 1000).toFixed(2) + ' kg' : Number(g || 0).toFixed(1) + ' g')
 const fmtSize = b => (Array.isArray(b) ? b : [0, 0, 0]).map(x => Math.round(Number(x || 0) * 10) / 10).join(' × ') + ' mm'
 
-// turn a backend result into one "version" of a chat answer
 function toVersion(r, prompt, f, m) {
   const safePrompt = String(prompt || 'CAD Design')
   return {
@@ -83,15 +81,13 @@ function toVersion(r, prompt, f, m) {
     counts: r.counts || null,
     bmin: r.bbox_min || null,
     density: r.density_g_cm3 || null,
-    shape: (r.plan && r.plan.profile_spec) || null, // polygon / revolve designs can be re-opened in the shape editor
+    shape: (r.plan && r.plan.profile_spec) || null,
     checkNote: r.check_detail || '',
     physics: r.physics || null,
   }
 }
-const plain = v =>
-  `Generated ${v.title} in ${v.m}. Size ${fmtSize(v.bbox)}, mass ${fmtMass(v.mass_g)}, ${v.verified ? 'verified' : 'needs checking'}.`
+const plain = v => `Generated ${v.title} in ${v.m}. Size ${fmtSize(v.bbox)}, mass ${fmtMass(v.mass_g)}, ${v.verified ? 'verified' : 'needs checking'}.`
 
-// readable error text for the chat
 const friendly = m => {
   const s = String(m || '')
   if (/failed to fetch|networkerror|load failed/i.test(s)) return "Can't reach the Brepline server. Make sure the backend is running."
@@ -108,7 +104,7 @@ const writeLS = (k, v) => { try { localStorage.setItem(k, v) } catch { /* ignore
 const Ic = ({ n }) => <svg className="i"><use href={`#${n}`} /></svg>
 const PI = ({ k }) => <svg className="i" viewBox="0 0 24 24"><path d={P[k]} /></svg>
 const PartIcon = () => <svg viewBox="0 0 100 100"><use href="#part" /></svg>
-/* ---------- thinking trace: shows the engine's real log lines + live sub-part preview ---------- */
+
 const STAGE_TITLE = ['Planning the design', 'Decomposing & querying cache', 'Building sub-components', 'Assembling & auditing physics']
 
 function stageOf(logs) {
@@ -132,7 +128,6 @@ function useElapsed(active, t0) {
   return sec
 }
 
-// state: 'busy' (live) | 'done' | 'stopped' | 'error'. Finished runs collapse to "Thought for 23s".
 function Thinking({ state, logs, t0, secs, onStop, partialMesh }) {
   const busy = state === 'busy'
   const [open, setOpen] = useState(busy)
@@ -171,8 +166,8 @@ function Thinking({ state, logs, t0, secs, onStop, partialMesh }) {
         </ol>
       )}
       {busy && open && partialMesh && partialMesh.verts && partialMesh.verts.length > 0 && (
-        <div style={{ marginTop: 10, borderRadius: 8, overflow: 'hidden', border: '1px solid var(--edge, #333)', maxWidth: 320, background: 'rgba(0,0,0,0.18)' }}>
-          <div style={{ fontSize: 11, padding: '5px 10px', opacity: 0.9, borderBottom: '1px solid var(--edge, #333)' }}>
+        <div style={{ marginTop: 10, borderRadius: 8, overflow: 'hidden', border: '1px solid var(--line)', maxWidth: 320, background: 'rgba(0,0,0,0.18)' }}>
+          <div style={{ fontSize: 11, padding: '5px 10px', opacity: 0.9, borderBottom: '1px solid var(--line)' }}>
             ✓ {verifiedLine}
           </div>
           <div style={{ width: '100%', height: 180, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
@@ -185,7 +180,6 @@ function Thinking({ state, logs, t0, secs, onStop, partialMesh }) {
   )
 }
 
-/* sidebar: visible whenever something is generating, with a Stop button */
 function SidebarGen({ items, onStop, onOpen }) {
   const it = items[0]
   const sec = useElapsed(!!it, it && it.t0)
@@ -201,7 +195,6 @@ function SidebarGen({ items, onStop, onOpen }) {
   )
 }
 
-/* "model ready" / "failed" notifications */
 function Toasts({ list, onClose, onOpen }) {
   if (!list.length) return null
   return (
@@ -216,7 +209,6 @@ function Toasts({ list, onClose, onOpen }) {
   )
 }
 
-/* custom confirmation dialog (replaces window.confirm) */
 function Confirm({ cf, onClose }) {
   useEffect(() => {
     if (!cf) return
@@ -443,7 +435,720 @@ function InfoPanel({ v, mesh, pts, measureOn }) {
   )
 }
 
-// full-screen 3D view + Interactive 60 FPS Physics & Crash Lab
+/* Wind tunnel view: ideal (potential) flow around the real side silhouette of the mesh.
+   Solves laplace(psi)=0 on a grid with the body as a streamline, then advects particles through
+   (u, v) = (dpsi/dy, -dpsi/dx). Bernoulli: faster flow -> lower pressure, Cp = 1 - |v|^2 / U^2.
+   Visualisation only (no wake / turbulence), not CFD. */
+function WindOverlay({ mesh, partColors, aero, wind, flip, pitch }) {
+  const wrapRef = useRef(null)
+  const ref = useRef(null)
+  const live = useRef({ wind, aero })
+  useEffect(() => { live.current = { wind, aero } }, [wind, aero])
+  const colKey = JSON.stringify(partColors || {})
+
+  useEffect(() => {
+    const cv = ref.current
+    const wrap = wrapRef.current
+    if (!cv || !wrap || !mesh || !mesh.verts || !mesh.tris) return
+    const ctx = cv.getContext('2d')
+    const dpr = Math.min(window.devicePixelRatio || 1, 2)
+    const rtl = !flip                         // default: air travels from the nose (+X, screen right) to the tail
+    const cols = JSON.parse(colKey)
+    const V0 = mesh.verts, T = mesh.tris, TP = mesh.tri_part, PN = mesh.parts || []
+    const pr = ((pitch || 0) * Math.PI) / 180
+    let V = V0
+    if (pr) {                                 // pitch: nose up = +, rotate about the bbox centre (side view)
+      let ax = Infinity, bx2 = -Infinity, az = Infinity, bz2 = -Infinity
+      for (let i = 0; i < V0.length; i += 3) {
+        ax = Math.min(ax, V0[i]); bx2 = Math.max(bx2, V0[i])
+        az = Math.min(az, V0[i + 2]); bz2 = Math.max(bz2, V0[i + 2])
+      }
+      const cxm = (ax + bx2) / 2, czm = (az + bz2) / 2, cs = Math.cos(pr), sn = Math.sin(pr)
+      V = new Float32Array(V0.length)
+      for (let i = 0; i < V0.length; i += 3) {
+        const x = V0[i] - cxm, z = V0[i + 2] - czm
+        V[i] = cxm + x * cs - z * sn; V[i + 1] = V0[i + 1]; V[i + 2] = czm + x * sn + z * cs
+      }
+    }
+    const nT = Math.floor(T.length / 3)
+    let xmin = Infinity, xmax = -Infinity, zmin = Infinity, zmax = -Infinity
+    for (let i = 0; i < V.length; i += 3) {
+      if (V[i] < xmin) xmin = V[i]
+      if (V[i] > xmax) xmax = V[i]
+      if (V[i + 2] < zmin) zmin = V[i + 2]
+      if (V[i + 2] > zmax) zmax = V[i + 2]
+    }
+    if (!isFinite(xmin)) return
+    const isWheel = PN.map(n => /wheel|tire|tyre/i.test(String(n)))
+    const rgb = h => {
+      const m = /^#?([0-9a-f]{6})$/i.exec(String(h || ''))
+      const n = m ? parseInt(m[1], 16) : 0x94a3b8
+      return [(n >> 16) & 255, (n >> 8) & 255, n & 255]
+    }
+
+    let W = 0, H = 0, sc = null, raf = 0, last = performance.now()
+
+    const build = () => {
+      const host = cv.closest('.mvw')
+      const pnl = host ? host.querySelector('.ip') : null
+      const pw = pnl ? Math.round(pnl.getBoundingClientRect().width) : 0
+      if (wrap.style.right !== pw + 'px') wrap.style.right = pw + 'px'
+      const r = cv.getBoundingClientRect()
+      W = r.width; H = r.height
+      if (W < 80 || H < 80) { sc = null; return }
+      cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr)
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+
+      const groundY = H * 0.8
+      const bx = xmax - xmin || 1, bz = zmax - zmin || 1
+      const s = Math.min((W * 0.5) / bx, (groundY * 0.5) / bz)
+      const ox = (W - bx * s) / 2 - xmin * s
+      const sx = X => ox + X * s
+      const sy = Z => groundY - (Z - zmin) * s
+      const mx = xs => (rtl ? W - xs : xs)    // screen <-> canonical (flow always left->right), self-inverse
+
+      // 1) pre-render the car (side view, painter's order by depth)
+      const oc = document.createElement('canvas')
+      oc.width = cv.width; oc.height = cv.height
+      const o = oc.getContext('2d')
+      o.setTransform(dpr, 0, 0, dpr, 0, 0)
+      const dep = new Float32Array(nT)
+      for (let t = 0; t < nT; t++) dep[t] = V[T[3 * t] * 3 + 1] + V[T[3 * t + 1] * 3 + 1] + V[T[3 * t + 2] * 3 + 1]
+      const order = Array.from({ length: nT }, (_, t) => t).sort((p, q) => dep[q] - dep[p])
+      const stroke = nT < 60000
+      o.lineWidth = 0.7
+      o.lineJoin = 'round'
+      for (const t of order) {
+        const a = T[3 * t] * 3, b = T[3 * t + 1] * 3, c = T[3 * t + 2] * 3
+        const ux = V[b] - V[a], uy = V[b + 1] - V[a + 1], uz = V[b + 2] - V[a + 2]
+        const wx = V[c] - V[a], wy = V[c + 1] - V[a + 1], wz = V[c + 2] - V[a + 2]
+        const nx = uy * wz - uz * wy, ny = uz * wx - ux * wz, nz = ux * wy - uy * wx
+        const nl = Math.hypot(nx, ny, nz) || 1
+        const sh = 0.5 + 0.5 * Math.abs((nx * 0.3 - ny * 0.45 + nz * 0.8) / nl)
+        const [r0, g0, b0] = rgb(cols[TP ? PN[TP[t]] : null])
+        const col = 'rgb(' + ((r0 * sh) | 0) + ',' + ((g0 * sh) | 0) + ',' + ((b0 * sh) | 0) + ')'
+        o.fillStyle = col
+        o.strokeStyle = col
+        o.beginPath()
+        o.moveTo(sx(V[a]), sy(V[a + 2]))
+        o.lineTo(sx(V[b]), sy(V[b + 2]))
+        o.lineTo(sx(V[c]), sy(V[c + 2]))
+        o.closePath()
+        o.fill()
+        if (stroke) o.stroke()
+      }
+
+      // 2) rasterise the body outline (wheels excluded so air can pass underneath)
+      const GX = 150
+      const GY = Math.max(36, Math.min(110, Math.round((GX * groundY) / W)))
+      const cw = W / GX, ch = groundY / GY
+      const mask = new Uint8Array(GX * GY)
+      const gxOf = X => mx(sx(X)) / cw
+      const gyOf = Z => ((Z - zmin) * s) / ch
+      for (let t = 0; t < nT; t++) {
+        if (TP && isWheel[TP[t]]) continue
+        const a = T[3 * t] * 3, b = T[3 * t + 1] * 3, c = T[3 * t + 2] * 3
+        const x0 = gxOf(V[a]), y0 = gyOf(V[a + 2])
+        const x1 = gxOf(V[b]), y1 = gyOf(V[b + 2])
+        const x2 = gxOf(V[c]), y2 = gyOf(V[c + 2])
+        const den = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2)
+        if (Math.abs(den) < 1e-9) continue
+        const i0 = Math.max(0, Math.floor(Math.min(x0, x1, x2))), i1 = Math.min(GX - 1, Math.ceil(Math.max(x0, x1, x2)))
+        const j0 = Math.max(0, Math.floor(Math.min(y0, y1, y2))), j1 = Math.min(GY - 1, Math.ceil(Math.max(y0, y1, y2)))
+        for (let j = j0; j <= j1; j++) {
+          for (let i = i0; i <= i1; i++) {
+            const px = i + 0.5, py = j + 0.5
+            const l1 = ((y1 - y2) * (px - x2) + (x2 - x1) * (py - y2)) / den
+            const l2 = ((y2 - y0) * (px - x2) + (x0 - x2) * (py - y2)) / den
+            const l3 = 1 - l1 - l2
+            if (l1 >= -0.02 && l2 >= -0.02 && l3 >= -0.02) mask[j * GX + i] = 1
+          }
+        }
+      }
+      // keep a minimum ground clearance, then close pin-holes column by column
+      const minJ = Math.ceil((0.06 * bz * s) / ch)
+      for (let i = 0; i < GX; i++) for (let j = 0; j < minJ && j < GY; j++) mask[j * GX + i] = 0
+      let gapSum = 0, gapN = 0
+      for (let i = 0; i < GX; i++) {
+        let lo = -1, hi = -1
+        for (let j = 0; j < GY; j++) if (mask[j * GX + i]) { if (lo < 0) lo = j; hi = j }
+        if (lo >= 0) {
+          for (let j = lo; j <= hi; j++) mask[j * GX + i] = 1
+          gapSum += lo; gapN++
+        }
+      }
+      const gapJ = gapN ? Math.max(gapSum / gapN, minJ) : 0
+
+      // 3) stream function: ground psi=0, top psi=GY-1, inflow/outflow psi=j, body psi=psiB
+      const psi = new Float32Array(GX * GY)
+      const fixed = new Uint8Array(GX * GY)
+      const psiB = 1.12 * gapJ              // air under the body runs ~12% faster than free stream
+      for (let j = 0; j < GY; j++) {
+        for (let i = 0; i < GX; i++) {
+          const k = j * GX + i
+          if (j === 0) { psi[k] = 0; fixed[k] = 1 }
+          else if (j === GY - 1) { psi[k] = GY - 1; fixed[k] = 1 }
+          else if (i === 0 || i === GX - 1) { psi[k] = j; fixed[k] = 1 }
+          else if (mask[k]) { psi[k] = psiB; fixed[k] = 1 }
+          else psi[k] = j
+        }
+      }
+      for (let it = 0; it < 450; it++) {
+        for (let j = 1; j < GY - 1; j++) {
+          for (let i = 1; i < GX - 1; i++) {
+            const k = j * GX + i
+            if (fixed[k]) continue
+            psi[k] += 1.9 * (0.25 * (psi[k - 1] + psi[k + 1] + psi[k - GX] + psi[k + GX]) - psi[k])
+          }
+        }
+      }
+      const U = new Float32Array(GX * GY), Vv = new Float32Array(GX * GY)
+      for (let j = 1; j < GY - 1; j++) {
+        for (let i = 1; i < GX - 1; i++) {
+          const k = j * GX + i
+          if (mask[k]) continue
+          let u = (psi[k + GX] - psi[k - GX]) / 2
+          let v = -(psi[k + 1] - psi[k - 1]) / 2
+          const m = Math.hypot(u, v)
+          if (m > 3) { u *= 3 / m; v *= 3 / m }
+          U[k] = u; Vv[k] = v
+        }
+      }
+      for (let i = 0; i < GX; i++) { U[i] = U[GX + i]; Vv[i] = Vv[GX + i]; U[(GY - 1) * GX + i] = U[(GY - 2) * GX + i]; Vv[(GY - 1) * GX + i] = Vv[(GY - 2) * GX + i] }
+      for (let j = 0; j < GY; j++) { U[j * GX] = U[j * GX + 1]; Vv[j * GX] = Vv[j * GX + 1]; U[j * GX + GX - 1] = U[j * GX + GX - 2]; Vv[j * GX + GX - 1] = Vv[j * GX + GX - 2] }
+
+      // 4) particles
+      const spawn = (p, anywhere) => {
+        for (let n = 0; n < 8; n++) {
+          p.gx = anywhere ? Math.random() * GX : 0.6
+          p.gy = 0.8 + Math.random() * (GY - 2.2)
+          if (!mask[Math.floor(p.gy) * GX + Math.floor(p.gx)]) break
+        }
+        p.tr = []
+        p.cp = 0
+      }
+      const parts = Array.from({ length: 240 }, () => { const p = {}; spawn(p, true); return p })
+      sc = { groundY, GX, GY, cw, ch, mask, U, Vv, oc, parts, spawn, topY: sy(zmax), cxs: sx((xmin + xmax) / 2) }
+    }
+
+    const frame = now => {
+      raf = requestAnimationFrame(frame)
+      const dt = Math.min((now - last) / 1000, 0.05)
+      last = now
+      if (!sc) return
+      const { groundY, GX, GY, cw, ch, mask, U, Vv, oc, parts, spawn } = sc
+      const wnd = live.current.wind || 0
+      const a = live.current.aero || {}
+      const Upx = Math.min(Math.max(wnd * 5, 0), 700)      // wind speed -> on-screen speed
+      const kAll = (Upx / cw) * dt
+      const steps = Math.max(1, Math.ceil(kAll * 1.5))
+      const kk = kAll / steps
+
+      for (const p of parts) {
+        for (let n = 0; n < steps; n++) {
+          const fx = Math.min(Math.max(p.gx - 0.5, 0), GX - 1.001)
+          const fy = Math.min(Math.max(p.gy - 0.5, 0), GY - 1.001)
+          const i = Math.floor(fx), j = Math.floor(fy), tx = fx - i, ty = fy - j, k = j * GX + i
+          const u = (U[k] * (1 - tx) + U[k + 1] * tx) * (1 - ty) + (U[k + GX] * (1 - tx) + U[k + GX + 1] * tx) * ty
+          const v = (Vv[k] * (1 - tx) + Vv[k + 1] * tx) * (1 - ty) + (Vv[k + GX] * (1 - tx) + Vv[k + GX + 1] * tx) * ty
+          p.cp = 1 - (u * u + v * v)
+          p.gx += u * kk
+          p.gy += v * kk
+        }
+        if (p.gx >= GX - 0.6 || p.gx < 0 || p.gy < 0.3 || p.gy > GY - 0.3 || mask[Math.floor(p.gy) * GX + Math.floor(p.gx)]) {
+          spawn(p, false)
+        } else if (kAll > 0) {
+          p.tr.push([p.gx, p.gy])
+          if (p.tr.length > 10) p.tr.shift()
+        }
+      }
+
+      ctx.fillStyle = '#0b0e13'
+      ctx.fillRect(0, 0, W, H)
+      ctx.fillStyle = '#11161d'
+      ctx.fillRect(0, groundY, W, H - groundY)
+      ctx.strokeStyle = '#475569'
+      ctx.lineWidth = 1.5
+      ctx.beginPath(); ctx.moveTo(0, groundY); ctx.lineTo(W, groundY); ctx.stroke()
+
+      const PX = g => (rtl ? W - g[0] * cw : g[0] * cw)
+      const PY = g => groundY - g[1] * ch
+      ctx.lineCap = 'round'
+      ctx.lineWidth = 1.7
+      for (const p of parts) {
+        const L = p.tr.length
+        if (L < 2) continue
+        const hue = p.cp < 0 ? 200 : 28
+        const base = 0.3 + Math.min(Math.abs(p.cp) * 1.1, 0.6)
+        for (let c = 0; c < 3; c++) {
+          const s0 = Math.floor(((L - 1) * c) / 3)
+          const s1 = Math.min(L - 1, Math.floor(((L - 1) * (c + 1)) / 3) + 1)
+          ctx.strokeStyle = 'hsla(' + hue + ',90%,62%,' + (base * (0.3 + 0.35 * c)).toFixed(3) + ')'
+          ctx.beginPath()
+          ctx.moveTo(PX(p.tr[s0]), PY(p.tr[s0]))
+          for (let q = s0 + 1; q <= s1; q++) ctx.lineTo(PX(p.tr[q]), PY(p.tr[q]))
+          ctx.stroke()
+        }
+      }
+
+      ctx.drawImage(oc, 0, 0, W, H)
+
+      // lift / downforce arrow above the body
+      if (a.lift_force_n !== undefined) {
+        const F = a.lift_force_n
+        const down = F < 0
+        const len = Math.min(90, 28 + Math.log10(1 + Math.abs(F)) * 20)
+        const x = sc.cxs
+        const yTip = down ? sc.topY - 14 : sc.topY - 14 - len
+        const yTail = down ? sc.topY - 14 - len : sc.topY - 14
+        const col = down ? '#10b981' : '#f59e0b'
+        const hd = down ? 1 : -1
+        ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = 3
+        ctx.beginPath(); ctx.moveTo(x, yTail); ctx.lineTo(x, yTip - hd * 4); ctx.stroke()
+        ctx.beginPath(); ctx.moveTo(x, yTip); ctx.lineTo(x - 7, yTip - hd * 11); ctx.lineTo(x + 7, yTip - hd * 11); ctx.closePath(); ctx.fill()
+        ctx.font = '600 12px system-ui, sans-serif'
+        ctx.textAlign = 'left'
+        ctx.fillText((down ? 'Downforce ' : 'Lift ') + Math.abs(F).toFixed(0) + ' N', x + 12, (yTail + yTip) / 2 + 4)
+      }
+
+      // HUD below the ground line
+      ctx.textAlign = 'left'
+      ctx.font = '600 12px system-ui, sans-serif'
+      ctx.fillStyle = 'rgba(226,232,240,0.95)'
+      ctx.fillText('Wind ' + wnd.toFixed(0) + ' m/s (' + (wnd * 3.6).toFixed(0) + ' km/h)' + (a.dynamic_pressure_pa ? ' · q ' + a.dynamic_pressure_pa + ' Pa' : ''), 14, groundY + 26)
+      ctx.font = '11px system-ui, sans-serif'
+      ctx.fillStyle = 'hsl(200,90%,62%)'; ctx.fillText('● fast flow = low pressure (suction)', 14, groundY + 46)
+      ctx.fillStyle = 'hsl(28,90%,62%)'; ctx.fillText('● slow flow = high pressure', 14, groundY + 62)
+      ctx.fillStyle = 'rgba(148,163,184,0.8)'
+      ctx.fillText('Ideal-flow view of the real outline (no wake). Panel numbers are the Bernoulli estimate.', 14, H - 10)
+    }
+
+    build()
+    const ro = new ResizeObserver(build)
+    ro.observe(cv)
+    raf = requestAnimationFrame(frame)
+    return () => { cancelAnimationFrame(raf); ro.disconnect() }
+  }, [mesh, flip, colKey, pitch])
+
+  return (
+    <div ref={wrapRef} style={{ position: 'absolute', top: 0, left: 0, bottom: 0, right: 0, zIndex: 1, pointerEvents: 'none' }}>
+      <canvas ref={ref} style={{ width: '100%', height: '100%', display: 'block' }} />
+    </div>
+  )
+}
+
+/* Keeps a failure in the flow view from blanking the whole app */
+class FlowBoundary extends Component {
+  constructor(props) { super(props); this.state = { err: null } }
+  static getDerivedStateFromError(err) { return { err } }
+  componentDidCatch(err) { console.error('Flow view failed:', err) }
+  render() {
+    if (this.state.err) {
+      return (
+        <div style={{ position: 'absolute', top: 70, left: 14, right: 344, zIndex: 1, padding: 12, borderRadius: 8, background: 'rgba(127,29,29,0.85)', color: '#fecaca', fontSize: 12 }}>
+          <b>Flow view failed:</b> {String((this.state.err && this.state.err.message) || this.state.err)}
+          <div style={{ opacity: 0.8, marginTop: 4 }}>Toggle “3D flow” or “Airflow” in the toolbar. Details are in the browser console.</div>
+        </div>
+      )
+    }
+    return this.props.children
+  }
+}
+
+/* True 3D wind tunnel: voxel potential flow (laplace(phi)=0, body = no-penetration) around the real mesh.
+   Wind yaw / pitch are applied by turning the model on a "turntable", like a real tunnel.
+   Ideal flow, no wake or turbulence: a visualisation, not CFD. */
+function WindTunnel3D({ mesh, partColors, aero, wind, yaw, pitch }) {
+  const wrapRef = useRef(null)
+  const hudRef = useRef(null)
+  const cam = useRef({ az: -0.85, el: 0.42, r: 70 })
+  const live = useRef({ wind, aero })
+  useEffect(() => { live.current = { wind, aero } }, [wind, aero])
+  const colKey = JSON.stringify(partColors || {})
+
+  useEffect(() => {
+    const wrap = wrapRef.current, hud = hudRef.current
+    if (!wrap || !mesh || !mesh.verts || !mesh.tris) return
+    const host = wrap.closest('.mvw')
+    const pnl = host ? host.querySelector('.ip') : null
+    wrap.style.right = (pnl ? Math.round(pnl.getBoundingClientRect().width) : 0) + 'px'
+
+    const V0 = mesh.verts, T = mesh.tris, TP = mesh.tri_part, PN = mesh.parts || []
+    const nT = Math.floor(T.length / 3), nV = Math.floor(V0.length / 3)
+    const cols = JSON.parse(colKey)
+    const hexRgb = h => {
+      const m = /^#?([0-9a-f]{6})$/i.exec(String(h || ''))
+      const n = m ? parseInt(m[1], 16) : 0x94a3b8
+      return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255]
+    }
+
+    // ---- 1) turntable: nose into the wind, then yaw (about Z) and pitch (nose up = +)
+    let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity, z0 = Infinity, z1 = -Infinity
+    for (let i = 0; i < nV; i++) {
+      const x = V0[3 * i], y = V0[3 * i + 1], z = V0[3 * i + 2]
+      if (x < x0) x0 = x; if (x > x1) x1 = x
+      if (y < y0) y0 = y; if (y > y1) y1 = y
+      if (z < z0) z0 = z; if (z > z1) z1 = z
+    }
+    if (!isFinite(x0)) return
+    const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2, cz = (z0 + z1) / 2
+    const yw = (yaw * Math.PI) / 180, pt = (pitch * Math.PI) / 180
+    const cyw = Math.cos(yw), syw = Math.sin(yw), cpt = Math.cos(pt), spt = Math.sin(pt)
+    const tv = new Float32Array(nV * 3)
+    let bx0 = Infinity, bx1 = -Infinity, by0 = Infinity, by1 = -Infinity, bz0 = Infinity, bz1 = -Infinity
+    for (let i = 0; i < nV; i++) {
+      let x = -(V0[3 * i] - cx), y = -(V0[3 * i + 1] - cy)
+      const z = V0[3 * i + 2] - cz
+      const xa = x * cyw - y * syw, ya = x * syw + y * cyw
+      const xb = xa * cpt + z * spt, zb = -xa * spt + z * cpt
+      tv[3 * i] = xb; tv[3 * i + 1] = ya; tv[3 * i + 2] = zb
+      if (xb < bx0) bx0 = xb; if (xb > bx1) bx1 = xb
+      if (ya < by0) by0 = ya; if (ya > by1) by1 = ya
+      if (zb < bz0) bz0 = zb; if (zb > bz1) bz1 = zb
+    }
+
+    // ---- 2) grid (cell units): flow runs along +x
+    const NX = 96, NY = 44, NZ = 36, NXY = NX * NY, N = NXY * NZ
+    const h = Math.max((bx1 - bx0) / 38, (by1 - by0) / 20, (bz1 - bz0) / 14, 1e-6)
+    const gv = new Float32Array(nV * 3)
+    for (let i = 0; i < nV; i++) {
+      gv[3 * i] = (tv[3 * i] - bx0) / h + 22
+      gv[3 * i + 1] = (tv[3 * i + 1] - (by0 + by1) / 2) / h + NY / 2
+      gv[3 * i + 2] = (tv[3 * i + 2] - bz0) / h + 1
+    }
+    const cmin = [22, NY / 2 - (by1 - by0) / h / 2, 1]
+    const cmax = [22 + (bx1 - bx0) / h, NY / 2 + (by1 - by0) / h / 2, 1 + (bz1 - bz0) / h]
+
+    // ---- 3) three.js scene
+    const cv = document.createElement('canvas')
+    cv.style.cssText = 'width:100%;height:100%;display:block'
+    wrap.insertBefore(cv, wrap.firstChild)
+    let renderer
+    try {
+      renderer = new THREE.WebGLRenderer({ canvas: cv, antialias: true })
+    } catch (err) {
+      cv.remove()
+      if (hud) hud.textContent = '3D view needs WebGL: ' + (err && err.message)
+      return
+    }
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2))
+    const scene = new THREE.Scene()
+    scene.background = new THREE.Color(0x0b0e13)
+    const camera = new THREE.PerspectiveCamera(40, 1, 0.5, 700)
+    camera.up.set(0, 0, 1)
+    scene.add(new THREE.AmbientLight(0xffffff, 0.8))
+    const dl = new THREE.DirectionalLight(0xffffff, 1.1)
+    dl.position.set(30, -50, 80)
+    scene.add(dl)
+
+    const pos = new Float32Array(nT * 9), colr = new Float32Array(nT * 9)
+    for (let t = 0; t < nT; t++) {
+      const [r0, g0, b0] = hexRgb(cols[TP ? PN[TP[t]] : null])
+      for (let c = 0; c < 3; c++) {
+        const vi = T[3 * t + c]
+        const o = 9 * t + 3 * c
+        pos[o] = gv[3 * vi]; pos[o + 1] = gv[3 * vi + 1]; pos[o + 2] = gv[3 * vi + 2]
+        colr[o] = r0; colr[o + 1] = g0; colr[o + 2] = b0
+      }
+    }
+    const carGeo = new THREE.BufferGeometry()
+    carGeo.setAttribute('position', new THREE.BufferAttribute(pos, 3))
+    carGeo.setAttribute('color', new THREE.BufferAttribute(colr, 3))
+    carGeo.computeVertexNormals()
+    const carMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.55, metalness: 0.15, side: THREE.DoubleSide })
+    scene.add(new THREE.Mesh(carGeo, carMat))
+
+    const grid = new THREE.GridHelper(96, 48, 0x334155, 0x1a212c)
+    grid.rotation.x = Math.PI / 2
+    grid.position.set(NX / 2, NY / 2, 0)
+    scene.add(grid)
+    const boxGeo = new THREE.EdgesGeometry(new THREE.BoxGeometry(NX, NY, NZ))
+    const box = new THREE.LineSegments(boxGeo, new THREE.LineBasicMaterial({ color: 0x243044 }))
+    box.position.set(NX / 2, NY / 2, NZ / 2)
+    scene.add(box)
+    const arrow = new THREE.ArrowHelper(new THREE.Vector3(0, 0, -1), new THREE.Vector3(0, 0, 0), 8, 0x10b981, 2.2, 1.4)
+    arrow.visible = false
+    scene.add(arrow)
+
+    // ---- 4) voxelise the surface (dense sampling), flood-fill the outside air
+    const solid = new Uint8Array(N)
+    const mark = (x, y, z) => {
+      const i = Math.floor(x), j = Math.floor(y), k = Math.floor(z)
+      if (i >= 0 && i < NX && j >= 0 && j < NY && k >= 0 && k < NZ) solid[(k * NY + j) * NX + i] = 1
+    }
+    for (let t = 0; t < nT; t++) {
+      const a = T[3 * t] * 3, b = T[3 * t + 1] * 3, c = T[3 * t + 2] * 3
+      const ax = gv[a], ay = gv[a + 1], az = gv[a + 2]
+      const bx = gv[b], by = gv[b + 1], bz = gv[b + 2]
+      const ccx = gv[c], ccy = gv[c + 1], ccz = gv[c + 2]
+      const e = Math.max(Math.hypot(bx - ax, by - ay, bz - az), Math.hypot(ccx - ax, ccy - ay, ccz - az), Math.hypot(ccx - bx, ccy - by, ccz - bz))
+      const n = Math.min(120, Math.max(1, Math.ceil(e * 2)))
+      for (let p = 0; p <= n; p++) {
+        for (let q = 0; q <= n - p; q++) {
+          const u = p / n, v = q / n, w = 1 - u - v
+          mark(ax * w + bx * u + ccx * v, ay * w + by * u + ccy * v, az * w + bz * u + ccz * v)
+        }
+      }
+    }
+    const air = new Uint8Array(N)
+    {
+      const qu = new Int32Array(N)
+      let qh = 0, qt = 0
+      if (!solid[0]) { air[0] = 1; qu[qt++] = 0 }
+      while (qh < qt) {
+        const k = qu[qh++]
+        const i = k % NX, j = Math.floor(k / NX) % NY, kz = Math.floor(k / NXY)
+        if (i > 0 && !air[k - 1] && !solid[k - 1]) { air[k - 1] = 1; qu[qt++] = k - 1 }
+        if (i < NX - 1 && !air[k + 1] && !solid[k + 1]) { air[k + 1] = 1; qu[qt++] = k + 1 }
+        if (j > 0 && !air[k - NX] && !solid[k - NX]) { air[k - NX] = 1; qu[qt++] = k - NX }
+        if (j < NY - 1 && !air[k + NX] && !solid[k + NX]) { air[k + NX] = 1; qu[qt++] = k + NX }
+        if (kz > 0 && !air[k - NXY] && !solid[k - NXY]) { air[k - NXY] = 1; qu[qt++] = k - NXY }
+        if (kz < NZ - 1 && !air[k + NXY] && !solid[k + NXY]) { air[k + NXY] = 1; qu[qt++] = k + NXY }
+      }
+    }
+
+    // ---- 5) potential flow: neighbours that are solid / outside the walls are skipped (no-penetration)
+    const nb = new Uint8Array(N), cnt = new Uint8Array(N), phi = new Float32Array(N)
+    const cellList = []
+    for (let kz = 0; kz < NZ; kz++) {
+      for (let j = 0; j < NY; j++) {
+        for (let i = 0; i < NX; i++) {
+          const k = (kz * NY + j) * NX + i
+          phi[k] = i
+          if (!air[k]) continue
+          let m = 0
+          if (i > 0 && air[k - 1]) m |= 1
+          if (i < NX - 1 && air[k + 1]) m |= 2
+          if (j > 0 && air[k - NX]) m |= 4
+          if (j < NY - 1 && air[k + NX]) m |= 8
+          if (kz > 0 && air[k - NXY]) m |= 16
+          if (kz < NZ - 1 && air[k + NXY]) m |= 32
+          nb[k] = m
+          cnt[k] = (m & 1) + ((m >> 1) & 1) + ((m >> 2) & 1) + ((m >> 3) & 1) + ((m >> 4) & 1) + ((m >> 5) & 1)
+          if (i > 0 && i < NX - 1 && cnt[k]) cellList.push(k)
+        }
+      }
+    }
+    const cells = Int32Array.from(cellList)
+    const nc = cells.length
+    const OMEGA = 1.85, MAXS = 420
+    const sweep = () => {
+      for (let n = 0; n < nc; n++) {
+        const k = cells[n], m = nb[k]
+        let s = 0
+        if (m & 1) s += phi[k - 1]
+        if (m & 2) s += phi[k + 1]
+        if (m & 4) s += phi[k - NX]
+        if (m & 8) s += phi[k + NX]
+        if (m & 16) s += phi[k - NXY]
+        if (m & 32) s += phi[k + NXY]
+        phi[k] += OMEGA * (s / cnt[k] - phi[k])
+      }
+    }
+    const ux = new Float32Array(N), uy = new Float32Array(N), uz = new Float32Array(N)
+    const computeVel = () => {
+      for (let n = 0; n < nc; n++) {
+        const k = cells[n], m = nb[k]
+        const dx = (m & 1) && (m & 2) ? (phi[k + 1] - phi[k - 1]) / 2 : (m & 2) ? phi[k + 1] - phi[k] : (m & 1) ? phi[k] - phi[k - 1] : 0
+        const dy = (m & 4) && (m & 8) ? (phi[k + NX] - phi[k - NX]) / 2 : (m & 8) ? phi[k + NX] - phi[k] : (m & 4) ? phi[k] - phi[k - NX] : 0
+        const dz = (m & 16) && (m & 32) ? (phi[k + NXY] - phi[k - NXY]) / 2 : (m & 32) ? phi[k + NXY] - phi[k] : (m & 16) ? phi[k] - phi[k - NXY] : 0
+        const mg = Math.hypot(dx, dy, dz)
+        const sc = mg > 3 ? 3 / mg : 1
+        ux[k] = dx * sc; uy[k] = dy * sc; uz[k] = dz * sc
+      }
+      for (let kz = 0; kz < NZ; kz++) for (let j = 0; j < NY; j++) {
+        const a0 = (kz * NY + j) * NX, a1 = a0 + NX - 1
+        if (air[a0]) { ux[a0] = 1 }
+        if (air[a1]) { ux[a1] = 1 }
+      }
+    }
+
+    // ---- 6) particles with trails
+    const M = 650, TL = 16
+    const pgx = new Float32Array(M), pgy = new Float32Array(M), pgz = new Float32Array(M), pcp = new Float32Array(M)
+    const trails = new Float32Array(M * TL * 3), tn = new Uint8Array(M)
+    const yLo = Math.max(1, cmin[1] - 5), yHi = Math.min(NY - 1, cmax[1] + 5), zHi = Math.min(NZ - 1, cmax[2] + 5)
+    const spawn = (p, anywhere) => {
+      for (let n = 0; n < 10; n++) {
+        pgx[p] = anywhere ? 1 + Math.random() * (NX - 3) : 0.7
+        pgy[p] = yLo + Math.random() * (yHi - yLo)
+        pgz[p] = 0.6 + Math.random() * (zHi - 0.6)
+        if (air[(Math.floor(pgz[p]) * NY + Math.floor(pgy[p])) * NX + Math.floor(pgx[p])]) break
+      }
+      tn[p] = 0
+    }
+    const sv = [0, 0, 0]
+    const samp = (gx, gy, gz) => {
+      const fx = Math.min(Math.max(gx - 0.5, 0), NX - 1.001)
+      const fy = Math.min(Math.max(gy - 0.5, 0), NY - 1.001)
+      const fz = Math.min(Math.max(gz - 0.5, 0), NZ - 1.001)
+      const i = Math.floor(fx), j = Math.floor(fy), kq = Math.floor(fz)
+      const tx = fx - i, ty = fy - j, tz = fz - kq
+      const b = (kq * NY + j) * NX + i
+      let ax = 0, ay = 0, az = 0
+      for (let dz = 0; dz < 2; dz++) for (let dy = 0; dy < 2; dy++) for (let dx = 0; dx < 2; dx++) {
+        const w = (dx ? tx : 1 - tx) * (dy ? ty : 1 - ty) * (dz ? tz : 1 - tz)
+        const o = b + dx + dy * NX + dz * NXY
+        ax += ux[o] * w; ay += uy[o] * w; az += uz[o] * w
+      }
+      sv[0] = ax; sv[1] = ay; sv[2] = az
+    }
+    const lp = new Float32Array(M * (TL - 1) * 6), lc = new Float32Array(M * (TL - 1) * 6)
+    const lGeo = new THREE.BufferGeometry()
+    lGeo.setAttribute('position', new THREE.BufferAttribute(lp, 3))
+    lGeo.setAttribute('color', new THREE.BufferAttribute(lc, 3))
+    const lMat = new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false })
+    const lines = new THREE.LineSegments(lGeo, lMat)
+    lines.frustumCulled = false
+    scene.add(lines)
+
+    // ---- 7) orbit controls + resize
+    let drag = null
+    const onDown = e => { drag = { x: e.clientX, y: e.clientY }; if (wrap.setPointerCapture) { try { wrap.setPointerCapture(e.pointerId) } catch { /* ignore */ } } }
+    const onMove = e => {
+      if (!drag) return
+      cam.current.az -= (e.clientX - drag.x) * 0.006
+      cam.current.el = Math.max(-0.1, Math.min(1.45, cam.current.el + (e.clientY - drag.y) * 0.006))
+      drag = { x: e.clientX, y: e.clientY }
+    }
+    const onUp = () => { drag = null }
+    const onWheel = e => { e.preventDefault(); cam.current.r = Math.max(20, Math.min(160, cam.current.r * Math.exp(e.deltaY * 0.001))) }
+    wrap.addEventListener('pointerdown', onDown)
+    wrap.addEventListener('pointermove', onMove)
+    wrap.addEventListener('pointerup', onUp)
+    wrap.addEventListener('pointercancel', onUp)
+    wrap.addEventListener('wheel', onWheel, { passive: false })
+    const fit = () => {
+      const w = Math.max(1, wrap.clientWidth), hh = Math.max(1, wrap.clientHeight)
+      renderer.setSize(w, hh, false)
+      camera.aspect = w / hh
+      camera.updateProjectionMatrix()
+    }
+    fit()
+    const ro = new ResizeObserver(fit)
+    ro.observe(wrap)
+
+    // ---- 8) loop
+    let raf = 0, last = performance.now(), frames = 0, sweeps = 0, solved = false
+    const down = new THREE.Vector3(0, 0, -1), up = new THREE.Vector3(0, 0, 1)
+    const frame = now => {
+      raf = requestAnimationFrame(frame)
+      const dt = Math.min((now - last) / 1000, 0.05)
+      last = now
+      frames++
+      if (!solved) {
+        const t0 = performance.now()
+        while (sweeps < MAXS && performance.now() - t0 < 10) { sweep(); sweeps++ }
+        if (sweeps >= MAXS) {
+          computeVel()
+          for (let p = 0; p < M; p++) spawn(p, true)
+          solved = true
+        }
+      }
+      const wnd = Math.max(live.current.wind || 0, 0)
+      const a = live.current.aero || {}
+      let o = 0
+      if (solved) {
+        const kAll = wnd * 0.18 * dt
+        const steps = Math.max(1, Math.ceil(kAll * 1.5))
+        const kk = kAll / steps
+        for (let p = 0; p < M; p++) {
+          for (let n = 0; n < steps; n++) {
+            samp(pgx[p], pgy[p], pgz[p])
+            pcp[p] = 1 - (sv[0] * sv[0] + sv[1] * sv[1] + sv[2] * sv[2])
+            pgx[p] += sv[0] * kk; pgy[p] += sv[1] * kk; pgz[p] += sv[2] * kk
+          }
+          const gx = pgx[p], gy = pgy[p], gz = pgz[p]
+          if (gx >= NX - 1.2 || gx < 0 || gy < 0.2 || gy > NY - 0.2 || gz < 0.2 || gz > NZ - 0.2 ||
+              !air[(Math.floor(gz) * NY + Math.floor(gy)) * NX + Math.floor(gx)]) {
+            spawn(p, false)
+          } else if (kAll > 0) {
+            const base = p * TL * 3
+            trails.copyWithin(base + 3, base, base + (TL - 1) * 3)
+            trails[base] = gx; trails[base + 1] = gy; trails[base + 2] = gz
+            if (tn[p] < TL) tn[p]++
+          }
+        }
+        for (let p = 0; p < M; p++) {
+          const n = tn[p], cp = pcp[p]
+          const amt = Math.min(Math.abs(cp), 1)
+          const cr = cp < 0 ? 0.25 : 1.0, cg = cp < 0 ? 0.65 : 0.55, cb = cp < 0 ? 1.0 : 0.18
+          const bright = 0.6 + 0.4 * amt
+          for (let q = 0; q < TL - 1; q++, o += 6) {
+            if (q < n - 1) {
+              const s0 = (p * TL + q) * 3, s1 = s0 + 3
+              lp[o] = trails[s0]; lp[o + 1] = trails[s0 + 1]; lp[o + 2] = trails[s0 + 2]
+              lp[o + 3] = trails[s1]; lp[o + 4] = trails[s1 + 1]; lp[o + 5] = trails[s1 + 2]
+              const f = (1 - q / (TL - 1)) * bright
+              lc[o] = cr * f; lc[o + 1] = cg * f; lc[o + 2] = cb * f
+              lc[o + 3] = cr * f * 0.85; lc[o + 4] = cg * f * 0.85; lc[o + 5] = cb * f * 0.85
+            } else {
+              lc[o] = lc[o + 1] = lc[o + 2] = lc[o + 3] = lc[o + 4] = lc[o + 5] = 0
+              lp[o] = lp[o + 1] = lp[o + 2] = lp[o + 3] = lp[o + 4] = lp[o + 5] = 0
+            }
+          }
+        }
+        lGeo.attributes.position.needsUpdate = true
+        lGeo.attributes.color.needsUpdate = true
+      }
+
+      // lift / downforce arrow
+      const F = a.lift_force_n
+      if (F !== undefined) {
+        const len = Math.min(14, 4 + Math.log10(1 + Math.abs(F)) * 3)
+        const cxg = (cmin[0] + cmax[0]) / 2, cyg = (cmin[1] + cmax[1]) / 2
+        arrow.visible = true
+        arrow.setColor(F < 0 ? 0x10b981 : 0xf59e0b)
+        if (F < 0) { arrow.position.set(cxg, cyg, cmax[2] + 2 + len); arrow.setDirection(down) }
+        else { arrow.position.set(cxg, cyg, cmax[2] + 2); arrow.setDirection(up) }
+        arrow.setLength(len, Math.min(3, len * 0.3), Math.min(1.8, len * 0.2))
+      } else arrow.visible = false
+
+      // camera
+      const c = cam.current
+      const tx = (cmin[0] + cmax[0]) / 2 + 6, ty = NY / 2, tz = (cmin[2] + cmax[2]) / 2
+      camera.position.set(tx + c.r * Math.cos(c.el) * Math.cos(c.az), ty + c.r * Math.cos(c.el) * Math.sin(c.az), tz + c.r * Math.sin(c.el))
+      camera.lookAt(tx, ty, tz)
+      renderer.render(scene, camera)
+
+      if (hud && frames % 8 === 0) {
+        let txt = 'Wind ' + wnd.toFixed(0) + ' m/s (' + (wnd * 3.6).toFixed(0) + ' km/h) · yaw ' + yaw + '° · pitch ' + pitch + '°'
+        if (!solved) txt += '\nSolving 3D flow… ' + Math.round((100 * sweeps) / MAXS) + '%'
+        else if (F !== undefined) {
+          txt += '\n' + (F < 0 ? 'Downforce ' : 'Lift ') + Math.abs(F).toFixed(0) + ' N'
+          if (a.side_force_n) txt += ' · side force ' + Math.abs(a.side_force_n).toFixed(0) + ' N'
+        }
+        hud.textContent = txt
+      }
+    }
+    raf = requestAnimationFrame(frame)
+
+    return () => {
+      cancelAnimationFrame(raf)
+      ro.disconnect()
+      wrap.removeEventListener('pointerdown', onDown)
+      wrap.removeEventListener('pointermove', onMove)
+      wrap.removeEventListener('pointerup', onUp)
+      wrap.removeEventListener('pointercancel', onUp)
+      wrap.removeEventListener('wheel', onWheel)
+      carGeo.dispose(); carMat.dispose(); lGeo.dispose(); lMat.dispose(); boxGeo.dispose()
+      renderer.dispose()
+      cv.remove()
+    }
+  }, [mesh, colKey, yaw, pitch])
+
+  return (
+    <div ref={wrapRef} style={{ position: 'absolute', top: 0, left: 0, bottom: 0, right: 0, zIndex: 1, cursor: 'grab', touchAction: 'none' }}>
+      <div style={{ position: 'absolute', left: 14, bottom: 12, fontSize: 12, lineHeight: 1.5, color: 'rgba(226,232,240,0.95)', pointerEvents: 'none' }}>
+        <div ref={hudRef} style={{ whiteSpace: 'pre', fontWeight: 600 }} />
+        <div style={{ color: 'hsl(200,90%,62%)', fontSize: 11 }}>● fast flow = low pressure (suction)</div>
+        <div style={{ color: 'hsl(28,90%,62%)', fontSize: 11 }}>● slow flow = high pressure</div>
+        <div style={{ color: 'rgba(148,163,184,0.85)', fontSize: 11 }}>Drag to orbit · scroll to zoom · ideal flow (no wake)</div>
+      </div>
+    </div>
+  )
+}
+
 function MeshModal({ s, onClose, onGoPricing }) {
   const [wire, setWire] = useState(false)
   const [auto, setAuto] = useState(true)
@@ -466,6 +1171,15 @@ function MeshModal({ s, onClose, onGoPricing }) {
   const [physData, setPhysData] = useState(null)
   const [showHeatmap, setShowHeatmap] = useState(false)
   const [flipDirection, setFlipDirection] = useState(false)
+  const [airflow, setAirflow] = useState(true)
+  const [flow3d, setFlow3d] = useState(true)
+  const [yaw, setYaw] = useState(0)
+  const [pitch, setPitch] = useState(0)
+  const [flowAng, setFlowAng] = useState({ yaw: 0, pitch: 0 })
+  useEffect(() => {
+    const t = setTimeout(() => setFlowAng({ yaw, pitch }), 350)
+    return () => clearTimeout(t)
+  }, [yaw, pitch])
   const [simAnim, setSimAnim] = useState({ active: false, runId: 0, crumpleRatio: 0.18, obstacle: 'concrete_wall' })
 
   useEffect(() => {
@@ -481,6 +1195,9 @@ function MeshModal({ s, onClose, onGoPricing }) {
     setInfo(window.innerWidth >= 1100)
     setLab(false)
     setFlipDirection(false)
+    setYaw(0)
+    setPitch(0)
+    setFlowAng({ yaw: 0, pitch: 0 })
     const initPhys = s.info && s.info.physics ? s.info.physics : null
     setPhysData(initPhys)
     setSimMat((s.info && s.info.m) || 'Al 6061')
@@ -492,47 +1209,69 @@ function MeshModal({ s, onClose, onGoPricing }) {
     return () => window.removeEventListener('keydown', onKey)
   }, [s.open, s.job, s.info, s.mesh, onClose])
 
-  // Starts 60 FPS canvas animation in 0ms and fetches updated physics telemetry in parallel!
-  const runCrashSim = async () => {
+  const runCrashSim = async ov0 => {
+    const isAero = obstacle === 'wind_tunnel'
+    const ov = ov0 && ov0.aeroOv ? ov0 : {}
+    const wNow = ov.wind !== undefined ? ov.wind : wind
+    const yNow = ov.yaw !== undefined ? ov.yaw : yaw
+    const pNow = ov.pitch !== undefined ? ov.pitch : pitch
     setAuto(false)
     const estCr = Math.min(0.58, 0.08 + (speed / 220) * 0.35)
     const nextRunId = Date.now()
 
-    // 1. Trigger 60 FPS canvas animation immediately (zero wait time!)
-    setSimAnim(prev => ({
-      active: true,
-      runId: nextRunId,
-      crumpleRatio: prev.crumpleRatio || estCr,
-      obstacle,
-      failureMode: prev.failureMode || 'ductile_crumple',
-      impactAxis: prev.impactAxis || null
-    }))
+    if (isAero) {
+      // Aero mode: no crash animation, just fetch the Bernoulli numbers
+      setSimAnim(prev => ({ ...prev, active: false, obstacle }))
+    } else {
+      setSimAnim(prev => ({
+        active: true,
+        runId: nextRunId,
+        crumpleRatio: prev.crumpleRatio || estCr,
+        obstacle,
+        failureMode: prev.failureMode || 'ductile_crumple',
+        impactAxis: prev.impactAxis || null
+      }))
+    }
 
-    // 2. Fetch exact physics telemetry from backend in parallel
     try {
       if (s.job) {
         const res = await simulatePhysics(s.job, {
           material: simMat,
           speed_kmh: speed,
-          wind_m_s: wind,
+          wind_m_s: wNow,
+          wind_yaw_deg: yNow,
+          wind_pitch_deg: pNow,
           obstacle,
           part_materials: partMats
         })
         if (res && res.physics) {
           setPhysData(res.physics)
-          const ct = res.physics.edge_cases?.crash_test || {}
-          setSimAnim(prev => ({
-            ...prev,
-            crumpleRatio: ct.crumple_ratio || estCr,
-            failureMode: ct.failure_mode || 'ductile_crumple',
-            impactAxis: ct.impact_axis || res.physics.impact_axis || null
-          }))
+          if (!isAero) {
+            const ct = res.physics.edge_cases?.crash_test || {}
+            setSimAnim(prev => ({
+              ...prev,
+              crumpleRatio: ct.crumple_ratio || estCr,
+              failureMode: ct.failure_mode || 'ductile_crumple',
+              impactAxis: ct.impact_axis || res.physics.impact_axis || null
+            }))
+          }
         }
       }
     } catch {
       /* keep local estimate */
     }
   }
+
+  const aeroTimer = useRef(null)
+  useEffect(() => () => clearTimeout(aeroTimer.current), [])
+  const rerunAero = ov => {
+    if (obstacle !== 'wind_tunnel') return
+    clearTimeout(aeroTimer.current)
+    aeroTimer.current = setTimeout(() => runCrashSim({ aeroOv: 1, ...ov }), 300)
+  }
+  const onWind = v => { setWind(v); rerunAero({ wind: v, yaw, pitch }) }
+  const onYaw = v => { setYaw(v); rerunAero({ wind, yaw: v, pitch }) }
+  const onPitch = v => { setPitch(v); rerunAero({ wind, yaw, pitch: v }) }
 
   const resetSim = () => {
     setSimAnim({ active: false, runId: 0, crumpleRatio: 0.18, obstacle })
@@ -543,6 +1282,7 @@ function MeshModal({ s, onClose, onGoPricing }) {
   const crash = physData?.edge_cases?.crash_test
   const windTest = physData?.edge_cases?.wind_shear
   const buckTest = physData?.edge_cases?.axial_buckling
+  const aeroTest = physData?.edge_cases?.bernoulli_aerodynamics
 
   const tgl = (on, set, label, extra) => (
     <button className={'btn' + (on ? ' on' : '')} onClick={() => set(x => !x)} aria-pressed={on} {...extra}>{label}</button>
@@ -568,12 +1308,24 @@ function MeshModal({ s, onClose, onGoPricing }) {
           {s.open && s.mesh
             ? <MeshViewer mesh={s.mesh} wire={wire} auto={auto} resetKey={rk} dims={dims} axes={axes} grid={grid}
                 measure={measure} clearKey={ck} onMeasure={setPts} partColors={partColors}
-                simState={{ ...simAnim, showHeatmap, speed, wind, partMats, simMat, flipDirection }} />
+                simState={{ ...simAnim, showHeatmap, speed, wind, partMats, simMat, flipDirection }}
+                edgeCases={physData?.edge_cases} />
+
             : <div className="mv nomesh">Preview not available</div>}
+          {lab && airflow && obstacle === 'wind_tunnel' && aeroTest && s.mesh
+            ? (
+              <FlowBoundary key={flow3d ? '3d' : '2d'}>
+                {flow3d
+                  ? <WindTunnel3D mesh={s.mesh} partColors={partColors} aero={aeroTest} wind={wind} yaw={flowAng.yaw} pitch={flowAng.pitch} />
+                  : <WindOverlay mesh={s.mesh} partColors={partColors} aero={aeroTest} wind={wind} flip={flipDirection} pitch={flowAng.pitch} />}
+              </FlowBoundary>
+            ) : null}
           <div className="vt">
             {tgl(dims, setDims, 'Dimensions')}
             {tgl(axes, setAxes, 'Axes')}
             {tgl(grid, setGrid, 'Grid')}
+            {tgl(airflow, setAirflow, 'Airflow')}
+            {airflow && obstacle === 'wind_tunnel' ? tgl(flow3d, setFlow3d, '3D flow') : null}
             <button className={'btn' + (measure ? ' on' : '')} aria-pressed={measure}
               onClick={() => { setMeasure(m => !m); setAuto(false) }}>Measure</button>
             {measure && pts.length > 0 ? <button className="btn" onClick={() => setCk(k => k + 1)}>Clear</button> : null}
@@ -591,7 +1343,8 @@ function MeshModal({ s, onClose, onGoPricing }) {
                   ['bollard_pole', '💈 Center Steel Bollard Pole'],
                   ['spike_strip', '📌 Road Spike Strip (Tire Blowout)'],
                   ['speed_bump', '⛰️ High-Speed Baja Speed-Bump Jump'],
-                  ['wind_and_thrust', '🌪️ Crosswind Gale & Body-Roll Test']
+                  ['wind_and_thrust', '🌪️ Crosswind Gale & Body-Roll Test'],
+                  ['wind_tunnel', '💨 Bernoulli Wind Tunnel (Lift / Downforce)']
                 ].map(([id, label]) => (
                   <button
                     key={id}
@@ -612,17 +1365,37 @@ function MeshModal({ s, onClose, onGoPricing }) {
               </div>
 
               <h4 className="ih">Simulation Parameters</h4>
-              <div className="ir">
-                <span>Vehicle Speed</span>
-                <b>{speed} km/h</b>
-              </div>
-              <input type="range" min="15" max="220" value={speed} onChange={e => setSpeed(Number(e.target.value))} style={{ width: '100%' }} />
+              {obstacle !== 'wind_tunnel' && (
+                <>
+                  <div className="ir">
+                    <span>Vehicle Speed</span>
+                    <b>{speed} km/h</b>
+                  </div>
+                  <input type="range" min="15" max="220" value={speed} onChange={e => setSpeed(Number(e.target.value))} style={{ width: '100%' }} />
+                </>
+              )}
 
               <div className="ir" style={{ marginTop: 6 }}>
-                <span>Crosswind Gust</span>
-                <b>{wind} m/s</b>
+                <span>{obstacle === 'wind_tunnel' ? 'Wind Speed' : 'Crosswind Gust'}</span>
+                <b>{wind} m/s{obstacle === 'wind_tunnel' ? ' · ' + Math.round(wind * 3.6) + ' km/h' : ''}</b>
               </div>
-              <input type="range" min="10" max="150" value={wind} onChange={e => setWind(Number(e.target.value))} style={{ width: '100%' }} />
+              <input type="range" min={obstacle === 'wind_tunnel' ? 0 : 10} max="150" value={wind} onChange={e => onWind(Number(e.target.value))} style={{ width: '100%' }} />
+
+              {obstacle === 'wind_tunnel' && (
+                <>
+                  <div className="ir" style={{ marginTop: 6 }}>
+                    <span>Wind Angle (yaw)</span>
+                    <b>{yaw}°</b>
+                  </div>
+                  <input type="range" min="-90" max="90" value={yaw} onChange={e => onYaw(Number(e.target.value))} style={{ width: '100%' }} />
+                  <div className="ir" style={{ marginTop: 6 }}>
+                    <span>Wind Pitch (up / down)</span>
+                    <b>{pitch}°</b>
+                  </div>
+                  <input type="range" min="-30" max="30" value={pitch} onChange={e => onPitch(Number(e.target.value))} style={{ width: '100%' }} />
+                  <div className="eq" style={{ marginTop: 4 }}>Yaw is visible in the 3D flow view; pitch shows in both views.</div>
+                </>
+              )}
 
               <div className="ir" style={{ marginTop: 6 }}>
                 <span>Primary Material</span>
@@ -672,7 +1445,7 @@ function MeshModal({ s, onClose, onGoPricing }) {
 
               <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
                 <button className="btn p" style={{ flex: 1 }} onClick={runCrashSim}>
-                  ▶ Run Simulation
+                  {obstacle === 'wind_tunnel' ? '▶ Run Aero Simulation' : '▶ Run Simulation'}
                 </button>
                 <button
                   className={'btn' + (flipDirection ? ' on' : '')}
@@ -686,10 +1459,10 @@ function MeshModal({ s, onClose, onGoPricing }) {
                 )}
               </div>
 
-              {crash && (
+              {crash && !crash.skipped && (
                 <>
                   <h4 className="ih">Edge-Case Telemetry</h4>
-                  <div className="ir"><span>Status</span><b style={{ color: crash.survived ? '#2fb67c' : '#ef4444' }}>{crash.survived ? '✓ SURVIVED' : '⚠ PLASTIC FRACTURE'}</b></div>
+                  <div className="ir"><span>Status</span><b style={{ color: crash.survived ? '#10b981' : '#ef4444' }}>{crash.survived ? '✓ SURVIVED' : '⚠ PLASTIC FRACTURE'}</b></div>
                   {crash.failure_description && <div className="eq" style={{ marginBottom: 6 }}>{crash.failure_description}</div>}
                   <div className="ir"><span>Safety Factor</span><b>{physData.overall_safety_factor}×</b></div>
                   <div className="ir"><span>Peak Deceleration</span><b>{crash.peak_deceleration_g} G</b></div>
@@ -698,6 +1471,35 @@ function MeshModal({ s, onClose, onGoPricing }) {
                   <div className="ir"><span>Peak Stress</span><b>{crash.impact_stress_mpa} MPa</b></div>
                   {windTest && <div className="ir"><span>Wind Shear SF</span><b>{windTest.safety_factor}× ({windTest.bending_stress_mpa} MPa)</b></div>}
                   {buckTest && <div className="ir"><span>6G Buckling SF</span><b>{buckTest.safety_factor}×</b></div>}
+                </>
+              )}
+
+              {aeroTest && (
+                <>
+                  <h4 className="ih">Bernoulli Aerodynamics</h4>
+                  <div className="eq">
+                    p + ½ρv² = const<br />
+                    ΔP = ½ρ(v<sub>top</sub>² − v<sub>bot</sub>²)<br />
+                    F = ΔP × A = {nf(aeroTest.delta_p_pa, 1)} Pa × {aeroTest.planform_area_m2} m²
+                  </div>
+                  <div className="ir"><span>Relative Flow V∞</span><b>{aeroTest.flow_velocity_m_s} m/s</b></div>
+                  <div className="ir"><span>Dynamic Pressure q</span><b>{aeroTest.dynamic_pressure_pa} Pa</b></div>
+                  <div className="ir"><span>v top / bottom</span><b>{aeroTest.v_top_m_s} / {aeroTest.v_bottom_m_s} m/s</b></div>
+                  <div className="ir"><span>p top / bottom</span><b>{aeroTest.p_top_pa} / {aeroTest.p_bottom_pa} Pa</b></div>
+                  <div className="ir"><span>Pressure Δ</span><b>{aeroTest.delta_p_pa} Pa</b></div>
+                  <div className="ir">
+                    <span>{aeroTest.lift_force_n < 0 ? 'Downforce' : 'Lift'}</span>
+                    <b style={{ color: aeroTest.lift_force_n < 0 ? '#10b981' : '#f59e0b' }}>
+                      {nf(Math.abs(aeroTest.lift_force_n), 1)} N {aeroTest.lift_force_n < 0 ? '⬇' : '⬆'}
+                    </b>
+                  </div>
+                  <div className="ir"><span>Drag</span><b>{nf(aeroTest.drag_force_n, 1)} N</b></div>
+                  <div className="ir"><span>Cl (effective)</span><b>{aeroTest.lift_coefficient}</b></div>
+                  <div className="ir"><span>Lift / Weight</span><b>{aeroTest.lift_to_weight}×</b></div>
+                  <div className="ir"><span>Reynolds · Mach</span><b>{nf(aeroTest.reynolds, 0)} · {aeroTest.mach}</b></div>
+                  {aeroTest.mach > 0.3 && (
+                    <div className="eq">Mach &gt; 0.3: incompressible Bernoulli is only approximate here.</div>
+                  )}
                 </>
               )}
 
@@ -726,13 +1528,11 @@ function MeshModal({ s, onClose, onGoPricing }) {
 
 /* ---------- App ---------- */
 export default function App() {
-  /* navigation */
   const [view, setView] = useState('chat')
   const [panel, setPanel] = useState('general')
   const [subOpen, setSubOpen] = useState(false)
   const pwRef = useRef(null)
 
-  /* sidebar */
   const [sbOff, setSbOff] = useState(() => {
     const v = readLS('bp-sb', null)
     return v === '0' || window.innerWidth <= 820
@@ -750,8 +1550,7 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKey)
   }, [])
 
-  /* backend status */
-  const [online, setOnline] = useState(null) // null = checking, true/false
+  const [online, setOnline] = useState(null)
   useEffect(() => {
     let alive = true
     const ping = () => health().then(h => alive && setOnline(!!h.ok), () => alive && setOnline(false))
@@ -760,8 +1559,7 @@ export default function App() {
     return () => { alive = false; clearInterval(t) }
   }, [])
 
-  /* theme / accent / motion */
-  const [theme, setTheme] = useState(() => readLS('bp-theme', 'light'))
+  const [theme, setTheme] = useState(() => readLS('bp-theme', 'dark'))
   const [accent, setAccent] = useState(ACCENTS[0])
   const [reduce, setReduce] = useState(false)
   useEffect(() => {
@@ -776,13 +1574,12 @@ export default function App() {
       return () => mq.removeEventListener('change', apply)
     }
   }, [theme])
-  useEffect(() => { document.documentElement.style.setProperty('--acc', accent) }, [accent])
+  useEffect(() => { document.documentElement.style.setProperty('--accent', accent) }, [accent])
   useEffect(() => {
     if (reduce) document.documentElement.style.setProperty('--e', 'linear')
     else document.documentElement.style.removeProperty('--e')
   }, [reduce])
 
-  /* settings popup: outside click + Esc */
   useEffect(() => {
     const onClick = e => { if (pwRef.current && !pwRef.current.contains(e.target)) setSubOpen(false) }
     const onKey = e => { if (e.key === 'Escape') setSubOpen(false) }
@@ -794,7 +1591,6 @@ export default function App() {
     }
   }, [])
 
-  /* data (real: filled as you generate) */
   const [userName, setUserName] = useState(() => readLS('bp-user', 'Gurtej'))
   useEffect(() => { writeLS('bp-user', userName) }, [userName])
 
@@ -813,14 +1609,13 @@ export default function App() {
     return Object.keys(c).sort((a, b) => c[b] - c[a])[0] || 'STEP'
   })()
 
-  /* composer */
   const [inp, setInp] = useState('')
   const [model, setModel] = useState('Brepline-1')
   const [mat, setMat] = useState('Al 6061')
   const [fmt, setFmt] = useState('STEP')
   const [unit, setUnit] = useState('mm')
   const [optOpen, setOptOpen] = useState(false)
-  const [refine, setRefine] = useState(null) // { job, label } => next prompt edits that design
+  const [refine, setRefine] = useState(null)
   const optRef = useRef(null)
   useEffect(() => {
     const onClick = e => { if (optRef.current && !optRef.current.contains(e.target)) setOptOpen(false) }
@@ -835,9 +1630,8 @@ export default function App() {
   const inpRef = useRef(null)
   const msgsRef = useRef(null)
   const uid = useRef(0)
-  const aborts = useRef({}) // message id -> AbortController of the running generation
+  const aborts = useRef({})
 
-  /* notifications + confirm dialog */
   const [toasts, setToasts] = useState([])
   const tid = useRef(0)
   const [cf, setCf] = useState(null)
@@ -870,8 +1664,6 @@ export default function App() {
     if (document.hidden) setUnread(true)
   }
 
-  /* chat */
-  /* several chats; message ids are unique across all chats, so id-based updates can touch every chat */
   const [chats, setChats] = useState([{ id: 1, msgs: [] }])
   const [activeId, setActiveId] = useState(1)
   const cid = useRef(1)
@@ -885,7 +1677,6 @@ export default function App() {
   const addMsg = M => setChats(cs => cs.map(c => (c.id === cur.id ? { ...c, msgs: [...c.msgs, M] } : c)))
   useEffect(() => { if (chats.length && !chats.some(c => c.id === activeId)) setActiveId(chats[chats.length - 1].id) }, [chats, activeId])
 
-  // FIXED: Only auto-scroll when a new message is added or chat tab changes, NEVER on 1s log poll ticks!
   useEffect(() => {
     msgsRef.current?.scrollTo({ top: 1e9, behavior: 'smooth' })
   }, [msgs.length, activeId])
@@ -894,10 +1685,9 @@ export default function App() {
   const busyList = allMsgs.filter(m => m.busy)
   const busyCount = busyList.length
   useEffect(() => {
-    document.title = busyCount ? 'Generating… · Brepline' : unread ? '✓ Ready · Brepline' : 'Brepline'
+    document.title = busyCount ? 'Generating… · BREPLINE' : unread ? '✓ Ready · BREPLINE' : 'BREPLINE — AI-native mechanical engineering'
   }, [busyCount, unread])
 
-  // one real generation; streams both logs and live partial sub-part 3D meshes
   const runGen = async (id, text, { m, f, parent = null, fresh = false }) => {
     const ac = new AbortController()
     aborts.current[id] = ac
@@ -964,8 +1754,6 @@ export default function App() {
     const M = msgs.find(x => x.id === id)
     if (!M || busyCount) return
     window.speechSynthesis && window.speechSynthesis.cancel()
-    // Only bypass cache if a previous completed version exists and user explicitly wants a fresh variation;
-    // if retrying after a timeout/error (M.vers.length === 0), allow pgvector cache to reuse already-built sub-parts!
     const forceFresh = Boolean(M.vers && M.vers.length > 0 && text === undefined)
     runGen(id, text ?? M.text, { m: M.m, f: M.f, parent: M.parent, fresh: forceFresh })
   }
@@ -1013,12 +1801,11 @@ export default function App() {
     closeSbMobile()
   }
 
-  /* stop, delete, jump-to */
   const stopOne = id => {
     const ac = aborts.current[id]
     if (!ac) return
     ac.abort()
-    if (ac.job) cancelJob(ac.job) // best effort, needs a cancel route on the backend
+    if (ac.job) cancelJob(ac.job)
   }
   const stopAll = () => Object.keys(aborts.current).forEach(stopOne)
   const openTurn = id => {
@@ -1060,7 +1847,6 @@ export default function App() {
     ok: 'Delete', danger: true, run: () => setFiles(fl => fl.filter(y => y && y.fid !== x.fid))
   })
 
-  /* custom polygon / profile editor */
   const [shapeEd, setShapeEd] = useState({ open: false, initial: null, parent: null })
   const drawShape = () => setShapeEd({ open: true, initial: null, parent: null })
   const editShape = v => setShapeEd({ open: true, initial: v.shape, parent: v.job })
@@ -1075,15 +1861,12 @@ export default function App() {
     setView('chat')
   }
 
-  /* 3D viewer */
   const [v3, setV3] = useState({ open: false, job: '', name: 'part', f: 'STEP', mesh: null, bbox: null, info: null })
   const open3d = v => setV3({ open: true, job: v.job, name: v.title || v.n, f: v.f, mesh: v.mesh, bbox: v.bbox, info: v })
   const close3d = useCallback(() => setV3(s => ({ ...s, open: false })), [])
 
-  /* upgrade pill: shown on every load for the Free plan; x hides it until next load */
   const [upb, setUpb] = useState(true)
 
-  // Load saved generations directly from Supabase PostgreSQL on startup
   useEffect(() => {
     fetchHistory().then(res => {
       if (!res || !res.ok || !Array.isArray(res.items) || !res.items.length) return
@@ -1332,13 +2115,11 @@ export default function App() {
               />
               <div className="bar">
                 <button className="btn" title="Draw your own polygon or profile" aria-label="Draw shape" onClick={drawShape}><Ic n="clip" /><span className="lbl">Draw shape</span></button>
-                {/* desktop / tablet: separate dropdowns */}
                 <div className="opts-d">
                   <select value={mat} onChange={e => setMat(e.target.value)}>{MATS.map(x => <option key={x}>{x}</option>)}</select>
                   <select value={fmt} onChange={e => setFmt(e.target.value)}>{FMTS.map(x => <option key={x}>{x}</option>)}</select>
                   <select value={unit} onChange={e => setUnit(e.target.value)}><option>mm</option></select>
                 </div>
-                {/* phones: one combined options menu */}
                 <div className="optw" ref={optRef}>
                   <button className="btn optb" aria-expanded={optOpen} onClick={() => setOptOpen(o => !o)}>
                     <span className="optt">{mat} · {fmt} · {unit}</span>
@@ -1361,7 +2142,7 @@ export default function App() {
                   : <button className="send" aria-label="Send" onClick={() => send()}><Ic n="up" /></button>}
               </div>
             </div>
-            <div className="foot">Brepline can make mistakes. Verify dimensions before manufacturing.</div>
+            <div className="foot">BREPLINE can make mistakes. Verify dimensions before manufacturing.</div>
           </div>
         </section>
 
@@ -1436,7 +2217,7 @@ export default function App() {
               </div>
 
               <div className={'panel' + (panel === 'appearance' ? ' on' : '')}>
-                <h3>Appearance</h3><p>Choose how Brepline looks.</p>
+                <h3>Appearance</h3><p>Choose how BREPLINE looks.</p>
                 <div className="srow"><div><b>Theme</b><small>Light, black, or follow your system</small></div>
                   <div className="seg">
                     {[['light', 'Light'], ['dark', 'Black'], ['system', 'System']].map(([t, l]) => (
@@ -1468,7 +2249,7 @@ export default function App() {
               </div>
 
               <div className={'panel' + (panel === 'data' ? ' on' : '')}>
-                <h3>Data controls</h3><p>Manage what Brepline stores.</p>
+                <h3>Data controls</h3><p>Manage what BREPLINE stores.</p>
                 <div className="srow"><div><b>Model improvement</b><small>Prompts and generated designs are stored to train future versions</small></div><span className="tag">On</span></div>
                 <div className="srow"><div><b>Clear history</b><small>Remove this session&apos;s conversations from the list</small></div>
                   <button className="btn danger" disabled={!hist.length} onClick={() => ask({
@@ -1497,7 +2278,6 @@ export default function App() {
   )
 }
 
-/* ---------- Pricing ---------- */
 function PricingView({ active }) {
   const [yearly, setYearly] = useState(false)
   const price = (m, y) => '$' + (yearly ? y : m)
@@ -1509,7 +2289,7 @@ function PricingView({ active }) {
         <div className="plans">
           <div className="plan">
             <h4>Free</h4>
-            <div className="pr">$0<small> /month</small></div><small>For trying Brepline</small>
+            <div className="pr">$0<small> /month</small></div><small>For trying BREPLINE</small>
             <ul><li>Limited generations per day</li><li>STEP and STL export</li><li>Community support</li></ul>
             <button className="btn">Current plan</button>
           </div>

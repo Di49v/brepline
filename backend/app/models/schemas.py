@@ -20,7 +20,16 @@ class SimulateRequest(BaseModel):
     material: str = Field(default="Al 6061", description="Selected material for stress/crash simulation")
     speed_kmh: float = Field(default=64.0, ge=5.0, le=350.0, description="Impact velocity in km/h")
     wind_m_s: float = Field(default=45.0, ge=0.0, le=200.0, description="Crosswind shear speed in m/s")
-    obstacle: Literal["concrete_wall", "bollard_pole", "wind_and_thrust"] = Field(
+    wind_yaw_deg: float = Field(default=0.0, ge=-90.0, le=90.0)
+    wind_pitch_deg: float = Field(default=0.0, ge=-30.0, le=30.0)
+    obstacle: Literal[
+        "concrete_wall",
+        "bollard_pole",
+        "spike_strip",
+        "speed_bump",
+        "wind_and_thrust",
+        "wind_tunnel",
+    ] = Field(
         default="concrete_wall",
         description="Selected obstacle preset for edge-case simulation"
     )
